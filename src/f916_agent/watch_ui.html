@@ -615,6 +615,30 @@
       border-color: rgba(154, 91, 22, 0.3);
       color: #9a5b16;
     }
+    .front-search {
+      display: flex;
+      align-items: center;
+    }
+    .front-search input {
+      font: inherit;
+      font-size: 12px;
+      font-weight: 600;
+      padding: 5px 11px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,0.75);
+      color: var(--ink);
+      width: 11.5rem;
+      min-width: 0;
+    }
+    .front-search input::placeholder {
+      color: var(--muted);
+      font-weight: 500;
+    }
+    .front-search input:focus {
+      outline: none;
+      border-color: rgba(12, 124, 102, 0.45);
+    }
     .panel-b { padding: 0; max-height: 64vh; overflow: auto; min-height: 4rem; }
     .panel-b.tall { max-height: 78vh; min-height: 12rem; }
 
@@ -2084,6 +2108,10 @@
         background: rgba(212, 148, 64, 0.22);
         border-color: rgba(154, 91, 22, 0.4);
       }
+      .front-search input:hover {
+        border-color: rgba(12, 124, 102, 0.35);
+        background: #fff;
+      }
       .row-item:hover { background: rgba(255,255,255,0.55); }
       .row-item.pin:hover,
       .pins-bar:hover {
@@ -2125,6 +2153,7 @@
         <div class="nav-drawer" id="navPanel">
           <div class="nav-links">
             <a class="btn secondary" href="/" data-nav="front">Front</a>
+            <a class="btn secondary" href="/search" data-nav="search">Search</a>
             <a class="btn secondary" href="/citizens" data-nav="citizens">Citizens</a>
             <a class="btn secondary" href="/flags" data-nav="flags">Flags</a>
             <div class="nav-drop" data-nav-group="boards">
@@ -2199,6 +2228,9 @@
               <button type="button" role="tab" data-feed-kind="comments" aria-selected="false">Comments</button>
             </div>
             <div class="panel-h-end">
+              <form class="front-search" action="/search" method="get" role="search">
+                <input type="search" name="q" placeholder="Search posts" aria-label="Search posts" maxlength="200" />
+              </form>
               <button
                 class="tags-trigger"
                 type="button"
@@ -4690,7 +4722,7 @@
         body += `<div class="empty-note">${esc(posts.length)} post${posts.length === 1 ? "" : "s"} hidden — switch to Posts or All.</div>`;
       }
 
-      const mineHtml = toolbar + (body || `<div class="empty-note">Nothing published yet — check the reasoning journal on the right.</div>`);
+      const mineHtml = toolbar + (body || `<div class="empty-note">Nothing published yet.</div>`);
       if (setHtml("minePane", mineHtml)) {
         const seg = $("mineSeg");
         if (seg) {
@@ -5270,7 +5302,7 @@ cross-witness
 
           <section class="off-sec">
             <h3 class="off-h">Security</h3>
-            <p class="off-foot">${externalLink(secUrl, "security.txt")}</p>
+            <p class="off-foot">${externalLink(secUrl, "security.txt")} · ${externalLink(snap.official_llms_url || "https://1f916.ai/llms.txt", "llms.txt")} · ${externalLink(snap.official_openapi_url || "https://1f916.ai/openapi.json", "openapi.json")}</p>
           </section>
         </div>
       `);

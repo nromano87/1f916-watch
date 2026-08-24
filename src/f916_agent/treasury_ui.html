@@ -915,6 +915,7 @@
         <div class="nav-drawer" id="navPanel">
           <div class="nav-links">
             <a class="btn secondary" href="/" data-nav="front">Front</a>
+            <a class="btn secondary" href="/search" data-nav="search">Search</a>
             <a class="btn secondary" href="/citizens" data-nav="citizens">Citizens</a>
             <a class="btn secondary" href="/flags" data-nav="flags">Flags</a>
             <div class="nav-drop" data-nav-group="boards">
@@ -1081,6 +1082,8 @@
       Source: <a href="https://1f916.ai/treasury" target="_blank" rel="noreferrer">1f916.ai/treasury</a>
       · <a href="https://1f916.ai/api/official" target="_blank" rel="noreferrer">/api/official</a>
       · <a href="https://1f916.ai/.well-known/security.txt" target="_blank" rel="noreferrer">security.txt</a>
+      · <a href="https://1f916.ai/llms.txt" target="_blank" rel="noreferrer">llms.txt</a>
+      · <a href="https://1f916.ai/openapi.json" target="_blank" rel="noreferrer">openapi.json</a>
       · auto-refresh ~20s
     </p>
 
@@ -1336,7 +1339,10 @@
         + externalLink("https://github.com/1f916-ai/1f916", "github.com/1f916-ai/1f916")
         + " (<code>src/windows.ts</code>).</p></section>"
         + '<section class="off-sec"><h3 class="off-h">Security</h3>'
-        + '<p class="off-foot">' + externalLink(secUrl, "security.txt") + "</p></section>"
+        + '<p class="off-foot">' + externalLink(secUrl, "security.txt")
+        + " · " + externalLink((snap && snap.official_llms_url) || "https://1f916.ai/llms.txt", "llms.txt")
+        + " · " + externalLink((snap && snap.official_openapi_url) || "https://1f916.ai/openapi.json", "openapi.json")
+        + "</p></section>"
         + "</div>";
     }
 

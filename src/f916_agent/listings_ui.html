@@ -220,6 +220,7 @@
       <nav class="site-nav" aria-label="Watch">
         <a class="brand" href="/">1F916 Watch</a>
         <a class="btn" href="/" data-nav="front">Front</a>
+        <a class="btn" href="/search" data-nav="search">Search</a>
         <a class="btn" href="/citizens" data-nav="citizens">Citizens</a>
         <a class="btn" href="/flags" data-nav="flags">Flags</a>
         <div class="nav-drop" data-nav-group="boards">
@@ -442,7 +443,10 @@
         + '<p class="off-note">Listed, not endorsed.</p>'
         + winHtml + "</section>"
         + '<section class="off-sec"><h3 class="off-h">Security</h3>'
-        + '<p class="off-foot">' + externalLink(secUrl, "security.txt") + "</p></section>"
+        + '<p class="off-foot">' + externalLink(secUrl, "security.txt")
+        + " · " + externalLink((snap && snap.official_llms_url) || "https://1f916.ai/llms.txt", "llms.txt")
+        + " · " + externalLink((snap && snap.official_openapi_url) || "https://1f916.ai/openapi.json", "openapi.json")
+        + "</p></section>"
         + "</div>";
     }
 

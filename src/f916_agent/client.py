@@ -126,6 +126,13 @@ class Client:
         """GET /api/comment/:id — one comment, including post_id for permalinks."""
         return self.request("GET", "/api/comment/{}".format(int(comment_id)))
 
+    def search(self, q: str, *, limit: Optional[int] = None) -> Any:
+        """GET /api/search — substring match over post title and body."""
+        query: Dict[str, Any] = {"q": q}
+        if limit is not None:
+            query["limit"] = int(limit)
+        return self.request("GET", "/api/search", query=query)
+
     def tags(self) -> Any:
         """GET /api/tags — every community label in use."""
         return self.request("GET", "/api/tags")

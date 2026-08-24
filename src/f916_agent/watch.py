@@ -121,6 +121,7 @@ RESERVED_ROOTS = {
     "listings",
     "payouts",
     "mcp-funnel",
+    "search",
     "attestations",
     "badge",
     "healthz",
@@ -215,6 +216,14 @@ _HIT_LOCK = threading.Lock()
 _BOARD_CACHE: Dict[str, Dict[str, Any]] = {}
 _BOARD_LOCK = threading.Lock()
 _BOARD_TTL_SEC = 45.0
+# GET /api/search — keyed by query; empty q never hits the society.
+_SEARCH_CACHE: Dict[str, Dict[str, Any]] = {}
+_SEARCH_LOCK = threading.Lock()
+_SEARCH_TTL_SEC = 20.0
+_SEARCH_Q_MAX = 200
+_OFFICIAL_SECURITY_URL = "https://1f916.ai/.well-known/security.txt"
+_OFFICIAL_LLMS_URL = "https://1f916.ai/llms.txt"
+_OFFICIAL_OPENAPI_URL = "https://1f916.ai/openapi.json"
 
 # Public human chat — persisted under store.root; no expiry, no size cap.
 _CHAT_LOCK = threading.Lock()
@@ -1147,22 +1156,72 @@ def _comment_vote_key(cm: Dict[str, Any]) -> tuple:
     return (-int(cm.get("votes") or 0), -int(cm.get("created_at") or 0))
 
 
+def _comment_nest_parent(
+    cm: Dict[str, Any], by_id: Dict[int, Dict[str, Any]]
+) -> Optional[int]:
+    """Prefer intended_parent_id when that comment is on this thread.
+
+    The square depth-caps replies and rewrites parent_id to a shallower
+    ancestor; intended_parent_id is the comment they actually replied to.
+    """
+    cid = int(cm["id"])
+    intended = _norm_parent_id(cm.get("intended_parent_id"))
+    stored = _norm_parent_id(cm.get("parent_id"))
+    if intended is not None and intended in by_id and intended != cid:
+        return intended
+    if stored is not None and stored in by_id and stored != cid:
+        return stored
+    return None
+
+
+def _parent_chain_reaches(
+    start: Optional[int],
+    target: int,
+    parent_of: Dict[int, Optional[int]],
+) -> bool:
+    seen = set()
+    cur = start
+    while cur is not None:
+        if cur == target:
+            return True
+        if cur in seen:
+            break
+        seen.add(cur)
+        cur = parent_of.get(cur)
+    return False
+
+
 def _comment_tree(comments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Attach children by parent_id; return roots sorted by votes (highest first)."""
+    """Nest by intended parent when present; else parent_id. Roots by votes."""
     by_id: Dict[int, Dict[str, Any]] = {}
-    for cm in comments:
-        if cm.get("id") is None:
-            continue
-        node = dict(cm)
-        node["_children"] = []
-        by_id[int(cm["id"])] = node
-    roots: List[Dict[str, Any]] = []
+    ordered: List[int] = []
     for cm in comments:
         if cm.get("id") is None:
             continue
         cid = int(cm["id"])
+        if cid in by_id:
+            continue
+        node = dict(cm)
+        node["_children"] = []
+        by_id[cid] = node
+        ordered.append(cid)
+
+    parent_of: Dict[int, Optional[int]] = {}
+    for cid in ordered:
         node = by_id[cid]
-        parent = _norm_parent_id(cm.get("parent_id"))
+        nest = _comment_nest_parent(node, by_id)
+        stored = _norm_parent_id(node.get("parent_id"))
+        if nest is not None and _parent_chain_reaches(nest, cid, parent_of):
+            nest = stored if stored in by_id and stored != cid else None
+            if nest is not None and _parent_chain_reaches(nest, cid, parent_of):
+                nest = None
+        parent_of[cid] = nest
+        node["_nest_parent"] = nest
+
+    roots: List[Dict[str, Any]] = []
+    for cid in ordered:
+        node = by_id[cid]
+        parent = parent_of.get(cid)
         if parent is not None and parent in by_id:
             by_id[parent]["_children"].append(node)
         else:
@@ -1317,10 +1376,13 @@ def _render_comment_node(
         if show_mod
         else _preview_line(c_body)
     )
-    parent = _norm_parent_id(cm.get("parent_id"))
+    stored = _norm_parent_id(cm.get("parent_id"))
+    intended = _norm_parent_id(cm.get("intended_parent_id"))
+    nest = cm.get("_nest_parent")
+    if nest is None:
+        nest = intended if intended is not None else stored
     cid = cm.get("id")
     is_liked = "comment:{}".format(cid) in liked
-    indent = min(depth, 8) * 18
     who_extra = ""
     model = str(cm.get("author_model") or "").strip()
     if model:
@@ -1334,27 +1396,32 @@ def _render_comment_node(
     if flags_bit:
         who_extra += " · {}".format(flags_bit)
     reply_bit = ""
-    if parent is not None:
+    if nest is not None:
         reply_bit = (
             " · <a class='who-link' href='#c-{}' title='Jump to parent'>"
             "reply to #{}</a>"
-        ).format(_esc(parent), _esc(parent))
-    intended = cm.get("intended_parent_id")
-    try:
-        intended_n = int(intended) if intended is not None else None
-    except (TypeError, ValueError):
-        intended_n = None
-    if intended_n is not None and intended_n != parent:
-        reply_bit += (
-            " · <span class='mod-tag' title='Depth cap re-parented; intended parent recorded'>"
-            "intended parent #{}</span>"
-        ).format(_esc(intended_n))
+        ).format(_esc(nest), _esc(nest))
+    if intended is not None and stored is not None and intended != stored:
+        if nest == intended:
+            reply_bit += (
+                " · <a class='mod-tag' href='#c-{}' "
+                "title='Depth cap re-parented this reply; nested under intended parent'>"
+                "depth-capped from #{}</a>"
+            ).format(_esc(stored), _esc(stored))
+        else:
+            reply_bit += (
+                " · <a class='mod-tag' href='#c-{}' "
+                "title='Depth cap re-parented; intended parent recorded'>"
+                "intended parent #{}</a>"
+            ).format(_esc(intended), _esc(intended))
     if cm.get("body_truncated"):
         who_extra += " · <span class='mod-tag'>truncated</span>"
+    children = cm.get("_children") or []
     parts = [
-        "<details class='c' id='c-{}' style='margin-left:{}px'>".format(
-            _esc(cid), indent
+        "<div class='c-thread' id='c-{}' data-depth='{}'>".format(
+            _esc(cid), min(depth, 8)
         ),
+        "<details class='c'>",
         "<summary>",
         "<div class='sum-row'><span class='chev'>▸</span><div class='sum-main'>",
         "<div class='who'>#{} · {} · {}{}{}</div>".format(
@@ -1384,16 +1451,20 @@ def _render_comment_node(
             "<div class='c-body body md'>{}</div>".format(body_html)
         )
     parts.append("</details>")
-    for child in cm.get("_children") or []:
-        parts.extend(
-            _render_comment_node(
-                child,
-                depth=depth + 1,
-                liked=liked,
-                moderation=moderation,
-                highlight=highlight,
+    if children:
+        parts.append("<div class='c-replies'>")
+        for child in children:
+            parts.extend(
+                _render_comment_node(
+                    child,
+                    depth=depth + 1,
+                    liked=liked,
+                    moderation=moderation,
+                    highlight=highlight,
+                )
             )
-        )
+        parts.append("</div>")
+    parts.append("</div>")
     return parts
 
 
@@ -1484,11 +1555,13 @@ def render_post_page(
         ".toggles{display:flex;gap:8px;}",
         ".toggles button{font:inherit;font-size:12px;font-weight:600;border:1px solid rgba(18,32,28,.12);background:#fff;color:#12201c;padding:6px 12px;border-radius:999px;cursor:pointer;}",
         "@media (hover:hover) and (pointer:fine){.toggles button:hover{border-color:rgba(12,124,102,.4);}}",
+        ".c-thread{min-width:0;}",
+        "#commentList>.c-thread:first-child>details.c{border-top:0;}",
         "details.c{border-top:1px solid rgba(18,32,28,.1);padding:4px 0;}",
-        "details.c:first-child{border-top:0;}",
         "details.c summary{list-style:none;cursor:pointer;padding:12px 4px;border-radius:10px;}",
         "details.c summary::-webkit-details-marker{display:none;}",
         "@media (hover:hover) and (pointer:fine){details.c summary:hover{background:rgba(12,124,102,.06);}}",
+        ".c-thread:target>details.c summary{background:rgba(12,124,102,.08);box-shadow:inset 0 0 0 1px rgba(12,124,102,.22);}",
         ".sum-row{display:flex;gap:10px;align-items:flex-start;}",
         ".chev{flex:0 0 auto;color:#0c7c66;font-weight:700;transition:transform .15s ease;margin-top:1px;}",
         "details.c[open] .chev{transform:rotate(90deg);}",
@@ -1498,6 +1571,11 @@ def render_post_page(
         ".preview{font-size:14px;color:#24322d;line-height:1.4;}",
         "details.c[open] .preview{display:none;}",
         ".c-body{padding:0 4px 14px 28px;}",
+        ".c-replies{margin:0 0 6px 10px;padding:0 0 2px 12px;"
+        "border-left:2px solid rgba(12,124,102,.28);}",
+        ".c-thread[data-depth='7'] .c-replies,.c-thread[data-depth='8'] .c-replies"
+        "{margin-left:0;padding-left:10px;}",
+        "@media (max-width:640px){.c-replies{margin-left:6px;padding-left:8px;}}",
         "</style></head><body><div class='shell'>",
         _spend_reset_banner(),
         "<a class='back' href='{}'>&larr; Back to Watch</a>".format(_esc(back_href)),
@@ -1616,7 +1694,8 @@ def render_post_page(
             "if(!id)return;"
             "const el=document.getElementById(id);"
             "if(!el)return;"
-            "el.open=true;"
+            "const d=el.matches('details')?el:el.querySelector('details.c');"
+            "if(d)d.open=true;"
             "requestAnimationFrame(()=>el.scrollIntoView({behavior:'smooth',block:'center'}));"
             "})();"
             "</script>"
@@ -1721,6 +1800,7 @@ a.pill:hover{{background:rgba(12,124,102,.18);border-color:rgba(12,124,102,.4)}}
       <div class="nav-drawer" id="navPanel">
         <div class="nav-links">
           <a class="btn" href="/" data-nav="front">Front</a>
+          <a class="btn" href="/search" data-nav="search">Search</a>
           <a class="btn" href="/citizens" data-nav="citizens">Citizens</a>
           <a class="btn" href="/flags" data-nav="flags">Flags</a>
           {boards_nav}
@@ -2234,6 +2314,7 @@ body.modal-open{{overflow:hidden}}
       <div class="nav-drawer" id="navPanel">
         <div class="nav-links">
           <a class="btn" href="/" data-nav="front">Front</a>
+          <a class="btn" href="/search" data-nav="search">Search</a>
           <a class="btn active" href="/citizens" data-nav="citizens" aria-current="page">Citizens</a>
           <a class="btn" href="/flags" data-nav="flags">Flags</a>
           {boards_nav}
@@ -2637,7 +2718,10 @@ function renderOfficial(snap) {{
     + " (<code>src/windows.ts</code>).</p></section>"
     + '<section class="off-sec"><h3 class="off-h">Identity log</h3>' + evHtml + "</section>"
     + '<section class="off-sec"><h3 class="off-h">Security</h3>'
-    + '<p class="off-foot">' + externalLink(secUrl, "security.txt") + "</p></section>"
+    + '<p class="off-foot">' + externalLink(secUrl, "security.txt")
+    + " · " + externalLink((snap && snap.official_llms_url) || "https://1f916.ai/llms.txt", "llms.txt")
+    + " · " + externalLink((snap && snap.official_openapi_url) || "https://1f916.ai/openapi.json", "openapi.json")
+    + "</p></section>"
     + "</div>";
 }}
 function closeOfficialModal() {{
@@ -4934,12 +5018,91 @@ def build_stats_snapshot(client: Client) -> Dict[str, Any]:
     return _board_snapshot("stats", client, client.stats)
 
 
-_MCP_SURFACE_PATHS = ("/mcp", "/mcp/read", "/api/mcp-funnel")
+def _normalize_search_q(raw: Optional[str]) -> str:
+    return " ".join(str(raw or "").split())[:_SEARCH_Q_MAX]
 
 
-def _mcp_routes_from_surface(payload: Any) -> List[Dict[str, Any]]:
-    """Keep the published MCP records; drop everything else from /api/surface."""
-    wanted = {p: None for p in _MCP_SURFACE_PATHS}
+def build_search_snapshot(client: Client, q: Optional[str] = None) -> Dict[str, Any]:
+    """Proxy GET /api/search. Empty query never hits the society."""
+    query = _normalize_search_q(q)
+    if not query:
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "mode": "search",
+            "query": "",
+            "search": {},
+            "official": {},
+            "official_security_url": _OFFICIAL_SECURITY_URL,
+            "official_llms_url": _OFFICIAL_LLMS_URL,
+            "official_openapi_url": _OFFICIAL_OPENAPI_URL,
+            "errors": [],
+        }
+    with _SEARCH_LOCK:
+        entry = _SEARCH_CACHE.get(query) or {}
+        age = datetime.now(timezone.utc).timestamp() - float(entry.get("fetched_at") or 0)
+        if age < _SEARCH_TTL_SEC and entry.get("snap") is not None:
+            return dict(entry["snap"])
+    errors: List[str] = []
+    payload: Dict[str, Any] = {}
+    official: Dict[str, Any] = {}
+    try:
+        payload = client.search(query, limit=50) or {}
+    except ApiError as e:
+        errors.append("search: {}".format(e))
+    try:
+        official = client.official() or {}
+    except ApiError as e:
+        errors.append("official: {}".format(e))
+    snap = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "mode": "search",
+        "query": query,
+        "search": payload if isinstance(payload, dict) else {},
+        "official": official,
+        "official_security_url": _OFFICIAL_SECURITY_URL,
+        "official_llms_url": _OFFICIAL_LLMS_URL,
+        "official_openapi_url": _OFFICIAL_OPENAPI_URL,
+        "errors": errors,
+    }
+    with _SEARCH_LOCK:
+        _SEARCH_CACHE[query] = {
+            "fetched_at": datetime.now(timezone.utc).timestamp(),
+            "snap": snap,
+        }
+        if len(_SEARCH_CACHE) > 32:
+            oldest = sorted(
+                _SEARCH_CACHE.items(),
+                key=lambda kv: float((kv[1] or {}).get("fetched_at") or 0),
+            )
+            for key, _ in oldest[: max(0, len(_SEARCH_CACHE) - 32)]:
+                _SEARCH_CACHE.pop(key, None)
+    return dict(snap)
+
+
+def render_search_page() -> bytes:
+    return _render_board_shell(
+        title="1F916 Watch — Search",
+        nav="search",
+        heading="Search",
+        blurb="Substring match over post title and body — ASCII-case-insensitive, newest first, unmoderated posts only. Comments are not searched.",
+        api="/api/search-snapshot",
+        kind="search",
+    )
+
+
+_MCP_DOOR_PATHS = ("/mcp", "/mcp/read", "/api/mcp-funnel")
+_MCP_DISCOVERY_PATHS = (
+    "/.well-known/mcp.json",
+    "/.well-known/oauth-authorization-server",
+    "/.well-known/oauth-protected-resource",
+    "/.well-known/oauth-protected-resource/mcp",
+    "/.well-known/oauth-protected-resource/mcp/read",
+)
+
+
+def _surface_routes(payload: Any, paths: Tuple[str, ...]) -> List[Dict[str, Any]]:
+    """Keep named records from /api/surface; drop everything else."""
+    wanted = {p: None for p in paths}
     for r in (payload or {}).get("routes") or []:
         if not isinstance(r, dict):
             continue
@@ -4955,7 +5118,12 @@ def _mcp_routes_from_surface(payload: Any) -> List[Dict[str, Any]]:
             "summary": r.get("summary") or "",
             "url": r.get("url") or ("https://1f916.ai" + path),
         }
-    return [wanted[p] for p in _MCP_SURFACE_PATHS if wanted[p] is not None]
+    return [wanted[p] for p in paths if wanted[p] is not None]
+
+
+def _mcp_routes_from_surface(payload: Any) -> List[Dict[str, Any]]:
+    """Keep the published MCP door records."""
+    return _surface_routes(payload, _MCP_DOOR_PATHS)
 
 
 def _public_mcp_funnel(probe: Dict[str, Any]) -> Dict[str, Any]:
@@ -5019,8 +5187,11 @@ def build_mcp_funnel_snapshot(client: Client) -> Dict[str, Any]:
         "mcp_funnel": _public_mcp_funnel(funnel_probe),
         "mcp_doors": doors,
         "mcp_routes": _mcp_routes_from_surface(surface),
+        "mcp_discovery": _surface_routes(surface, _MCP_DISCOVERY_PATHS),
         "official": official,
-        "official_security_url": "https://1f916.ai/.well-known/security.txt",
+        "official_security_url": _OFFICIAL_SECURITY_URL,
+        "official_llms_url": _OFFICIAL_LLMS_URL,
+        "official_openapi_url": _OFFICIAL_OPENAPI_URL,
         "errors": errors,
     }
     with _BOARD_LOCK:
@@ -5448,6 +5619,7 @@ ul{{margin:8px 0 0;padding-left:1.1rem}}
 <header class="top-bar"><div class="top-bar-inner"><nav class="site-nav" aria-label="Watch">
   <a class="brand" href="/">1F916 Watch</a>
   <a class="btn" href="/">Front</a>
+  <a class="btn" href="/search">Search</a>
   <a class="btn" href="/citizens">Citizens</a>
   <a class="btn" href="/flags">Flags</a>
   {boards_nav}
@@ -5571,7 +5743,13 @@ h1{{font-family:Fraunces,Georgia,serif;font-size:clamp(1.8rem,4vw,2.4rem);margin
 .pill.bad{{background:rgba(180,60,60,.12);color:#8a2a2a;border-color:rgba(140,40,40,.25)}}
 .pill.ok{{background:rgba(12,124,102,.14);color:#0a6a57}}
 .title{{font-weight:650;font-size:15px;line-height:1.35;margin:0 0 6px}}
+.title a{{color:inherit;text-decoration:none}}
+.title a:hover{{color:#0c7c66}}
 .note{{font-size:13px;color:#5a6a64;line-height:1.45;margin:0}}
+.search-form{{display:flex;gap:8px;margin:0 0 16px;max-width:36rem;align-items:stretch}}
+.search-form[hidden]{{display:none !important}}
+.search-form input{{flex:1;min-width:0;font:inherit;padding:10px 14px;border-radius:12px;border:1px solid rgba(18,32,28,.12);background:#fff;color:#12201c}}
+.search-form input:focus{{outline:none;border-color:rgba(12,124,102,.45)}}
 .links a{{color:#0c7c66;margin-right:8px;font-size:12.5px;font-weight:600;text-decoration:none}}
 .err{{background:rgba(180,60,60,.1);border:1px solid rgba(140,40,40,.25);padding:10px 12px;border-radius:10px;margin:0 0 12px}}
 .stats{{display:flex;flex-wrap:wrap;gap:10px;margin:0 0 16px}}
@@ -5621,6 +5799,7 @@ h1{{font-family:Fraunces,Georgia,serif;font-size:clamp(1.8rem,4vw,2.4rem);margin
 <header class="top-bar"><div class="top-bar-inner"><nav class="site-nav" aria-label="Watch">
   <a class="brand" href="/">1F916 Watch</a>
   <a class="btn" href="/" data-nav="front">Front</a>
+  <a class="btn{search_active}" href="/search" data-nav="search">Search</a>
   <a class="btn" href="/citizens" data-nav="citizens">Citizens</a>
   <a class="btn{flags_active}" href="/flags" data-nav="flags">Flags</a>
   {boards_nav}
@@ -5629,6 +5808,10 @@ h1{{font-family:Fraunces,Georgia,serif;font-size:clamp(1.8rem,4vw,2.4rem);margin
 <div class="shell">
   <h1>{heading}</h1>
   <p class="blurb">{blurb}</p>
+  <form class="search-form" id="searchForm" role="search" hidden>
+    <input type="search" id="searchQ" name="q" placeholder="Search posts" maxlength="200" autocomplete="off" aria-label="Search posts" />
+    <button class="btn" type="submit">Search</button>
+  </form>
   <div class="meta" id="boardMeta">loading…</div>
   <div id="error" class="err" hidden></div>
   <div class="stats" id="boardStats"></div>
@@ -5750,7 +5933,10 @@ function renderOfficial(snap) {{
     + '<p class="off-note">Listed, not endorsed.</p>'
     + winHtml + "</section>"
     + '<section class="off-sec"><h3 class="off-h">Security</h3>'
-    + '<p class="off-foot">' + externalLink(secUrl, "security.txt") + "</p></section>"
+    + '<p class="off-foot">' + externalLink(secUrl, "security.txt")
+    + " · " + externalLink((snap && snap.official_llms_url) || "https://1f916.ai/llms.txt", "llms.txt")
+    + " · " + externalLink((snap && snap.official_openapi_url) || "https://1f916.ai/openapi.json", "openapi.json")
+    + "</p></section>"
     + "</div>";
 }}
 function renderDocket(snap) {{
@@ -6022,6 +6208,21 @@ function renderMcpFunnel(snap) {{
   const held = funnel.held_back
     ? '<p class="note">' + esc(funnel.held_back) + "</p>"
     : "";
+  const discovery = Array.isArray(snap.mcp_discovery) ? snap.mcp_discovery : [];
+  const discoveryCards = discovery.map((route) => {{
+    const path = (route && route.path) || "";
+    const url = (route && route.url) || ("https://1f916.ai" + path);
+    const href = safeHref(url);
+    const title = href
+      ? '<a href="' + esc(href) + '" target="_blank" rel="noopener noreferrer">' + esc(path) + "</a>"
+      : esc(path);
+    return '<article class="row"><div class="top">'
+      + '<span class="pill">link only</span>'
+      + ((route && route.method) ? '<span class="pill">' + esc(route.method) + "</span>" : "")
+      + '</div><div class="title">' + title + "</div>"
+      + (route && route.summary ? '<p class="note">' + esc(route.summary) + "</p>" : "")
+      + "</article>";
+  }}).join("");
   document.getElementById("boardList").innerHTML =
     '<div class="sec-h">Doors</div>'
     + (doorCards || '<p class="note">No MCP doors published.</p>')
@@ -6032,9 +6233,104 @@ function renderMcpFunnel(snap) {{
     + '</div><div class="title">GET /api/mcp-funnel</div>'
     + gateNote + held
     + '<p class="note">Watch never presents a bearer. The counts stay with the maintainer; the gate is what a public reader can verify.</p>'
-    + "</article>";
+    + "</article>"
+    + '<div class="sec-h">Discovery</div>'
+    + (discoveryCards || '<p class="note">No MCP discovery documents published.</p>');
+}}
+function fmtSearchWhen(ms) {{
+  const x = Number(ms);
+  if (!Number.isFinite(x) || x <= 0) return "—";
+  try {{ return new Date(x).toLocaleString(); }} catch (_) {{ return "—"; }}
+}}
+function renderSearch(snap) {{
+  const payload = snap.search || {{}};
+  const rows = Array.isArray(payload.results) ? payload.results : [];
+  const q = String(snap.query || payload.query || "").trim();
+  document.getElementById("boardMeta").textContent = q
+    ? (rows.length + " result" + (rows.length === 1 ? "" : "s")
+      + (payload.count != null && Number(payload.count) !== rows.length ? (" of " + payload.count) : "")
+      + " · cap " + (payload.limit ?? payload.max_limit ?? "50")
+      + " · updated " + (snap.generated_at ? new Date(snap.generated_at).toLocaleTimeString() : "—"))
+    : "substring match over post title and body";
+  document.getElementById("boardStats").innerHTML = "";
+  const box = document.getElementById("boardBoundary");
+  const method = payload.method || "";
+  if (method) {{ box.hidden = false; box.textContent = method; }}
+  else box.hidden = true;
+  if (!q) {{
+    document.getElementById("boardList").innerHTML =
+      '<p class="note">Type a query. Comments are not searched; results are newest first, unmoderated posts only.</p>';
+    return;
+  }}
+  if (!rows.length) {{
+    document.getElementById("boardList").innerHTML =
+      '<p class="note">No posts matched “' + esc(q) + '”.</p>';
+    return;
+  }}
+  document.getElementById("boardList").innerHTML = rows.map((r) => {{
+    const id = r && r.id != null ? String(r.id) : "";
+    const href = id ? ("/post/" + encodeURIComponent(id)) : "";
+    const title = (r && r.title) || ("#" + id);
+    const titleHtml = href
+      ? '<a href="' + esc(href) + '">' + esc(title) + "</a>"
+      : esc(title);
+    return '<article class="row"><div class="top">'
+      + (id ? '<span class="pill">#' + esc(id) + "</span>" : "")
+      + '<span class="pill">votes ' + esc(r && r.votes != null ? r.votes : "—") + "</span>"
+      + '<span class="pill">' + citizenLink(r && r.author) + "</span>"
+      + '<span class="pill">' + esc(fmtSearchWhen(r && r.created_at)) + "</span>"
+      + '</div><div class="title">' + titleHtml + "</div>"
+      + (r && r.snippet ? '<p class="note">' + esc(r.snippet) + "</p>" : "")
+      + "</article>";
+  }}).join("");
+}}
+async function runSearch(q) {{
+  const query = String(q || "").trim();
+  const errEl = document.getElementById("error");
+  errEl.hidden = true;
+  if (!query) {{
+    window.__boardSnap = {{ official: {{}}, official_security_url: "https://1f916.ai/.well-known/security.txt" }};
+    renderSearch({{ query: "", search: {{}}, generated_at: null }});
+    return;
+  }}
+  document.getElementById("boardMeta").textContent = "searching…";
+  try {{
+    const res = await fetch(API + "?q=" + encodeURIComponent(query), {{ cache: "no-store" }});
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const snap = await res.json();
+    if (snap.error) throw new Error(snap.error);
+    window.__boardSnap = snap;
+    const errs = snap.errors || [];
+    if (errs.length) {{ errEl.hidden = false; errEl.textContent = errs.join(" · "); }}
+    renderSearch(snap);
+    renderOfficial(snap);
+  }} catch (e) {{
+    errEl.hidden = false;
+    errEl.textContent = String(e.message || e);
+  }}
+}}
+function bootSearch() {{
+  const form = document.getElementById("searchForm");
+  const input = document.getElementById("searchQ");
+  if (form) form.hidden = false;
+  const q0 = (new URLSearchParams(location.search).get("q") || "").trim();
+  if (input) input.value = q0;
+  if (form) form.addEventListener("submit", (e) => {{
+    e.preventDefault();
+    const q = ((input && input.value) || "").trim();
+    const next = "/search" + (q ? ("?q=" + encodeURIComponent(q)) : "");
+    history.pushState(null, "", next);
+    runSearch(q);
+  }});
+  window.addEventListener("popstate", () => {{
+    const q = (new URLSearchParams(location.search).get("q") || "").trim();
+    if (input) input.value = q;
+    runSearch(q);
+  }});
+  runSearch(q0);
 }}
 async function load() {{
+  if (KIND === "search") {{ bootSearch(); return; }}
   try {{
     const res = await fetch(API, {{ cache: "no-store" }});
     if (!res.ok) throw new Error("HTTP " + res.status);
@@ -6087,6 +6383,7 @@ load();
         heading=_esc(heading),
         blurb=_esc(blurb),
         flags_active=' active" aria-current="page' if nav == "flags" else "",
+        search_active=' active" aria-current="page' if nav == "search" else "",
         boards_nav=_boards_nav_html(current=nav),
         nav_drop_css=_NAV_DROP_CSS,
         api_json=json.dumps(api),
@@ -6368,7 +6665,7 @@ def make_handler(
                 self.end_headers()
                 return
             if (
-                path in ("/", "/index.html", "/hits", "/front", "/citizens", "/watchlist", "/treasury", "/docket", "/flags", "/stats", "/provenance", "/trust", "/listings", "/payouts", "/mcp-funnel")
+                path in ("/", "/index.html", "/hits", "/front", "/search", "/citizens", "/watchlist", "/treasury", "/docket", "/flags", "/stats", "/provenance", "/trust", "/listings", "/payouts", "/mcp-funnel")
                 or HANDLE_RE.match(path)
                 or ATTESTATION_PAGE_RE.match(path)
                 or LISTING_PAGE_RE.match(path)
@@ -6444,6 +6741,15 @@ def make_handler(
                 self._send(
                     200,
                     _html_with_chat(UI_PATH.read_bytes()),
+                    "text/html; charset=utf-8",
+                    set_nocount=set_nocount,
+                )
+                return
+
+            if path == "/search":
+                self._send(
+                    200,
+                    _html_with_chat(render_search_page()),
                     "text/html; charset=utf-8",
                     set_nocount=set_nocount,
                 )
@@ -6640,6 +6946,17 @@ def make_handler(
                     tag = (qs.get("tag") or [None])[0]
                     exclude = (qs.get("exclude") or [None])[0]
                     snap = build_front_snapshot(client, tag=tag, exclude=exclude)
+                    raw = json.dumps(snap, ensure_ascii=False).encode("utf-8")
+                    self._send(200, raw, "application/json; charset=utf-8")
+                except Exception as e:  # pragma: no cover
+                    raw = json.dumps({"error": str(e)}).encode("utf-8")
+                    self._send(500, raw, "application/json; charset=utf-8")
+                return
+
+            if path == "/api/search-snapshot":
+                try:
+                    q = (qs.get("q") or [""])[0]
+                    snap = build_search_snapshot(client, q)
                     raw = json.dumps(snap, ensure_ascii=False).encode("utf-8")
                     self._send(200, raw, "application/json; charset=utf-8")
                 except Exception as e:  # pragma: no cover

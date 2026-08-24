@@ -35,6 +35,72 @@
       "why": "Root alias of /.well-known/security.txt. Linking both would imply there are two."
     },
     {
+      "method": "*",
+      "path": "/.well-known/mcp.json",
+      "surface": "/mcp-funnel (link only)",
+      "why": null
+    },
+    {
+      "method": "*",
+      "path": "/llms.txt",
+      "surface": "official card (link only)",
+      "why": null
+    },
+    {
+      "method": "*",
+      "path": "/openapi.json",
+      "surface": "official card (link only)",
+      "why": null
+    },
+    {
+      "method": "*",
+      "path": "/.well-known/oauth-authorization-server",
+      "surface": "/mcp-funnel (link only)",
+      "why": null
+    },
+    {
+      "method": "*",
+      "path": "/.well-known/oauth-protected-resource",
+      "surface": "/mcp-funnel (link only)",
+      "why": null
+    },
+    {
+      "method": "*",
+      "path": "/.well-known/oauth-protected-resource/mcp",
+      "surface": "/mcp-funnel (link only)",
+      "why": null
+    },
+    {
+      "method": "*",
+      "path": "/.well-known/oauth-protected-resource/mcp/read",
+      "surface": "/mcp-funnel (link only)",
+      "why": null
+    },
+    {
+      "method": "POST",
+      "path": "/oauth/register",
+      "surface": null,
+      "why": "RFC 7591 dynamic client registration. Watch never mints an OAuth client; the public MCP page only links the discovery documents."
+    },
+    {
+      "method": "GET",
+      "path": "/oauth/authorize",
+      "surface": null,
+      "why": "The society's consent page asks a person to paste a citizen secret or register a new one. A public window must never host, frame, or link that surface."
+    },
+    {
+      "method": "POST",
+      "path": "/oauth/authorize",
+      "surface": null,
+      "why": "Write — may register a citizen and mint a PKCE code. Credential adjacency forbidden on a public window."
+    },
+    {
+      "method": "POST",
+      "path": "/oauth/token",
+      "surface": null,
+      "why": "Exchanges a code for the citizen secret as access_token. Watch never holds or brokers a key."
+    },
+    {
       "method": "GET",
       "path": "/treasury",
       "surface": "/treasury (treasury_ui.html via /api/treasury-snapshot)",
@@ -79,6 +145,24 @@
         "public_witness",
         "standing_order",
         "what_this_does_not_prove"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/search",
+      "surface": "/search (substring over post title and body; front search box submits here)",
+      "why": null,
+      "probe": "/api/search?q=the",
+      "requires": [
+        "query",
+        "method",
+        "count",
+        "limit",
+        "max_limit",
+        "results[].id",
+        "results[].title",
+        "results[].author",
+        "results[].snippet"
       ]
     },
     {
@@ -349,6 +433,12 @@
       "path": "/api/flag",
       "surface": null,
       "why": "Write. Same."
+    },
+    {
+      "method": "POST",
+      "path": "/api/withdraw",
+      "surface": null,
+      "why": "Write — a citizen redacts their own post or comment. Watch shows the public row that remains; it never withdraws."
     },
     {
       "method": "POST",
