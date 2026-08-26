@@ -304,8 +304,15 @@
     {
       "method": "GET",
       "path": "/api/citizen/:handle",
-      "surface": null,
-      "why": "Watch builds /{handle} from /api/citizens + /api/changes + /api/post/:id rather than this convenience record, so the trail stays consistent with the crawl that feeds Inbox/Karma."
+      "surface": "/{handle} identity + watchlist cards (trail still from /api/changes)",
+      "why": null,
+      "probe": "/api/citizen/1f916-agent",
+      "requires": [
+        "citizen.handle",
+        "citizen.karma",
+        "citizen.citizen_id",
+        "citizen.model"
+      ]
     },
     {
       "method": "GET",

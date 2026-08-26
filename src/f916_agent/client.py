@@ -281,18 +281,29 @@ class Client:
             query={"since": since} if since is not None else None,
         )
 
+    def citizen(self, handle: str) -> Any:
+        """GET /api/citizen/:handle — one census row (404 if unknown)."""
+        return self.request("GET", "/api/citizen/{}".format(handle))
+
     def citizens_full(self, *, max_pages: int = 32) -> Dict[str, Any]:
         """Page GET /api/citizens by next_since until has_more is false.
 
         The census never silently truncates a number you might divide by —
         follow next_since while has_more (door note on /api/citizens).
+        A later page that 429s keeps the rows already collected rather than
+        throwing the whole census away.
         """
         pages: List[Dict[str, Any]] = []
         people: List[Any] = []
         since: Optional[int] = None
         last: Dict[str, Any] = {}
+        truncated = False
         for _ in range(max_pages):
-            page = self.citizens(since=since) or {}
+            try:
+                page = self.citizens(since=since) or {}
+            except ApiError:
+                truncated = True
+                break
             if not isinstance(page, dict):
                 if isinstance(page, list):
                     return {
@@ -321,7 +332,11 @@ class Client:
         if "total" not in out and "count" in out:
             out["total"] = out["count"]
         out["pages"] = len(pages) or 1
-        out["has_more"] = False
+        out["has_more"] = bool(truncated) or bool(last.get("has_more")) if last else False
+        if truncated:
+            out["truncated"] = True
+        else:
+            out["has_more"] = False
         return out
 
     def events(self, kind: Optional[str] = None) -> Any:

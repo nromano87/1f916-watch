@@ -3719,11 +3719,44 @@ def _load_changes_index(client: Client, *, force: bool = False) -> Dict[str, Any
 
 
 def find_citizen(client: Client, handle: str) -> Optional[Dict[str, Any]]:
-    needle = (handle or "").strip().lower()
+    """Resolve one handle via GET /api/citizen/:handle.
+
+    Do not page the census for this. A 1,700-row /api/citizens walk 429s, and
+    the exception used to make every watchlist card look like a missing citizen.
+
+    Returns None only when the society says the handle is unknown (404).
+    Other failures raise so callers can keep the handle instead of lying.
+    Trail bodies still come from /api/changes — this is identity only.
+    """
+    needle = (handle or "").strip()
     if not needle:
         return None
     try:
-        data = client.citizens_full() or {}
+        data = client.citizen(needle) or {}
+    except ApiError as e:
+        if int(getattr(e, "status", 0) or 0) == 404:
+            return None
+        person = _find_citizen_on_census_page(client, needle)
+        if person:
+            return person
+        raise
+    if not isinstance(data, dict):
+        return None
+    person = data.get("citizen")
+    if isinstance(person, dict) and person.get("handle"):
+        return person
+    if data.get("handle"):
+        return data
+    return None
+
+
+def _find_citizen_on_census_page(
+    client: Client, handle: str
+) -> Optional[Dict[str, Any]]:
+    """First census page only — fallback when the per-handle route fails."""
+    needle = handle.strip().lower()
+    try:
+        data = client.citizens() or {}
     except ApiError:
         return None
     people = data if isinstance(data, list) else (data.get("citizens") or [])
@@ -3809,7 +3842,14 @@ def build_watchlist_inbox(
     citizens_out: List[Dict[str, Any]] = []
 
     for handle in cleaned:
-        person = find_citizen(client, handle)
+        person: Optional[Dict[str, Any]] = None
+        lookup_error: Optional[str] = None
+        try:
+            person = find_citizen(client, handle)
+        except ApiError as e:
+            lookup_error = "identity: {}".format(e)
+            errors.append("{}: {}".format(handle, lookup_error))
+            person = {"handle": handle}
         if not person:
             citizens_out.append(
                 {
@@ -3846,10 +3886,15 @@ def build_watchlist_inbox(
             own_ids.add(pid)
         own_comments = [c for c in all_comments if c.get("author") == h]
         today = _allowance_from_ledger(own_posts, own_comments)
+        karma_raw = person.get("karma")
+        try:
+            karma = int(karma_raw) if karma_raw is not None else None
+        except (TypeError, ValueError):
+            karma = None
         entry: Dict[str, Any] = {
             "handle": h,
             "model": person.get("model"),
-            "karma": int(person.get("karma") or 0),
+            "karma": karma,
             "citizen_id": person.get("id") or person.get("citizen_id"),
             "error": None,
             "inbox": {"items": [], "counts": {"total": 0}},
@@ -4078,7 +4123,12 @@ def build_public_snapshot(
     """Society-visible Watch view for any citizen — no local secret.
     """
     errors: List[str] = []
-    person = find_citizen(client, handle)
+    person: Optional[Dict[str, Any]] = None
+    try:
+        person = find_citizen(client, handle)
+    except ApiError as e:
+        errors.append("citizen: {}".format(e))
+        person = {"handle": handle}
     if not person:
         return {
             "generated_at": datetime.now(timezone.utc).isoformat(),
