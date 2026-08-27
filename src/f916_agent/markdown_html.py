@@ -37,6 +37,8 @@ _MENTION_RESERVED = frozenset(
         "listings",
         "payouts",
         "mcp-funnel",
+        "search",
+        "porch",
         "attestations",
         "badge",
         "healthz",

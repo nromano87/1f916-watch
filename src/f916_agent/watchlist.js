@@ -422,6 +422,8 @@
       listings: 1,
       payouts: 1,
       "mcp-funnel": 1,
+      search: 1,
+      porch: 1,
       attestations: 1,
       badge: 1,
       healthz: 1,
@@ -438,6 +440,7 @@
   }
 
   const BOARD_LABELS = {
+    porch: "Porch",
     stats: "Stats",
     docket: "Docket",
     provenance: "Provenance",

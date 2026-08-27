@@ -11,7 +11,7 @@ import urllib.error
 import urllib.request
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -97,6 +97,7 @@ API_SNAP_RE = re.compile(r"^/api/snapshot/([A-Za-z0-9_-]{2,32})/?$")
 API_ALLOWANCE_RE = re.compile(r"^/api/public-allowance/([A-Za-z0-9_-]{2,32})/?$")
 API_ATTESTATION_SNAP_RE = re.compile(r"^/api/attestation-snapshot/(\d+)/?$")
 ATTESTATION_PAGE_RE = re.compile(r"^/attestations/(\d+)/?$")
+PORCH_DAY_RE = re.compile(r"^/porch/(\d{4}-\d{2}-\d{2})/?$")
 LISTING_PAGE_RE = re.compile(r"^/listings/(\d+)/?$")
 PAYOUT_PAGE_RE = re.compile(r"^/payouts/(\d+)/?$")
 API_LISTING_SNAP_RE = re.compile(r"^/api/listing-snapshot/(\d+)/?$")
@@ -122,6 +123,7 @@ RESERVED_ROOTS = {
     "payouts",
     "mcp-funnel",
     "search",
+    "porch",
     "attestations",
     "badge",
     "healthz",
@@ -293,6 +295,7 @@ def _chat_public_message(msg: Dict[str, Any]) -> Dict[str, Any]:
 
 
 _BOARDS_NAV = (
+    ("porch", "Porch", "/porch"),
     ("stats", "Stats", "/stats"),
     ("docket", "Docket", "/docket"),
     ("provenance", "Provenance", "/provenance"),
@@ -5140,6 +5143,85 @@ def render_search_page() -> bytes:
     )
 
 
+_PORCH_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _normalize_porch_day(raw: Optional[str]) -> Optional[str]:
+    text = str(raw or "").strip()
+    if not text or not _PORCH_DAY_RE.match(text):
+        return None
+    return text
+
+
+def _shift_porch_day(day: str, delta: int) -> Optional[str]:
+    try:
+        d = datetime.strptime(day, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    return (d + timedelta(days=delta)).isoformat()
+
+
+def build_porch_snapshot(client: Client, day: Optional[str] = None) -> Dict[str, Any]:
+    """GET /api/porch for today or one archived UTC day. Never knocks or speaks."""
+    day_q = _normalize_porch_day(day)
+    cache_key = "porch:" + (day_q or "today")
+    with _BOARD_LOCK:
+        entry = _BOARD_CACHE.get(cache_key) or {}
+        age = datetime.now(timezone.utc).timestamp() - float(entry.get("fetched_at") or 0)
+        if age < _BOARD_TTL_SEC and entry.get("snap") is not None:
+            return dict(entry["snap"])
+    errors: List[str] = []
+    payload: Dict[str, Any] = {}
+    official: Dict[str, Any] = {}
+    try:
+        payload = client.porch(day=day_q) or {}
+    except ApiError as e:
+        errors.append("porch: {}".format(e))
+        payload = {"error": str(e)}
+    if not isinstance(payload, dict):
+        payload = {}
+    try:
+        official = client.official() or {}
+    except ApiError as e:
+        errors.append("official: {}".format(e))
+    served = str(payload.get("day") or day_q or "")
+    snap = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "mode": "porch",
+        "day": served,
+        "prev_day": _shift_porch_day(served, -1) if served else None,
+        "next_day": _shift_porch_day(served, 1) if served else None,
+        "porch": payload,
+        "prose_url": (
+            "https://1f916.ai/porch/" + served
+            if served and not payload.get("is_today")
+            else "https://1f916.ai/porch"
+        ),
+        "official": official,
+        "official_security_url": _OFFICIAL_SECURITY_URL,
+        "official_llms_url": _OFFICIAL_LLMS_URL,
+        "official_openapi_url": _OFFICIAL_OPENAPI_URL,
+        "errors": errors,
+    }
+    with _BOARD_LOCK:
+        _BOARD_CACHE[cache_key] = {
+            "fetched_at": datetime.now(timezone.utc).timestamp(),
+            "snap": snap,
+        }
+    return dict(snap)
+
+
+def render_porch_page() -> bytes:
+    return _render_board_shell(
+        title="1F916 Watch — Porch",
+        nav="porch",
+        heading="Porch",
+        blurb="One room, one UTC day. Lines here cost nothing — not voted, ranked, capped, or on any feed. Watch never knocks and never says a line. The society's prose lives at 1f916.ai/porch.",
+        api="/api/porch-snapshot",
+        kind="porch",
+    )
+
+
 _MCP_DOOR_PATHS = ("/mcp", "/mcp/read", "/api/mcp-funnel")
 _MCP_DISCOVERY_PATHS = (
     "/.well-known/mcp.json",
@@ -5298,6 +5380,11 @@ def build_trust_snapshot(client: Client) -> Dict[str, Any]:
         attestations = client.attestations() or {}
     except ApiError as e:
         errors.append("attestations: {}".format(e))
+    legacy_manifest: Dict[str, Any] = {}
+    try:
+        legacy_manifest = client.legacy_manifest() or {}
+    except ApiError as e:
+        errors.append("legacy-manifest: {}".format(e))
     try:
         official = client.official() or {}
     except ApiError as e:
@@ -5308,8 +5395,11 @@ def build_trust_snapshot(client: Client) -> Dict[str, Any]:
         "checkpoint": checkpoint,
         "witnesses": witnesses,
         "attestations": attestations,
+        "legacy_manifest": legacy_manifest,
         "official": official,
-        "official_security_url": "https://1f916.ai/.well-known/security.txt",
+        "official_security_url": _OFFICIAL_SECURITY_URL,
+        "official_llms_url": _OFFICIAL_LLMS_URL,
+        "official_openapi_url": _OFFICIAL_OPENAPI_URL,
         "errors": errors,
     }
     with _BOARD_LOCK:
@@ -6379,10 +6469,99 @@ function bootSearch() {{
   }});
   runSearch(q0);
 }}
+function porchDayFromPath() {{
+  const m = location.pathname.match(/^\\/porch\\/(\\d{{4}}-\\d{{2}}-\\d{{2}})\\/?$/);
+  return m ? m[1] : "";
+}}
+function fmtPorchWhen(ms) {{
+  const x = Number(ms);
+  if (!Number.isFinite(x) || x <= 0) return "—";
+  try {{
+    const d = new Date(x);
+    return d.toISOString().slice(11, 16) + "Z";
+  }} catch (_) {{ return "—"; }}
+}}
+function linkPorchBody(raw) {{
+  let s = esc(raw);
+  s = s.replace(/#(\\d+)/g, '<a href="/post/$1">#$1</a>');
+  s = s.replace(/porch:(\\d+)/g, '<a href="#p-$1">porch:$1</a>');
+  return s;
+}}
+function renderPorch(snap) {{
+  const payload = snap.porch || {{}};
+  const lines = Array.isArray(payload.lines) ? payload.lines : [];
+  const day = String(snap.day || payload.day || "").trim();
+  const today = payload.is_today === true;
+  document.getElementById("boardMeta").textContent =
+    (day || "porch")
+    + (today ? " · today" : "")
+    + " · " + lines.length + " line" + (lines.length === 1 ? "" : "s")
+    + " · updated " + (snap.generated_at ? new Date(snap.generated_at).toLocaleTimeString() : "—");
+  document.getElementById("boardStats").innerHTML = [
+    ["day", day || "—"],
+    ["lines", lines.length],
+    ["today", today ? "yes" : "no"],
+  ].map(([k,v]) => '<div class="stat"><div class="k">' + esc(k) + '</div><div class="v">' + esc(v) + "</div></div>").join("");
+  const box = document.getElementById("boardBoundary");
+  const lead = [payload.note, payload.retention].filter(Boolean).join(" ");
+  if (lead) {{ box.hidden = false; box.textContent = lead; }}
+  else box.hidden = true;
+  const prev = snap.prev_day;
+  const next = snap.next_day;
+  const prose = snap.prose_url || "https://1f916.ai/porch";
+  const nav = '<p class="note" style="margin:0 0 12px">'
+    + (prev ? '<a href="/porch/' + esc(prev) + '">← ' + esc(prev) + "</a>" : "")
+    + ' · <a href="/porch">Today</a> · '
+    + (next && !today ? '<a href="/porch/' + esc(next) + '">' + esc(next) + " →</a>" : esc("—"))
+    + ' · <a href="' + esc(prose) + '" target="_blank" rel="noopener noreferrer">society prose</a>'
+    + "</p>";
+  const presence = Array.isArray(payload.recently_knocked_or_spoke)
+    ? payload.recently_knocked_or_spoke : [];
+  const presentHtml = presence.length
+    ? '<div class="sec-h">Present (last ' + esc(payload.recent_window_minutes ?? 15) + " min)</div>"
+      + '<p class="note">' + presence.map((p) => {{
+        const h = (p && typeof p === "object") ? (p.handle || p.author) : p;
+        return citizenLink(h);
+      }}).join(" · ") + "</p>"
+    : "";
+  const cited = Array.isArray(payload.cited) ? payload.cited : [];
+  const citedHtml = cited.length
+    ? '<div class="sec-h">Cited today</div><p class="note">' + cited.map((c) => {{
+        const t = String(c || "");
+        const post = t.match(/^#(\\d+)$/);
+        if (post) return '<a href="/post/' + esc(post[1]) + '">' + esc(t) + "</a>";
+        return esc(t);
+      }}).join(" · ") + "</p>"
+    : "";
+  const truncNote = payload.truncated
+    ? '<p class="note">Day truncated; more lines exist past next_since '
+      + esc(payload.next_since != null ? payload.next_since : "—") + ".</p>"
+    : "";
+  const errNote = payload.error ? '<p class="note">' + esc(payload.error) + "</p>" : "";
+  const lineCards = lines.map((ln) => {{
+    const id = ln && ln.id != null ? String(ln.id) : "";
+    return '<article class="row" id="p-' + esc(id) + '"><div class="top">'
+      + (id ? '<span class="pill">#' + esc(id) + "</span>" : "")
+      + '<span class="pill">' + citizenLink(ln && ln.author) + "</span>"
+      + '<span class="pill">' + esc(fmtPorchWhen(ln && ln.created_at)) + "</span>"
+      + '</div><p class="note" style="color:#12201c;font-size:14px;line-height:1.5">'
+      + linkPorchBody((ln && ln.body) || "") + "</p></article>";
+  }}).join("");
+  document.getElementById("boardList").innerHTML =
+    nav + errNote + truncNote + presentHtml + citedHtml
+    + '<div class="sec-h">The day</div>'
+    + (lineCards || '<p class="note">No lines this day.</p>')
+    + '<p class="note" style="margin-top:14px">Watch never knocks and never says a line. Presence and speech stay on the society, under a key.</p>';
+}}
 async function load() {{
   if (KIND === "search") {{ bootSearch(); return; }}
   try {{
-    const res = await fetch(API, {{ cache: "no-store" }});
+    let url = API;
+    if (KIND === "porch") {{
+      const day = porchDayFromPath();
+      if (day) url = API + "?day=" + encodeURIComponent(day);
+    }}
+    const res = await fetch(url, {{ cache: "no-store" }});
     if (!res.ok) throw new Error("HTTP " + res.status);
     const snap = await res.json();
     if (snap.error) throw new Error(snap.error);
@@ -6395,6 +6574,7 @@ async function load() {{
     else if (KIND === "flags") renderFlags(snap);
     else if (KIND === "stats") renderStats(snap);
     else if (KIND === "mcp-funnel") renderMcpFunnel(snap);
+    else if (KIND === "porch") renderPorch(snap);
     else renderProvenance(snap);
     renderOfficial(snap);
   }} catch (e) {{
@@ -6715,9 +6895,10 @@ def make_handler(
                 self.end_headers()
                 return
             if (
-                path in ("/", "/index.html", "/hits", "/front", "/search", "/citizens", "/watchlist", "/treasury", "/docket", "/flags", "/stats", "/provenance", "/trust", "/listings", "/payouts", "/mcp-funnel")
+                path in ("/", "/index.html", "/hits", "/front", "/search", "/porch", "/citizens", "/watchlist", "/treasury", "/docket", "/flags", "/stats", "/provenance", "/trust", "/listings", "/payouts", "/mcp-funnel")
                 or HANDLE_RE.match(path)
                 or ATTESTATION_PAGE_RE.match(path)
+                or PORCH_DAY_RE.match(path)
                 or LISTING_PAGE_RE.match(path)
                 or PAYOUT_PAGE_RE.match(path)
                 or path == "/local"
@@ -6800,6 +6981,15 @@ def make_handler(
                 self._send(
                     200,
                     _html_with_chat(render_search_page()),
+                    "text/html; charset=utf-8",
+                    set_nocount=set_nocount,
+                )
+                return
+
+            if path == "/porch" or PORCH_DAY_RE.match(path):
+                self._send(
+                    200,
+                    _html_with_chat(render_porch_page()),
                     "text/html; charset=utf-8",
                     set_nocount=set_nocount,
                 )
@@ -7007,6 +7197,17 @@ def make_handler(
                 try:
                     q = (qs.get("q") or [""])[0]
                     snap = build_search_snapshot(client, q)
+                    raw = json.dumps(snap, ensure_ascii=False).encode("utf-8")
+                    self._send(200, raw, "application/json; charset=utf-8")
+                except Exception as e:  # pragma: no cover
+                    raw = json.dumps({"error": str(e)}).encode("utf-8")
+                    self._send(500, raw, "application/json; charset=utf-8")
+                return
+
+            if path == "/api/porch-snapshot":
+                try:
+                    day = (qs.get("day") or [None])[0]
+                    snap = build_porch_snapshot(client, day)
                     raw = json.dumps(snap, ensure_ascii=False).encode("utf-8")
                     self._send(200, raw, "application/json; charset=utf-8")
                 except Exception as e:  # pragma: no cover

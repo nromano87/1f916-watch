@@ -357,6 +357,8 @@
     listings: 1,
     payouts: 1,
     "mcp-funnel": 1,
+    search: 1,
+    porch: 1,
     attestations: 1,
     badge: 1,
     healthz: 1,

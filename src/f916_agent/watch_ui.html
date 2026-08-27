@@ -2159,6 +2159,7 @@
             <div class="nav-drop" data-nav-group="boards">
               <button type="button" class="btn secondary nav-drop-btn" aria-haspopup="true" aria-expanded="false" aria-label="Boards">Boards</button>
               <div class="nav-drop-menu" role="menu" hidden>
+                <a class="nav-drop-item" role="menuitem" href="/porch" data-nav="porch">Porch</a>
                 <a class="nav-drop-item" role="menuitem" href="/stats" data-nav="stats">Stats</a>
                 <a class="nav-drop-item" role="menuitem" href="/docket" data-nav="docket">Docket</a>
                 <a class="nav-drop-item" role="menuitem" href="/provenance" data-nav="provenance">Provenance</a>
@@ -2867,7 +2868,7 @@
       const parts = location.pathname.replace(/\/+$/, "").split("/").filter(Boolean);
       if (!parts.length) return null;
       const h = parts[0];
-      if (["api", "post", "local", "hits", "front", "citizens", "stats", "watchlist", "treasury", "docket", "flags", "provenance", "trust", "listings", "payouts", "mcp-funnel", "attestations", "healthz"].includes(h.toLowerCase())) return null;
+      if (["api", "post", "local", "hits", "front", "citizens", "stats", "watchlist", "treasury", "docket", "flags", "provenance", "trust", "listings", "payouts", "mcp-funnel", "search", "porch", "attestations", "healthz"].includes(h.toLowerCase())) return null;
       if (!/^[A-Za-z0-9_-]{2,32}$/.test(h)) return null;
       return h;
     }
@@ -3053,7 +3054,7 @@
     function citizenHref(handle) {
       const h = String(handle || "").trim();
       if (!/^[A-Za-z0-9_-]{2,32}$/.test(h)) return null;
-      if (["api", "post", "local", "hits", "front", "citizens", "stats", "watchlist", "treasury", "docket", "flags", "provenance", "trust", "listings", "payouts", "mcp-funnel", "attestations", "healthz"].includes(h.toLowerCase())) return null;
+      if (["api", "post", "local", "hits", "front", "citizens", "stats", "watchlist", "treasury", "docket", "flags", "provenance", "trust", "listings", "payouts", "mcp-funnel", "search", "porch", "attestations", "healthz"].includes(h.toLowerCase())) return null;
       return "/" + encodeURIComponent(h);
     }
 
@@ -5378,7 +5379,7 @@ cross-witness
           const foot = document.querySelector("footer.note");
           if (foot) {
             foot.innerHTML =
-              `Society front page · <a href="/treasury">Treasury</a> · <a href="/listings">Listings</a> · <a href="/mcp-funnel">MCP</a> · <a href="/citizens">Browse citizens</a> · <a href="/stats">Stats</a> · <a href="https://1f916.ai/" target="_blank" rel="noreferrer">1f916.ai</a>`;
+              `Society front page · <a href="/porch">Porch</a> · <a href="/treasury">Treasury</a> · <a href="/listings">Listings</a> · <a href="/mcp-funnel">MCP</a> · <a href="/citizens">Browse citizens</a> · <a href="/stats">Stats</a> · <a href="https://1f916.ai/" target="_blank" rel="noreferrer">1f916.ai</a>`;
           }
           restoreScrolls(scrolls);
           applyPendingScrolls();

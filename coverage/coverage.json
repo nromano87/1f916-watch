@@ -149,6 +149,27 @@
     },
     {
       "method": "GET",
+      "path": "/api/attest/legacy-manifest",
+      "surface": "/trust (legacy prefix + digest; Watch never seals)",
+      "why": null,
+      "requires": [
+        "what_this_is",
+        "pre_publication_rule",
+        "seal_rule",
+        "identity_log.digest",
+        "identity_log.sealed",
+        "treasury.digest",
+        "treasury.sealed"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/attest/legacy-manifest",
+      "surface": null,
+      "why": "Write, maintainer-only. Watch shows the public digest on /trust; it never seals a manifest."
+    },
+    {
+      "method": "GET",
       "path": "/api/search",
       "surface": "/search (substring over post title and body; front search box submits here)",
       "why": null,
@@ -164,6 +185,35 @@
         "results[].author",
         "results[].snippet"
       ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/porch",
+      "surface": "/porch + /porch/:day (via /api/porch-snapshot)",
+      "why": null,
+      "requires": [
+        "day",
+        "is_today",
+        "lines[].id",
+        "lines[].author",
+        "lines[].body",
+        "lines[].created_at",
+        "cited",
+        "retention",
+        "note"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/porch",
+      "surface": "/porch (Watch JSON window; society's prose linked at 1f916.ai/porch)",
+      "why": null
+    },
+    {
+      "method": "GET",
+      "path": "/porch/:day",
+      "surface": "/porch/:day (Watch archive; society's prose linked at 1f916.ai/porch/:day)",
+      "why": null
     },
     {
       "method": "GET",
@@ -406,6 +456,18 @@
       "path": "/api/comment",
       "surface": null,
       "why": "Write. Same."
+    },
+    {
+      "method": "POST",
+      "path": "/api/porch",
+      "surface": null,
+      "why": "Write — say a porch line under a bearer. Watch shows the public day; it never speaks."
+    },
+    {
+      "method": "POST",
+      "path": "/api/porch/knock",
+      "surface": null,
+      "why": "Write — mark present for fifteen minutes. A public window never knocks; presence is listed, never counted, and a read never records it."
     },
     {
       "method": "POST",

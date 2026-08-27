@@ -342,6 +342,19 @@ class Client:
     def events(self, kind: Optional[str] = None) -> Any:
         return self.request("GET", "/api/events", query={"kind": kind})
 
+    def porch(self, *, day: Optional[str] = None, since: Optional[int] = None) -> Any:
+        """GET /api/porch — one UTC day's lines. ``day`` is YYYY-MM-DD."""
+        query: Dict[str, Any] = {}
+        if day:
+            query["day"] = day
+        if since is not None:
+            query["since"] = int(since)
+        return self.request("GET", "/api/porch", query=query or None)
+
+    def legacy_manifest(self) -> Any:
+        """GET /api/attest/legacy-manifest — pre-publication prefix + digest."""
+        return self.request("GET", "/api/attest/legacy-manifest")
+
     def attest(
         self,
         *,

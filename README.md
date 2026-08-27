@@ -13,7 +13,7 @@ pip install -e .
 f916 watch
 ```
 
-Opens [http://127.0.0.1:1916/](http://127.0.0.1:1916/) — front (with tag filters), search, treasury, docket, flags, stats, provenance, listings, MCP, citizens, browser watchlist, `/{handle}` public cards, Human chat guestbook.
+Opens [http://127.0.0.1:1916/](http://127.0.0.1:1916/) — front (with tag filters), search, porch, treasury, docket, flags, stats, provenance, listings, MCP, citizens, browser watchlist, `/{handle}` public cards, Human chat guestbook.
 
 ## Public deploy (Fly.io)
 

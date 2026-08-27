@@ -193,6 +193,25 @@
     }
     .hist-event .top { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 4px; }
     .hist-event .btn { padding: 4px 10px; font-size: 11px; }
+    .legacy-block { margin: 0 0 16px; }
+    .legacy-block:last-child { margin-bottom: 0; }
+    .legacy-digest {
+      display: block; user-select: all; word-break: break-all;
+      font-family: ui-monospace, Menlo, monospace; font-size: 12px;
+      padding: 8px 10px; border-radius: 10px;
+      background: rgba(255,255,255,.7); border: 1px solid var(--line);
+      margin: 6px 0 10px;
+    }
+    .legacy-table-wrap { overflow-x: auto; margin-top: 8px; }
+    .legacy-table {
+      width: 100%; border-collapse: collapse; font-size: 12px;
+    }
+    .legacy-table th, .legacy-table td {
+      text-align: left; padding: 5px 7px; border-bottom: 1px solid var(--line);
+      vertical-align: top;
+    }
+    .legacy-table th { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+    .legacy-table td.mono { font-size: 11px; }
   </style>
 </head>
 <body>
@@ -207,6 +226,7 @@
         <div class="nav-drop" data-nav-group="boards">
           <button type="button" class="btn nav-drop-btn active" aria-haspopup="true" aria-expanded="false" aria-label="Boards">Trust</button>
           <div class="nav-drop-menu" role="menu" hidden>
+            <a class="nav-drop-item" role="menuitem" href="/porch" data-nav="porch">Porch</a>
             <a class="nav-drop-item" role="menuitem" href="/stats" data-nav="stats">Stats</a>
             <a class="nav-drop-item" role="menuitem" href="/docket" data-nav="docket">Docket</a>
             <a class="nav-drop-item" role="menuitem" href="/provenance" data-nav="provenance">Provenance</a>
@@ -223,9 +243,10 @@
   <div class="shell">
     <h1>Trust</h1>
     <p class="blurb">
-      Signed checkpoints, the witness directory with chained key history, and
-      the attestation ledger — plus tools to fetch inclusion and consistency
-      proofs. Read-only; this window never holds a citizen key.
+      Signed checkpoints, the witness directory with chained key history, the
+      attestation ledger, and the pre-publication legacy-prefix digest — plus
+      tools to fetch inclusion and consistency proofs. Read-only; this window
+      never holds a citizen key and never seals a manifest.
     </p>
     <div class="meta" id="boardMeta">loading…</div>
     <div id="error" class="err" hidden></div>
@@ -241,6 +262,12 @@
       <h2>Witnesses</h2>
       <p class="lead" id="witnessLead">Independent countersigners. A pointer, not an endorsement.</p>
       <div id="witnessList"></div>
+    </section>
+
+    <section class="sec" id="legacySec">
+      <h2>Legacy prefix</h2>
+      <p class="lead" id="legacyLead">Rows written before sealing shipped, served verbatim with a digest. Watch never seals.</p>
+      <div id="legacyList"></div>
     </section>
 
     <section class="sec" id="attestSec">
@@ -418,19 +445,68 @@
         + "</div>";
     }
 
+    function fmtCents(n) {
+      const x = Number(n);
+      if (!Number.isFinite(x)) return "—";
+      const sign = x < 0 ? "−" : "";
+      return sign + "$" + (Math.abs(x) / 100).toFixed(2);
+    }
+    function renderLegacyLog(block, title) {
+      const b = block && typeof block === "object" ? block : {};
+      const sealed = b.sealed && typeof b.sealed === "object" ? b.sealed : {};
+      const ids = Array.isArray(b.covered_ids) ? b.covered_ids : [];
+      const fields = Array.isArray(b.fields) ? b.fields : [];
+      const rows = Array.isArray(b.rows) ? b.rows : [];
+      const sealedOn = sealed.sealed === true;
+      const head = ids.length
+        ? (ids[0] + "–" + ids[ids.length - 1] + " (" + ids.length + ")")
+        : "—";
+      const table = rows.length && fields.length
+        ? '<div class="legacy-table-wrap"><table class="legacy-table"><thead><tr>'
+          + fields.map((f) => "<th>" + esc(f) + "</th>").join("")
+          + "</tr></thead><tbody>"
+          + rows.map((r) => "<tr>" + fields.map((f) => {
+              let v = r && r[f];
+              if (f === "amount_cents") v = fmtCents(v);
+              else if (f === "created_at") v = fmtWhen(v);
+              else if (v == null) v = "—";
+              const cls = (f === "digest" || f === "tx" || f === "source") ? ' class="mono"' : "";
+              return "<td" + cls + ">" + esc(v) + "</td>";
+            }).join("") + "</tr>").join("")
+          + "</tbody></table></div>"
+        : '<p class="note">No rows.</p>';
+      return '<article class="legacy-block"><div class="top" style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:8px">'
+        + '<span class="pill">' + esc(title) + "</span>"
+        + '<span class="pill">' + esc(b.log || "") + "</span>"
+        + (sealedOn
+          ? '<span class="pill">sealed</span>'
+          : '<span class="pill">unsealed</span>')
+        + '<span class="pill">ids ' + esc(head) + "</span>"
+        + "</div>"
+        + '<p class="note" style="margin:0 0 6px">Digest — record off-machine. Watch never seals.</p>'
+        + '<code class="legacy-digest">' + esc(b.digest || "—") + "</code>"
+        + (b.algorithm ? '<p class="note">' + esc(b.algorithm) + "</p>" : "")
+        + (sealed.note ? '<p class="note" style="margin-top:8px">' + esc(sealed.note) + "</p>" : "")
+        + table
+        + "</article>";
+    }
     function renderTrust(snap) {
       const cp = snap.checkpoint || {};
       const wit = snap.witnesses || {};
       const att = snap.attestations || {};
+      const legacy = snap.legacy_manifest || {};
       const checkpoints = Array.isArray(cp.checkpoints) ? cp.checkpoints : [];
       const witnesses = Array.isArray(wit.witnesses) ? wit.witnesses : [];
       const rows = Array.isArray(att.attestations) ? att.attestations : [];
 
+      const idSealed = !!(legacy.identity_log && legacy.identity_log.sealed && legacy.identity_log.sealed.sealed);
+      const trSealed = !!(legacy.treasury && legacy.treasury.sealed && legacy.treasury.sealed.sealed);
       document.getElementById("boardMeta").textContent =
         checkpoints.length + " checkpoint" + (checkpoints.length === 1 ? "" : "s")
         + " · " + witnesses.length + " witness" + (witnesses.length === 1 ? "" : "es")
         + " · " + (att.count != null ? att.count : rows.length) + " attestation"
         + ((att.count != null ? att.count : rows.length) === 1 ? "" : "s")
+        + " · legacy " + (idSealed && trSealed ? "sealed" : "unsealed")
         + " · updated " + (snap.generated_at ? new Date(snap.generated_at).toLocaleTimeString() : "—");
 
       const reg = cp.registry_public_key || {};
@@ -518,6 +594,18 @@
           document.getElementById("proofEvent").focus();
         });
       });
+
+      document.getElementById("legacyLead").textContent =
+        legacy.what_this_is || "Rows written before sealing shipped, served verbatim with a digest.";
+      const legacyRules = [
+        legacy.pre_publication_rule,
+        legacy.seal_rule,
+        "Watch never POSTs a seal.",
+      ].filter(Boolean).map((t) => '<p class="note" style="margin:0 0 10px">' + esc(t) + "</p>").join("");
+      document.getElementById("legacyList").innerHTML =
+        legacyRules
+        + renderLegacyLog(legacy.identity_log, "Identity log")
+        + renderLegacyLog(legacy.treasury, "Treasury");
 
       document.getElementById("attestLead").textContent =
         att.how_to_verify || "Claims on the square — signed when a bound key is offered.";
