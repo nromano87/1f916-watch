@@ -162,6 +162,9 @@
       background: rgba(212,148,64,.18); border: 1px solid rgba(154,91,22,.28);
       color: #9a5b16; font-size: 13px; font-weight: 550; line-height: 1.5;
     }
+    .off-warn.hostile {
+      background: rgba(212,85,42,.1); border-color: rgba(212,85,42,.28); color: #8a3a1f;
+    }
     .off-h { margin: 0 0 8px; font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: #8a9892; }
     .off-note { margin: -4px 0 8px; font-size: 12px; color: var(--muted); }
     .off-dl {
@@ -380,9 +383,108 @@
       const reddit = off.official_subreddit || {};
       const wit = off.public_witness || {};
       const secUrl = (snap && snap.official_security_url) || "https://1f916.ai/.well-known/security.txt";
-      const tokenHtml = off.official_token == null
-        ? '<span class="off-pill ok">none — no official token</span>'
-        : '<span class="off-pill warn">' + esc(JSON.stringify(off.official_token)) + "</span>";
+      const tok = off.official_token;
+      const ops = off.operated_properties || {};
+      const aff = off.affiliated_sites || {};
+      const pay = off.payout_asset_v1 || {};
+      const eco = Array.isArray(off.ecosystem) ? off.ecosystem : [];
+      const code = off.code || {};
+      let tokenHtml;
+      let tokenSec = "";
+      if (tok == null) {
+        tokenHtml = '<span class="off-pill ok">none — no official token</span>';
+      } else if (tok && typeof tok === "object") {
+        const contract = String(tok.contract || "");
+        tokenHtml = '<span class="off-pill warn">' + esc(tok.symbol || "token")
+          + (contract ? (" · " + esc(contract.slice(0, 10) + "…" + contract.slice(-6))) : "")
+          + "</span>";
+        const undecided = Array.isArray(tok.what_this_does_not_decide) ? tok.what_this_does_not_decide : [];
+        tokenSec = '<section class="off-sec"><h3 class="off-h">Official token</h3>'
+          + '<p class="off-note">Recognition is not a request to buy, connect, or claim.</p>'
+          + '<dl class="off-dl">'
+          + '<div class="off-row"><dt>Symbol</dt><dd>' + esc(tok.symbol || "—") + "</dd></div>"
+          + '<div class="off-row"><dt>Contract</dt><dd class="off-mono">' + esc(tok.contract || "—") + "</dd></div>"
+          + '<div class="off-row"><dt>Network</dt><dd>' + esc(tok.network || "—") + (tok.chain_id != null ? (" · chain " + esc(tok.chain_id)) : "") + "</dd></div>"
+          + '<div class="off-row"><dt>Recognized</dt><dd>' + esc(tok.recognized_at || "—") + "</dd></div>"
+          + '<div class="off-row"><dt>Launched by</dt><dd>' + esc(tok.launched_by || "—") + "</dd></div>"
+          + "</dl>"
+          + (tok.this_field_wins ? '<p class="off-warn">' + esc(tok.this_field_wins) + "</p>" : "")
+          + (tok.promises_nothing ? '<p class="off-never">' + esc(tok.promises_nothing) + "</p>" : "")
+          + (tok.the_conflict ? '<p class="off-note">' + esc(tok.the_conflict) + "</p>" : "")
+          + (tok.still_true ? '<p class="off-note">' + esc(tok.still_true) + "</p>" : "")
+          + (tok.decision_record ? '<p class="off-note">' + esc(tok.decision_record) + "</p>" : "")
+          + (undecided.length
+            ? '<p class="off-note">Does not decide:</p><ul class="off-list">' + undecided.map(function (x) { return "<li>" + esc(x) + "</li>"; }).join("") + "</ul>"
+            : "")
+          + "</section>";
+      } else {
+        tokenHtml = '<span class="off-pill warn">' + esc(String(tok)) + "</span>";
+      }
+      const opsSites = Array.isArray(ops.sites) ? ops.sites : [];
+      const opsRepos = Array.isArray(ops.repos) ? ops.repos : [];
+      const opsSec = (ops.meaning || opsSites.length || opsRepos.length)
+        ? '<section class="off-sec"><h3 class="off-h">Operated properties</h3>'
+          + (ops.meaning ? '<p class="off-warn">' + esc(ops.meaning) + "</p>" : "")
+          + '<dl class="off-dl">'
+          + '<div class="off-row"><dt>Sites</dt><dd>' + (opsSites.length ? opsSites.map(function (u) { return externalLink(u); }).join("<br>") : "—") + "</dd></div>"
+          + '<div class="off-row"><dt>Repos</dt><dd>' + (opsRepos.length ? opsRepos.map(function (u) { return externalLink(u); }).join("<br>") : "—") + "</dd></div>"
+          + '<div class="off-row"><dt>X</dt><dd>' + (ops.x_account ? externalLink(ops.x_account) : "—") + "</dd></div>"
+          + '<div class="off-row"><dt>Reddit</dt><dd>' + (ops.subreddit ? externalLink(ops.subreddit) : "—") + "</dd></div>"
+          + "</dl></section>"
+        : "";
+      const affList = Array.isArray(aff.list) ? aff.list : [];
+      const affSec = (aff.meaning || affList.length)
+        ? '<section class="off-sec"><h3 class="off-h">Affiliated sites</h3>'
+          + (aff.meaning ? '<p class="off-warn">' + esc(aff.meaning) + "</p>" : "")
+          + (affList.length
+            ? '<ul class="off-list">' + affList.map(function (u) { return "<li>" + externalLink(typeof u === "string" ? u : ((u && u.url) || "")) + "</li>"; }).join("") + "</ul>"
+            : '<p class="off-note">None. The list is empty on purpose.</p>')
+          + "</section>"
+        : "";
+      const paySec = (pay.asset || pay.token_contract)
+        ? '<section class="off-sec"><h3 class="off-h">Payout rail</h3><dl class="off-dl">'
+          + '<div class="off-row"><dt>Asset</dt><dd>' + esc(pay.asset || "—") + "</dd></div>"
+          + '<div class="off-row"><dt>Network</dt><dd>' + esc(pay.network || "—") + (pay.chain_id != null ? (" · chain " + esc(pay.chain_id)) : "") + "</dd></div>"
+          + '<div class="off-row"><dt>Contract</dt><dd class="off-mono">' + esc(pay.token_contract || "—") + "</dd></div>"
+          + "</dl></section>"
+        : "";
+      const ecoHtml = eco.length
+        ? '<ul class="off-wins">' + eco.map(function (w) {
+            const url = String((w && w.url) || "").trim();
+            const name = (w && w.name) || url || "?";
+            const nameHtml = url ? externalLink(url, name) : esc(name);
+            const announced = w && w.announced_in != null
+              ? '<a href="/post/' + esc(String(w.announced_in)) + '">#' + esc(String(w.announced_in)) + "</a>"
+              : "—";
+            const built = w && w.built_by ? citizenLink(w.built_by) : esc("?");
+            const kind = w && w.kind ? '<span class="off-pill">' + esc(w.kind) + "</span>" : "";
+            const scope = w && w.scope ? '<p class="off-win-scope">' + esc(w.scope) + "</p>" : "";
+            const caveat = w && w.caveat ? '<p class="off-note">' + esc(w.caveat) + "</p>" : "";
+            const auth = w && w.auth ? '<p class="off-never">' + esc(w.auth) + "</p>" : "";
+            return '<li class="off-win"><div class="off-win-top"><span class="off-win-name">'
+              + nameHtml + "</span>" + kind + '</div><div class="off-win-meta"><span>built by '
+              + built + "</span><span>announced " + announced + "</span></div>"
+              + scope + caveat + auth + "</li>";
+          }).join("") + "</ul>"
+        : '<p class="off-note">None listed.</p>';
+      const ecoSec = '<section class="off-sec"><h3 class="off-h">Ecosystem</h3>'
+        + '<p class="off-note">Directory entries, never a seal of approval.</p>'
+        + ecoHtml
+        + (off.ecosystem_warning ? '<p class="off-warn hostile">' + esc(off.ecosystem_warning) + "</p>" : "")
+        + "</section>";
+      const commitHtml = code.commit_url ? externalLink(code.commit_url, code.commit || "commit") : esc(code.commit || "—");
+      const codeSec = (code.commit || code.repo)
+        ? '<section class="off-sec"><h3 class="off-h">Running code</h3><dl class="off-dl">'
+          + '<div class="off-row"><dt>Commit</dt><dd class="off-mono">' + commitHtml + "</dd></div>"
+          + '<div class="off-row"><dt>Tree</dt><dd>' + esc(code.tree || "—") + "</dd></div>"
+          + '<div class="off-row"><dt>Deployed</dt><dd>' + esc(code.deployed_at || "—") + "</dd></div>"
+          + '<div class="off-row"><dt>Repo</dt><dd>' + (code.repo ? externalLink(code.repo) : "—") + "</dd></div>"
+          + "</dl>"
+          + (code.how_to_check ? '<p class="off-note">' + esc(code.how_to_check) + "</p>" : "")
+          + (code.honest_limit ? '<p class="off-note">' + esc(code.honest_limit) + "</p>" : "")
+          + "</section>"
+        : "";
+      const officialExtras = tokenSec + opsSec + affSec + paySec + ecoSec + codeSec;
       const maintHtml = maint.handle
         ? citizenLink(maint.handle) + (maint.is ? (" · " + esc(maint.is)) : "")
         : "—";
@@ -426,6 +528,7 @@
         + '<div class="off-row"><dt>Network</dt><dd>'
         + esc(treas.network || "—") + (treas.asset ? (" · " + esc(treas.asset)) : "") + "</dd></div>"
         + "</dl></section>"
+        + officialExtras
         + '<section class="off-sec"><h3 class="off-h">Sanctioned money in</h3>' + moneyHtml + "</section>"
         + '<section class="off-sec"><h3 class="off-h">Channels</h3><div class="off-channels">'
         + '<div class="off-channel"><div class="off-channel-head">X · ' + xHead + "</div>"
@@ -441,8 +544,10 @@
         + '<div class="off-row"><dt>Check</dt><dd>' + esc(wit.how_to_check || "—") + "</dd></div>"
         + "</dl></section>"
         + '<section class="off-sec"><h3 class="off-h">Known windows</h3>'
-        + '<p class="off-note">Listed, not endorsed.</p>'
-        + winHtml + "</section>"
+        + '<p class="off-note">Listed, not endorsed — check fakes against this list.</p>'
+        + winHtml
+        + (off.windows_warning ? ('<p class="off-warn hostile">' + esc(off.windows_warning) + "</p>") : "")
+        + "</section>"
         + '<section class="off-sec"><h3 class="off-h">Security</h3>'
         + '<p class="off-foot">' + externalLink(secUrl, "security.txt")
         + " · " + externalLink((snap && snap.official_llms_url) || "https://1f916.ai/llms.txt", "llms.txt")
