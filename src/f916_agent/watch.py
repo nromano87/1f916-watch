@@ -19,6 +19,13 @@ import html as html_mod
 import re
 from urllib.parse import parse_qs, urlparse
 
+from .chat_mod import (
+    CHAT_ADMIN_NAME,
+    CHAT_ADMIN_REMOVAL_TEXT,
+    chat_is_offensive,
+    chat_reject_reason,
+    redact_chat_message,
+)
 from .client import ApiError, Client
 from .identity import Store
 from .inbox import build_inbox, build_inbox_for_handle
@@ -279,6 +286,8 @@ def _chat_name_has_vid(name_key: str, visitor_id: str) -> bool:
     for msg in _CHAT_MESSAGES:
         if str(msg.get("name") or "").strip().lower() != name_key:
             continue
+        if msg.get("removed"):
+            continue
         if _normalize_vid(msg.get("vid")) == visitor_id:
             return True
     return False
@@ -286,12 +295,39 @@ def _chat_name_has_vid(name_key: str, visitor_id: str) -> bool:
 
 def _chat_public_message(msg: Dict[str, Any]) -> Dict[str, Any]:
     """Public payload — never leak visitor ids to other clients."""
+    if msg.get("removed") or chat_is_offensive(
+        str(msg.get("name") or ""), str(msg.get("text") or "")
+    ):
+        return {
+            "id": msg["id"],
+            "name": CHAT_ADMIN_NAME,
+            "text": CHAT_ADMIN_REMOVAL_TEXT,
+            "t": msg["t"],
+            "removed": True,
+        }
     return {
         "id": msg["id"],
         "name": msg["name"],
         "text": msg["text"],
         "t": msg["t"],
     }
+
+
+def _publish_auth_failure(
+    handler: BaseHTTPRequestHandler,
+) -> Optional[Tuple[int, Dict[str, Any]]]:
+    """None when Bearer F916_PUBLISH_TOKEN matches; otherwise a JSON error."""
+    expected = publish_token()
+    if not expected:
+        return 503, {
+            "error": "publish disabled",
+            "hint": "set F916_PUBLISH_TOKEN on the Watch host",
+        }
+    auth = handler.headers.get("Authorization") or ""
+    provided = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    if not tokens_match(provided, expected):
+        return 401, {"error": "unauthorized"}
+    return None
 
 
 _BOARDS_NAV = (
@@ -448,12 +484,26 @@ def _chat_prune_locked(now: float) -> bool:
     live = {
         str(m.get("name") or "").strip().lower()
         for m in _CHAT_MESSAGES
-        if str(m.get("name") or "").strip()
+        if str(m.get("name") or "").strip() and not m.get("removed")
     }
     for key in list(_CHAT_NAME_OWNERS.keys()):
         if key not in live:
             _CHAT_NAME_OWNERS.pop(key, None)
             changed = True
+    return changed
+
+
+def _chat_sweep_locked(now: float) -> bool:
+    """Tombstone stored rows that break house rules. Ids and timestamps stay."""
+    changed = False
+    for msg in _CHAT_MESSAGES:
+        if msg.get("removed"):
+            if redact_chat_message(msg, now=now):
+                changed = True
+            continue
+        if chat_is_offensive(str(msg.get("name") or ""), str(msg.get("text") or "")):
+            if redact_chat_message(msg, now=now):
+                changed = True
     return changed
 
 
@@ -488,12 +538,24 @@ def _chat_ensure_loaded_locked(store: Store) -> None:
             continue
         name = str(raw.get("name") or "").strip()
         text = str(raw.get("text") or "")
-        if mid <= 0 or not name or not text:
+        removed = bool(raw.get("removed"))
+        if mid <= 0 or not name:
+            continue
+        if not text and not removed:
             continue
         msg: Dict[str, Any] = {"id": mid, "name": name, "text": text, "t": ts}
-        vid = _normalize_vid(raw.get("vid"))
-        if vid:
-            msg["vid"] = vid
+        if removed:
+            msg["removed"] = True
+            try:
+                removed_at = int(raw.get("removed_at") or 0)
+            except (TypeError, ValueError):
+                removed_at = 0
+            if removed_at > 0:
+                msg["removed_at"] = removed_at
+        else:
+            vid = _normalize_vid(raw.get("vid"))
+            if vid:
+                msg["vid"] = vid
         msgs.append(msg)
     msgs.sort(key=lambda m: (int(m["t"]), int(m["id"])))
     owners: Dict[str, str] = {}
@@ -515,7 +577,8 @@ def _chat_ensure_loaded_locked(store: Store) -> None:
     _CHAT_NAME_OWNERS.update(owners)
     _CHAT_NEXT_ID = max(1, next_id)
     _CHAT_LOADED_ROOT = root_key
-    if _chat_prune_locked(time.time()):
+    now = time.time()
+    if _chat_sweep_locked(now) or _chat_prune_locked(now):
         _chat_persist_locked(store)
 
 
@@ -524,7 +587,9 @@ def chat_snapshot(store: Store) -> Dict[str, Any]:
 
     def _snap() -> Dict[str, Any]:
         _chat_ensure_loaded_locked(store)
-        if _chat_prune_locked(now):
+        swept = _chat_sweep_locked(now)
+        pruned = _chat_prune_locked(now)
+        if swept or pruned:
             _chat_persist_locked(store)
         msgs = [_chat_public_message(m) for m in _CHAT_MESSAGES]
         latest = int(msgs[-1]["id"]) if msgs else 0
@@ -556,6 +621,9 @@ def chat_post(
     # Cheap control-char scrub.
     if any(ord(ch) < 9 or ord(ch) in (11, 12) or (14 <= ord(ch) < 32) for ch in text):
         return 400, {"error": "bad message"}
+    reject = chat_reject_reason(name, text)
+    if reject:
+        return 400, {"error": "not allowed", "hint": reject}
     now = time.time()
     ip = (client_ip or "unknown")[:64]
     name_key = name.lower()
@@ -598,6 +666,52 @@ def chat_post(
         return 200, {"ok": True, "message": _chat_public_message(msg)}
 
     return _with_chat_file_lock(store, _post)
+
+
+def chat_moderate(
+    store: Store,
+    ids: Any,
+) -> Tuple[int, Dict[str, Any]]:
+    """Tombstone specific guestbook rows (operator; Bearer F916_PUBLISH_TOKEN)."""
+    want: List[int] = []
+    if isinstance(ids, int):
+        want = [ids]
+    elif isinstance(ids, list):
+        for raw in ids:
+            try:
+                mid = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if mid > 0:
+                want.append(mid)
+    want = sorted(set(want))
+    if not want:
+        return 400, {"error": "bad ids", "hint": "pass id or ids"}
+
+    now = time.time()
+
+    def _mod() -> Tuple[int, Dict[str, Any]]:
+        _chat_ensure_loaded_locked(store)
+        found = {int(m["id"]): m for m in _CHAT_MESSAGES}
+        missing = [mid for mid in want if mid not in found]
+        if missing:
+            return 404, {"error": "unknown id", "ids": missing}
+        changed = False
+        removed: List[int] = []
+        for mid in want:
+            if redact_chat_message(found[mid], now=now):
+                changed = True
+            removed.append(mid)
+        if changed:
+            _chat_prune_locked(now)
+            _chat_persist_locked(store)
+        return 200, {
+            "ok": True,
+            "removed": removed,
+            "message": CHAT_ADMIN_REMOVAL_TEXT,
+        }
+
+    return _with_chat_file_lock(store, _mod)
 
 
 def _hit_paths(store: Store) -> tuple:
@@ -7905,6 +8019,25 @@ def make_handler(
                 self._send(code, raw, "application/json; charset=utf-8")
                 return
 
+            if path == "/api/chat/moderate":
+                denied = _publish_auth_failure(self)
+                if denied is not None:
+                    code, payload = denied
+                    raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                    self._send(code, raw, "application/json; charset=utf-8")
+                    return
+                try:
+                    body = self._read_json_body(max_bytes=4096)
+                except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as e:
+                    raw = json.dumps({"error": str(e)}).encode("utf-8")
+                    self._send(400, raw, "application/json; charset=utf-8")
+                    return
+                ids = body.get("ids", body.get("id"))
+                code, payload = chat_moderate(store, ids)
+                raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                self._send(code, raw, "application/json; charset=utf-8")
+                return
+
             if path == "/api/watchlist":
                 try:
                     body = self._read_json_body(max_bytes=4096)
@@ -7924,27 +8057,11 @@ def make_handler(
                 self._send(404, b'{"error":"not found"}', "application/json")
                 return
 
-            expected = publish_token()
-            if not expected:
-                raw = json.dumps(
-                    {
-                        "error": "publish disabled",
-                        "hint": "set F916_PUBLISH_TOKEN on the Watch host",
-                    }
-                ).encode("utf-8")
-                self._send(503, raw, "application/json; charset=utf-8")
-                return
-
-            auth = self.headers.get("Authorization") or ""
-            provided = ""
-            if auth.lower().startswith("bearer "):
-                provided = auth[7:].strip()
-            if not tokens_match(provided, expected):
-                self._send(
-                    401,
-                    b'{"error":"unauthorized"}',
-                    "application/json; charset=utf-8",
-                )
+            denied = _publish_auth_failure(self)
+            if denied is not None:
+                code, payload = denied
+                raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                self._send(code, raw, "application/json; charset=utf-8")
                 return
 
             length_raw = self.headers.get("Content-Length") or "0"

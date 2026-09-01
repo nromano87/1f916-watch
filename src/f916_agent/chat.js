@@ -255,6 +255,9 @@
     "#f916-chat-log .empty{margin:auto;color:#8a9892;font-size:15px;text-align:center;padding:28px 18px;line-height:1.45;}" +
     "#f916-chat-log .msg{padding:12px 14px;border-radius:16px;background:#fff;border:1px solid rgba(18,32,28,.07);box-shadow:0 1px 0 rgba(255,255,255,.8) inset;}" +
     "#f916-chat-log .msg.mine{background:rgba(12,124,102,.08);border-color:rgba(12,124,102,.16);}" +
+    "#f916-chat-log .msg.removed{background:rgba(18,32,28,.04);border-style:dashed;border-color:rgba(18,32,28,.12);box-shadow:none;}" +
+    "#f916-chat-log .msg.removed .who{color:#5a6a64;}" +
+    "#f916-chat-log .msg.removed .body{color:#5a6a64;font-style:italic;font-size:14px;}" +
     "#f916-chat-log .msg .meta{display:flex;gap:10px;align-items:center;margin-bottom:6px;font-size:12px;color:#5a6a64;}" +
     "#f916-chat-log .msg .who{font-weight:700;color:#0c7c66;font-size:13px;}" +
     "#f916-chat-log .msg .meta-right{margin-left:auto;display:flex;gap:10px;align-items:center;}" +
@@ -313,7 +316,7 @@
     '<button type="button" class="close" aria-label="Close chat">×</button>' +
     "</div>" +
     '<div class="grab" aria-hidden="true"><i></i></div>' +
-    "<header><h2>Human chat</h2></header>" +
+    "<header><h2>Human chat</h2><p>No slurs, hate, or harassment. Removals stay on the log.</p></header>" +
     '<div id="f916-chat-ignored"></div>' +
     '<div id="f916-chat-log"><div class="empty">Say hi. No accounts.</div></div>' +
     '<form id="f916-chat-form">' +
@@ -325,7 +328,7 @@
     '<textarea id="f916-chat-text" name="text" maxlength="280" placeholder="Message" rows="1" required enterkeyhint="send"></textarea>' +
     '<button type="submit" id="f916-chat-send">Send</button>' +
     "</div>" +
-    '<div class="foot"><div class="hint">1 msg / 5s</div><div class="err" id="f916-chat-err"></div></div></form>';
+    '<div class="foot"><div class="hint">1 msg / 5s · keep it civil</div><div class="err" id="f916-chat-err"></div></div></form>';
 
   function $(id) {
     return document.getElementById(id);
@@ -666,10 +669,12 @@
     var html = [];
     for (var i = 0; i < visible.length; i++) {
       var m = visible[i];
-      var mine = isMine(m.name);
+      var removed = !!m.removed;
+      var mine = !removed && isMine(m.name);
       html.push(
         '<div class="msg' +
           (mine ? " mine" : "") +
+          (removed ? " removed" : "") +
           '" data-id="' +
           m.id +
           '"><div class="meta"><span class="who">' +
@@ -677,13 +682,13 @@
           '</span><div class="meta-right"><span>' +
           ago(m.t) +
           "</span>" +
-          (mine
+          (mine || removed
             ? ""
             : '<button type="button" class="ignore" data-ignore="' +
               esc(m.name) +
               '">ignore</button>') +
           '</div></div><div class="body">' +
-          formatBody(m.text) +
+          (removed ? esc(m.text) : formatBody(m.text)) +
           "</div></div>"
       );
     }
