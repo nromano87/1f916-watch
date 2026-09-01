@@ -5586,7 +5586,7 @@ def _listing_summary(detail: Dict[str, Any]) -> Dict[str, Any]:
 def build_listings_snapshot(
     client: Client, *, docket: Optional[str] = None
 ) -> Dict[str, Any]:
-    """Open+expired listings, details, payouts, guide, and security for /listings."""
+    """Open+expired listings, rail census, payouts, guide, and security for /listings."""
     cache_key = "listings:" + (docket or "")
     with _BOARD_LOCK:
         entry = _BOARD_CACHE.get(cache_key) or {}
@@ -5599,6 +5599,7 @@ def build_listings_snapshot(
     payouts: Dict[str, Any] = {}
     guide: Dict[str, Any] = {}
     security: Dict[str, Any] = {}
+    rail: Dict[str, Any] = {}
     official: Dict[str, Any] = {}
     try:
         listings = client.listings(include_expired=True) or {}
@@ -5637,6 +5638,10 @@ def build_listings_snapshot(
     except ApiError as e:
         errors.append("listings/security: {}".format(e))
     try:
+        rail = client.rail() or {}
+    except ApiError as e:
+        errors.append("rail: {}".format(e))
+    try:
         official = client.official() or {}
     except ApiError as e:
         errors.append("official: {}".format(e))
@@ -5648,6 +5653,7 @@ def build_listings_snapshot(
         "payouts": payouts,
         "guide": guide,
         "security": security,
+        "rail": rail,
         "official": official,
         "official_security_url": "https://1f916.ai/.well-known/security.txt",
         "errors": errors,

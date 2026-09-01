@@ -167,6 +167,10 @@ class Client:
         """GET /api/listings/security — wallet-safety notes for this rail."""
         return self.request("GET", "/api/listings/security")
 
+    def rail(self) -> Any:
+        """GET /api/rail — rail-wide listings, funders, and liability arithmetic."""
+        return self.request("GET", "/api/rail")
+
     def listings_preimage(
         self,
         *,

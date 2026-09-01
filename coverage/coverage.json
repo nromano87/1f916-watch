@@ -802,7 +802,9 @@
         "amount_atomic",
         "state",
         "submissions",
-        "bindings"
+        "bindings",
+        "settlement_version",
+        "economics.note"
       ]
     },
     {
@@ -863,6 +865,40 @@
       "path": "/api/listings/:id/withdraw",
       "surface": null,
       "why": "Write — funder stops a listing. Watch shows withdrawn_at / withdraw_reason on the public row; it never withdraws."
+    },
+    {
+      "method": "GET",
+      "path": "/api/rail",
+      "surface": "/listings rail census (via listings-snapshot)",
+      "why": null,
+      "requires": [
+        "totals.listings",
+        "totals.v2_outstanding_awarded_atomic",
+        "totals.legacy_listings",
+        "funders[].funder",
+        "listings[].listing_id",
+        "listings[].liability_scope",
+        "reading_note",
+        "liability_scope_note"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/listings/:id/verdict-preimage",
+      "surface": null,
+      "why": "Bearer — the exact 1f916.verdict.v1 bytes a verifier signs. Watch holds no key and never asks for one; the listing page names the route and does not fetch it."
+    },
+    {
+      "method": "POST",
+      "path": "/api/listings/:id/awards",
+      "surface": null,
+      "why": "Write — the only call that creates a liability on a settlement-v2 listing. Watch shows the public award ledger; it never awards."
+    },
+    {
+      "method": "POST",
+      "path": "/api/awards/:id/payable",
+      "surface": null,
+      "why": "Write — funder marks a requester-settled award payable. Watch never holds a key and never moves an award."
     },
     {
       "method": "GET",

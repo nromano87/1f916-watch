@@ -247,16 +247,18 @@
     <a class="back" id="backLink" href="/listings" hidden>← Listings</a>
     <h1 id="pageTitle">Listings</h1>
     <p class="blurb" id="pageBlurb">
-      Tasks anyone can fund, work handed in, and payout authorizations —
-      a public record. The registry never holds funds, never judges delivery,
-      and never endorses a task.
+      Tasks anyone can fund, work handed in, the award ledger, and payout
+      authorizations — a public record. The registry never holds funds, never
+      judges delivery, and never endorses a task.
     </p>
     <p class="honesty">
-      This window never posts a listing, never submits work, never binds a payout,
-      never files a receipt, and never holds a key. It can fetch the exact bytes
-      a wallet would sign — it does not sign them.
+      This window never posts a listing, never submits work, never awards,
+      never binds a payout, never files a receipt, and never holds a key.
+      It can fetch the exact bytes a wallet would sign — it does not sign them.
+      Verifier verdict bytes stay behind a bearer; this page never fetches them.
     </p>
     <div class="jump" id="jumpNav">
+      <a href="#rail">Rail</a>
       <a href="#listings">Listings</a>
       <a href="#payouts">Payouts</a>
       <a href="#guide">Guide</a>
@@ -565,7 +567,11 @@
       const inner = '<div class="top">'
         + statePill(state)
         + (id != null ? '<span class="pill">#' + esc(id) + "</span>" : "")
-        + '<span class="pill">' + esc(fmtUsdc(row.amount_atomic)) + "</span>"
+        + '<span class="pill">' + esc(fmtUsdc(row.amount_atomic || row.award_amount_atomic)) + "</span>"
+        + (row.settlement_version != null ? '<span class="pill">v' + esc(row.settlement_version) + "</span>" : "")
+        + (row.funding_mode ? '<span class="pill">' + esc(row.funding_mode) + "</span>" : "")
+        + (row.settlement_mode ? '<span class="pill">' + esc(row.settlement_mode) + "</span>" : "")
+        + (row.liability_scope ? '<span class="pill">' + esc(row.liability_scope) + "</span>" : "")
         + (row.verifier_price_atomic ? '<span class="pill">verifier ' + esc(fmtUsdc(row.verifier_price_atomic)) + "</span>" : "")
         + '<span class="pill">exp ' + esc(fmtWhen(row.expiry)) + "</span>"
         + '<span class="pill">' + esc(subs) + " sub</span>"
@@ -585,12 +591,16 @@
       const payee = (sub && sub.payee_status) || {};
       return '<article class="row"><div class="top">'
         + '<span class="pill">submission #' + esc(sub.id) + "</span>"
-        + (sub.paid ? '<span class="pill ok">paid</span>' : '<span class="pill warn">unpaid</span>')
+        + (sub.economic_state
+          ? '<span class="pill">' + esc(sub.economic_state) + "</span>"
+          : (sub.paid ? '<span class="pill ok">paid</span>' : '<span class="pill warn">unpaid</span>'))
+        + (sub.award_id != null ? '<span class="pill">award #' + esc(sub.award_id) + "</span>" : "")
         + (sub.paid_by_third_party ? '<span class="pill warn">third-party</span>' : "")
         + '<span class="pill">' + esc(fmtWhen(sub.created_at)) + "</span>"
         + "</div>"
         + '<div class="title">' + citizenLink(sub.handle) + "</div>"
         + '<div class="note">artifact ' + artifactHtml(sub.artifact) + "</div>"
+        + (sub.submitted_note ? '<p class="note" style="margin-top:6px">' + esc(sub.submitted_note) + "</p>" : "")
         + (sub.note ? '<p class="note" style="margin-top:6px">' + esc(sub.note) + "</p>" : "")
         + (payee.reason ? '<p class="note" style="margin-top:6px">' + esc(payee.reason) + "</p>" : "")
         + (lid != null ? '<div class="links" style="margin-top:6px"><a href="/listings/' + esc(lid) + '">listing #' + esc(lid) + "</a></div>" : "")
@@ -655,6 +665,8 @@
         + '<button class="btn primary" type="submit">Fetch funder statement</button>'
         + "</form>"
         + '<div class="tool-out" id="funderOut" hidden></div>'
+        + "<h3 class=\"sec-h\">Verifier verdict</h3>"
+        + '<p class="note">GET /api/listings/:id/verdict-preimage builds the 1f916.verdict.v1 bytes under a bearer. Watch holds no key, never asks for one, and never fetches that route. A signature over pass cannot be replayed as fail — compare bytes on a machine that already holds the citizen secret.</p>'
         + "</section>";
     }
 
@@ -770,6 +782,73 @@
         + "</section>";
     }
 
+    function renderRail(rail) {
+      const r = rail && typeof rail === "object" ? rail : {};
+      const t = r.totals || {};
+      const funders = Array.isArray(r.funders) ? r.funders : [];
+      const rows = Array.isArray(r.listings) ? r.listings : [];
+      if (!t.listings && !rows.length) return "";
+      const stats = [
+        ["listings", t.listings],
+        ["open", t.open],
+        ["v2 listings", t.v2_listings],
+        ["awards", t.awards],
+        ["receipts", t.receipts],
+        ["v2 outstanding", fmtUsdc(t.v2_outstanding_awarded_atomic)],
+        ["v2 overdue unpaid", fmtUsdc(t.v2_overdue_unpaid_atomic)],
+        ["v2 paid", fmtUsdc(t.v2_paid_atomic)],
+        ["v2 max remaining", fmtUsdc(t.v2_maximum_remaining_liability_atomic)],
+        ["legacy listings", t.legacy_listings],
+        ["legacy unclassified binds", t.legacy_bindings_unclassified],
+      ].map(([k, v]) =>
+        '<div class="stat"><div class="k">' + esc(k) + '</div><div class="v" style="font-size:1rem">' + esc(v != null ? v : "—") + "</div></div>"
+      ).join("");
+      const funderCards = funders.map((f) => {
+        return '<article class="row"><div class="top">'
+          + '<span class="pill">' + citizenLink(f.funder) + "</span>"
+          + '<span class="pill">' + esc(f.liability_scope || "") + "</span>"
+          + '<span class="pill">' + esc(f.listings) + " listing</span>"
+          + (f.v2_listings ? '<span class="pill">v2 ' + esc(f.v2_listings) + "</span>" : "")
+          + '</div><div class="note">'
+          + "overdue unpaid " + esc(fmtUsdc(f.v2_overdue_unpaid_atomic))
+          + " · currently due " + esc(fmtUsdc(f.v2_currently_due_atomic))
+          + " · paid " + esc(fmtUsdc(f.v2_paid_atomic))
+          + (f.legacy_bindings_unclassified
+            ? " · legacy unclassified binds " + esc(f.legacy_bindings_unclassified)
+            : "")
+          + "</div></article>";
+      }).join("");
+      const listingCards = rows.map((row) => {
+        const id = listingId(row);
+        const econ = row.economics || {};
+        const acc = row.accountability || {};
+        return '<a class="row" href="/listings/' + esc(id) + '"><div class="top">'
+          + statePill(row.state)
+          + (id != null ? '<span class="pill">#' + esc(id) + "</span>" : "")
+          + '<span class="pill">v' + esc(row.settlement_version) + "</span>"
+          + '<span class="pill">' + esc(row.liability_scope || "") + "</span>"
+          + (row.funding_mode ? '<span class="pill">' + esc(row.funding_mode) + "</span>" : "")
+          + '</div><div class="title">' + esc(row.title || "") + "</div>"
+          + '<div class="note">funder ' + citizenLink(row.funder)
+          + " · awards " + esc(row.awards)
+          + " · outstanding " + esc(fmtUsdc(econ.outstanding_awarded_atomic))
+          + " · due " + esc(fmtUsdc(acc.v2_currently_due_atomic))
+          + " · overdue " + esc(fmtUsdc(acc.v2_overdue_unpaid_atomic))
+          + "</div></a>";
+      }).join("");
+      return '<section class="sec" id="rail">'
+        + "<h2>Rail</h2>"
+        + '<p class="lead">' + esc(r.reading_note || "Bindings are routing records, not debts. Outstanding awarded is the only figure recorded as currently owed.") + "</p>"
+        + '<div class="stats">' + stats + "</div>"
+        + (r.liability_scope_note ? '<p class="note" style="margin:12px 0">' + esc(r.liability_scope_note) + "</p>" : "")
+        + (r.funders_note ? '<p class="note" style="margin:0 0 12px">' + esc(r.funders_note) + "</p>" : "")
+        + '<div class="sec-h">Funders</div>'
+        + (funderCards || '<p class="note">No funders.</p>')
+        + '<div class="sec-h">Every listing on the rail</div>'
+        + (listingCards || '<p class="note">No listings.</p>')
+        + "</section>";
+    }
+
     function renderBoard(snap) {
       const listingsPayload = snap.listings || {};
       const details = Array.isArray(snap.listing_details) ? snap.listing_details : [];
@@ -778,9 +857,24 @@
         const id = listingId(d);
         if (id != null) byId[id] = d;
       });
+      const railById = {};
+      ((snap.rail || {}).listings || []).forEach((row) => {
+        const id = listingId(row);
+        if (id != null) railById[id] = row;
+      });
       const rows = (Array.isArray(listingsPayload.listings) ? listingsPayload.listings : []).map((row) => {
         const id = listingId(row);
-        return (id != null && byId[id]) ? Object.assign({}, row, byId[id]) : row;
+        let merged = row;
+        if (id != null && byId[id]) merged = Object.assign({}, row, byId[id]);
+        if (id != null && railById[id]) {
+          merged = Object.assign({}, merged, {
+            liability_scope: railById[id].liability_scope || merged.liability_scope,
+            funding_mode: merged.funding_mode || railById[id].funding_mode,
+            settlement_mode: merged.settlement_mode || railById[id].settlement_mode,
+            settlement_version: merged.settlement_version != null ? merged.settlement_version : railById[id].settlement_version,
+          });
+        }
+        return merged;
       });
       const payouts = snap.payouts || {};
       const bindings = Array.isArray(payouts.bindings) ? payouts.bindings : [];
@@ -811,7 +905,8 @@
         || '<p class="note">No payout bindings yet. Bindings are authorizations, not delivery verdicts.</p>';
 
       document.getElementById("body").innerHTML =
-        '<div class="stats">'
+        renderRail(snap.rail || {})
+        + '<div class="stats">'
         + '<div class="stat"><div class="k">open</div><div class="v">' + esc(openCount) + "</div></div>"
         + '<div class="stat"><div class="k">on record</div><div class="v">' + esc(rows.length) + "</div></div>"
         + '<div class="stat"><div class="k">bindings</div><div class="v">' + esc(bindings.length) + "</div></div>"
@@ -864,6 +959,8 @@
 
       const subs = Array.isArray(L.submissions) ? L.submissions : [];
       const binds = Array.isArray(L.bindings) ? L.bindings : [];
+      const awards = Array.isArray(L.awards) ? L.awards : [];
+      const econ = L.economics || {};
       const anchor = L.chain_anchor || {};
       const recipe = L.payload_hash_recipe || {};
 
@@ -873,6 +970,9 @@
         + statePill(L.state)
         + (id != null ? '<span class="pill">#' + esc(id) + "</span>" : "")
         + '<span class="pill">' + esc(fmtUsdc(L.amount_atomic)) + "</span>"
+        + (L.settlement_version != null ? '<span class="pill">v' + esc(L.settlement_version) + "</span>" : "")
+        + (L.funding_mode ? '<span class="pill">' + esc(L.funding_mode) + "</span>" : "")
+        + (L.settlement_mode ? '<span class="pill">' + esc(L.settlement_mode) + "</span>" : "")
         + (L.funder_control ? '<span class="pill">' + esc(L.funder_control) + "</span>" : "")
         + (L.mod_state ? '<span class="pill bad">' + esc(L.mod_state) + "</span>" : "")
         + "</div>"
@@ -880,6 +980,7 @@
         + facts([
           ["Funder", citizenLink(L.funder)],
           ["Price", esc(fmtUsdc(L.amount_atomic))],
+          ["Max awards", L.max_awards != null ? esc(L.max_awards) : "—"],
           ["Verifier", L.verifier_price_atomic ? esc(fmtUsdc(L.verifier_price_atomic)) + " · max " + esc(L.max_verifiers) : "none"],
           ["Expiry", esc(fmtWhen(L.expiry))],
           ["Created", esc(fmtWhen(L.created_at))],
@@ -892,12 +993,47 @@
           ["Payload", '<span class="mono">' + esc(L.payload_hash || "—") + "</span>"],
           ["Withdrawn", L.withdrawn_at ? esc(fmtWhen(L.withdrawn_at)) + (L.withdraw_reason ? " · " + esc(L.withdraw_reason) : "") : "—"],
         ])
+        + (L.funding_mode_note ? '<p class="note" style="margin-top:8px">' + esc(L.funding_mode_note) + "</p>" : "")
+        + (L.settlement_mode_note ? '<p class="note" style="margin-top:8px">' + esc(L.settlement_mode_note) + "</p>" : "")
         + (L.rule ? '<p class="note">' + esc(L.rule) + "</p>" : "")
         + (L.payment_advice ? '<p class="note" style="margin-top:8px">' + esc(L.payment_advice) + "</p>" : "")
         + (L.before_you_start ? '<p class="note" style="margin-top:8px">' + esc(L.before_you_start) + "</p>" : "")
         + (L.payee_prerequisites ? '<p class="note" style="margin-top:8px">' + esc(L.payee_prerequisites) + "</p>" : "")
         + "</section>"
+        + '<section class="sec"><h2>Economics</h2>'
+        + '<p class="lead">' + esc(econ.note || L.submission_state_note || "") + "</p>"
+        + facts([
+          ["Award amount", esc(fmtUsdc(econ.award_amount_atomic))],
+          ["Max liability", esc(fmtUsdc(econ.max_liability_atomic))],
+          ["Slots used", econ.awarded_slots_used != null ? esc(econ.awarded_slots_used) : "—"],
+          ["Capacity left", econ.available_award_capacity != null ? esc(econ.available_award_capacity) : "—"],
+          ["Outstanding awarded", esc(fmtUsdc(econ.outstanding_awarded_atomic))],
+          ["Currently due", esc(fmtUsdc(econ.currently_due_atomic))],
+          ["Overdue unpaid", esc(fmtUsdc(econ.overdue_unpaid_atomic))],
+          ["Expired unclaimed", esc(fmtUsdc(econ.expired_unclaimed_atomic))],
+          ["Paid", esc(fmtUsdc(econ.amount_paid_atomic))],
+          ["Max remaining", esc(fmtUsdc(econ.maximum_remaining_liability_atomic))],
+        ])
+        + (L.clocks_note ? '<p class="note" style="margin-top:8px">' + esc(L.clocks_note) + "</p>" : "")
+        + (L.settlement_block_note ? '<p class="note" style="margin-top:8px">' + esc(L.settlement_block_note) + "</p>" : "")
+        + "</section>"
+        + '<section class="sec"><h2>Awards</h2>'
+        + '<p class="lead">' + esc(L.awards_note || "Watch never awards. A submission is not a debt; only an award in awarded, payable, or overdue_unpaid is.") + "</p>"
+        + (awards.length ? awards.map((a) => {
+            return '<article class="row"><div class="top">'
+              + (a.id != null ? '<span class="pill">award #' + esc(a.id) + "</span>" : "")
+              + (a.state ? statePill(a.state) : "")
+              + (a.amount_atomic != null ? '<span class="pill">' + esc(fmtUsdc(a.amount_atomic)) + "</span>" : "")
+              + "</div>"
+              + '<div class="note">' + (a.handle ? ("payee " + citizenLink(a.handle)) : "")
+              + (a.submission_id != null ? " · submission #" + esc(a.submission_id) : "")
+              + "</div>"
+              + (a.note ? '<p class="note" style="margin-top:6px">' + esc(a.note) + "</p>" : "")
+              + "</article>";
+          }).join("") : '<p class="note">No awards on this listing.</p>')
+        + "</section>"
         + '<section class="sec"><h2>Submissions</h2>'
+        + (L.submission_state_note ? '<p class="lead">' + esc(L.submission_state_note) + "</p>" : "")
         + (subs.length ? subs.map((s) => submissionCard(s, L)).join("") : '<p class="note">No work handed in yet.</p>')
         + "</section>"
         + '<section class="sec"><h2>Bindings</h2>'
