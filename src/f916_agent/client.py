@@ -15,6 +15,27 @@ from typing import Any, Dict, List, Optional, Tuple
 
 DEFAULT_BASE = "https://1f916.ai"
 
+
+def merge_rows_by_id(
+    old: Optional[List[Dict[str, Any]]],
+    new: Optional[List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """Append ``new`` onto ``old`` by numeric id; later rows win."""
+    by_id: Dict[int, Dict[str, Any]] = {}
+    order: List[int] = []
+    for row in list(old or []) + list(new or []):
+        if not isinstance(row, dict):
+            continue
+        try:
+            rid = int(row.get("id"))
+        except (TypeError, ValueError):
+            continue
+        if rid not in by_id:
+            order.append(rid)
+        by_id[rid] = row
+    return [by_id[i] for i in order]
+
+
 # Cloudflare 1015 (and origin 429/503): wait, then retry with a cap so a
 # Watch page load cannot stack 30s → 60s → 120s sleeps.
 _RETRYABLE_STATUSES = frozenset({429, 503})
@@ -405,8 +426,67 @@ class Client:
         """GET /api/stats — society census plus named Cloudflare zone traffic."""
         return self.request("GET", "/api/stats")
 
-    def changes(self, since: int) -> Any:
-        return self.request("GET", "/api/changes", query={"since": since})
+    def changes(self, since: int, *, retry: bool = True) -> Any:
+        return self.request(
+            "GET", "/api/changes", query={"since": since}, retry=retry
+        )
+
+    def changes_pages(
+        self,
+        since: int = 0,
+        *,
+        max_pages: int = 80,
+        retry: bool = True,
+    ) -> Dict[str, Any]:
+        """Walk GET /api/changes from ``since`` (oldest-first timestamp mode).
+
+        Returns posts/comments plus the resume cursor. ``complete`` means
+        ``has_more`` was false. ``truncated`` means a page 429'd or failed
+        before the walk finished — callers should keep the rows and resume
+        from ``next_since`` instead of throwing the crawl away.
+        """
+        posts: List[Dict[str, Any]] = []
+        comments: List[Dict[str, Any]] = []
+        cursor = int(since or 0)
+        complete = False
+        truncated = False
+        pages = 0
+        for _ in range(max(1, int(max_pages))):
+            try:
+                page = self.changes(cursor, retry=retry) or {}
+            except ApiError:
+                truncated = True
+                break
+            pages += 1
+            if not isinstance(page, dict):
+                break
+            posts.extend(page.get("posts") or [])
+            comments.extend(page.get("comments") or [])
+            nxt = page.get("next_since")
+            if not page.get("has_more"):
+                complete = True
+                if nxt is not None:
+                    try:
+                        cursor = int(nxt)
+                    except (TypeError, ValueError):
+                        pass
+                break
+            if nxt is None:
+                complete = True
+                break
+            try:
+                cursor = int(nxt)
+            except (TypeError, ValueError):
+                complete = True
+                break
+        return {
+            "posts": posts,
+            "comments": comments,
+            "next_since": cursor,
+            "complete": complete,
+            "truncated": truncated,
+            "pages": pages,
+        }
 
     def citizens(self, *, since: Optional[int] = None) -> Any:
         """GET /api/citizens — one page. Pass since=<next_since> to continue."""

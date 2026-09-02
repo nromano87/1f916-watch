@@ -34,7 +34,7 @@ from .chat_mod import (
     chat_reject_reason,
     redact_chat_message,
 )
-from .client import ApiError, Client
+from .client import ApiError, Client, merge_rows_by_id
 from .identity import Store
 from .inbox import build_inbox, build_inbox_for_handle, text_names_handle
 from .markdown_html import highlight_handle, to_html as md_html
@@ -176,16 +176,26 @@ _CHAIN_VERIFY_LOCK = threading.Lock()
 _CHAIN_VERIFY_TTL_SEC = 15.0
 
 # Shared /api/changes crawl so public profiles stay snappy.
+# /api/changes is oldest-first: recrawling from since=0 every TTL cannot
+# reach "now" once the square outgrows ~80 pages, and a mid-walk 429 used
+# to discard the whole attempt — leaving Comments stuck on a stale tip.
 _CHANGES_CACHE: Dict[str, Any] = {
     "fetched_at": 0.0,
     "posts": [],
     "comments": [],
     "gap": {},
+    "next_since": 0,
+    "complete": False,
 }
 _CHANGES_LOCK = threading.Lock()
 _CHANGES_COND = threading.Condition(_CHANGES_LOCK)
 _CHANGES_REFRESHING = False
 _CHANGES_TTL_SEC = 60.0
+_CHANGES_MAX_PAGES = 80
+_CHANGES_INCREMENTAL_PAGES = 16
+_CHANGES_TIP_PAGES = 16
+_CHANGES_TIP_LOOKBACK_SEC = (6 * 3600, 24 * 3600, 72 * 3600)
+_CHANGES_TIP_STALE_SEC = 30 * 60
 # Society bug: collapsed/removed rows can be omitted from /api/changes while
 # still serving on /api/post/:id. Cap probes so a wild ID hole can't stall Watch.
 _CHANGES_GAP_PROBE_CAP = 64
@@ -4355,11 +4365,87 @@ def _probe_changes_post_gap(
     }
 
 
+def _newest_created_at_ms(rows: List[Dict[str, Any]]) -> int:
+    newest = 0
+    for row in rows or []:
+        try:
+            newest = max(newest, int(row.get("created_at") or 0))
+        except (TypeError, ValueError):
+            continue
+    return newest
+
+
+def _changes_tip_is_stale(comments: List[Dict[str, Any]]) -> bool:
+    newest = _newest_created_at_ms(comments)
+    if newest <= 0:
+        return True
+    now_ms = int(time.time() * 1000)
+    return (now_ms - newest) > (_CHANGES_TIP_STALE_SEC * 1000)
+
+
+def _fetch_changes_tip(client: Client) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Newest /api/changes rows by walking a recent window through to now.
+
+    Timestamp mode is oldest-first, so a multi-day ``since`` on a single
+    page returns the *start* of that window. Page until ``has_more`` is
+    false (or the cap) so the last page is the live tip.
+    """
+    now_ms = int(time.time() * 1000)
+    last_posts: List[Dict[str, Any]] = []
+    last_comments: List[Dict[str, Any]] = []
+    for lookback in _CHANGES_TIP_LOOKBACK_SEC:
+        walked = client.changes_pages(
+            max(0, now_ms - int(lookback) * 1000),
+            max_pages=_CHANGES_TIP_PAGES,
+            retry=False,
+        )
+        posts = list(walked.get("posts") or [])
+        comments = list(walked.get("comments") or [])
+        if not posts and not comments:
+            if walked.get("truncated"):
+                break
+            continue
+        last_posts, last_comments = posts, comments
+        if walked.get("complete"):
+            return posts, comments
+        extra = client.changes_pages(
+            int(walked.get("next_since") or 0),
+            max_pages=_CHANGES_TIP_PAGES,
+            retry=False,
+        )
+        return (
+            merge_rows_by_id(posts, list(extra.get("posts") or [])),
+            merge_rows_by_id(comments, list(extra.get("comments") or [])),
+        )
+    return last_posts, last_comments
+
+
+def _ingest_changes_rows(
+    posts: List[Dict[str, Any]], comments: List[Dict[str, Any]]
+) -> None:
+    """Merge rows into the shared crawl without moving the resume cursor."""
+    if not posts and not comments:
+        return
+    with _CHANGES_COND:
+        _CHANGES_CACHE["posts"] = merge_rows_by_id(
+            list(_CHANGES_CACHE.get("posts") or []), posts
+        )
+        _CHANGES_CACHE["comments"] = merge_rows_by_id(
+            list(_CHANGES_CACHE.get("comments") or []), comments
+        )
+        if float(_CHANGES_CACHE.get("fetched_at") or 0) <= 0:
+            _CHANGES_CACHE["fetched_at"] = datetime.now(timezone.utc).timestamp()
+
+
 def _load_changes_index(client: Client, *, force: bool = False) -> Dict[str, Any]:
     """Crawl /api/changes once; concurrent callers wait for the in-flight refresh.
 
     After the first fill, an expired TTL returns the last crawl immediately
     and refreshes behind it — handle pages must not wait on 80 society pages.
+
+    Refreshes resume from ``next_since`` (not since=0) and keep partial pages
+    on 429. A recent-window walk fills the live tip so Comments cannot freeze
+    at wherever an origin crawl last stopped.
     """
     global _CHANGES_REFRESHING
     if not force:
@@ -4384,33 +4470,85 @@ def _load_changes_index(client: Client, *, force: bool = False) -> Dict[str, Any
                 force = False
                 continue
             _CHANGES_REFRESHING = True
+            resume = int(_CHANGES_CACHE.get("next_since") or 0)
+            had_data = bool(
+                _CHANGES_CACHE.get("posts") or _CHANGES_CACHE.get("comments")
+            )
             break
 
     try:
-        posts: List[Dict[str, Any]] = []
-        comments: List[Dict[str, Any]] = []
-        since = 0
-        for _ in range(80):
-            page = client.changes(since) or {}
-            posts.extend(page.get("posts") or [])
-            comments.extend(page.get("comments") or [])
-            if not page.get("has_more"):
-                break
-            nxt = page.get("next_since")
-            if nxt is None:
-                break
-            since = int(nxt)
+        start = resume if had_data else 0
+        max_pages = (
+            _CHANGES_INCREMENTAL_PAGES if had_data else _CHANGES_MAX_PAGES
+        )
+        walked = client.changes_pages(
+            start, max_pages=max_pages, retry=not had_data
+        )
+        posts_delta = list(walked.get("posts") or [])
+        comments_delta = list(walked.get("comments") or [])
+        next_since = int(walked.get("next_since") or start)
+        complete = bool(walked.get("complete"))
+        truncated = bool(walked.get("truncated"))
+        made_progress = bool(
+            walked.get("pages") or posts_delta or comments_delta
+        )
 
-        gap = _probe_changes_post_gap(client, posts)
+        tip_posts: List[Dict[str, Any]] = []
+        tip_comments: List[Dict[str, Any]] = []
+        with _CHANGES_COND:
+            cached_comments = list(_CHANGES_CACHE.get("comments") or [])
+        need_tip = (not complete) or _changes_tip_is_stale(
+            merge_rows_by_id(cached_comments, comments_delta)
+        )
+        if need_tip:
+            try:
+                tip_posts, tip_comments = _fetch_changes_tip(client)
+            except ApiError:
+                tip_posts, tip_comments = [], []
+
+        gap: Dict[str, Any] = {}
+        prev_gap: Dict[str, Any] = {}
+        with _CHANGES_COND:
+            posts = merge_rows_by_id(
+                list(_CHANGES_CACHE.get("posts") or []), posts_delta
+            )
+            comments = merge_rows_by_id(
+                list(_CHANGES_CACHE.get("comments") or []), comments_delta
+            )
+            if tip_posts or tip_comments:
+                posts = merge_rows_by_id(posts, tip_posts)
+                comments = merge_rows_by_id(comments, tip_comments)
+            prev_gap = dict(_CHANGES_CACHE.get("gap") or {})
+            if made_progress or not had_data:
+                _CHANGES_CACHE["next_since"] = next_since
+            if complete:
+                _CHANGES_CACHE["complete"] = True
+            elif made_progress:
+                _CHANGES_CACHE["complete"] = False
+            if made_progress or tip_comments or tip_posts or not had_data:
+                _CHANGES_CACHE["fetched_at"] = datetime.now(
+                    timezone.utc
+                ).timestamp()
+            _CHANGES_CACHE["posts"] = posts
+            _CHANGES_CACHE["comments"] = comments
+            stored_complete = bool(_CHANGES_CACHE.get("complete"))
+            snapshot_posts = list(posts)
+
         # Do not call _load_moderation_index here: front-snapshot loads mod then
         # changes, and nesting would deadlock under singleflight. Callers that
         # need reasons enrich omitted_posts themselves.
-
+        if stored_complete or (not had_data and not truncated):
+            try:
+                gap = _probe_changes_post_gap(client, snapshot_posts)
+            except Exception:
+                gap = prev_gap
+        else:
+            gap = prev_gap
         with _CHANGES_COND:
-            _CHANGES_CACHE["fetched_at"] = datetime.now(timezone.utc).timestamp()
-            _CHANGES_CACHE["posts"] = posts
-            _CHANGES_CACHE["comments"] = comments
-            _CHANGES_CACHE["gap"] = gap
+            if gap:
+                _CHANGES_CACHE["gap"] = gap
+            elif not _CHANGES_CACHE.get("gap"):
+                _CHANGES_CACHE["gap"] = {}
             return dict(_CHANGES_CACHE)
     finally:
         with _CHANGES_COND:
@@ -6188,12 +6326,29 @@ def _compute_front_snapshot(
     )
     if not filtered:
         _ensure_changes_index_async(client)
-        index = _peek_changes_index()
-        if index:
+        index = _peek_changes_index() or {}
+        source_comments = list(index.get("comments") or [])
+        source_posts = list(index.get("posts") or [])
+        if _changes_tip_is_stale(source_comments):
+            try:
+                tip_posts, tip_comments = _fetch_changes_tip(client)
+                if tip_posts or tip_comments:
+                    _ingest_changes_rows(tip_posts, tip_comments)
+                    source_comments = merge_rows_by_id(
+                        source_comments, tip_comments
+                    )
+                    source_posts = merge_rows_by_id(source_posts, tip_posts)
+            except Exception as e:  # pragma: no cover
+                errors.append("front_comments_tip: {}".format(e))
+        source_comments = merge_rows_by_id(
+            source_comments, list(extra.get("comments_new") or [])
+        )
+        source_posts = merge_rows_by_id(source_posts, thread_posts)
+        if source_comments:
             try:
                 front_comments = _front_comments_feed(
-                    list(index.get("comments") or []),
-                    list(index.get("posts") or []),
+                    source_comments,
+                    source_posts,
                     moderation,
                     vote_map=vote_map,
                 )

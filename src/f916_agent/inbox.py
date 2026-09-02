@@ -9,11 +9,18 @@ bare-handle mention catch-net for name-drops the @-only society bucket misses.
 from __future__ import annotations
 
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
-from .client import ApiError, Client, ME_INBOX_BUCKETS, extract_me_inbox
+from .client import (
+    ApiError,
+    Client,
+    ME_INBOX_BUCKETS,
+    extract_me_inbox,
+    merge_rows_by_id,
+)
 from .identity import Store
 
 
@@ -73,22 +80,26 @@ def _snip_around_handle(text: str, handle: str, *, radius: int = 90) -> str:
 def _crawl_changes(
     client: Client, *, max_pages: int = 80
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    posts: List[Dict[str, Any]] = []
-    comments: List[Dict[str, Any]] = []
-    since = 0
-    for _ in range(max_pages):
-        try:
-            page = client.changes(since) or {}
-        except ApiError:
+    walked = client.changes_pages(0, max_pages=max_pages)
+    posts = list(walked.get("posts") or [])
+    comments = list(walked.get("comments") or [])
+    if walked.get("complete"):
+        return posts, comments
+    # Origin walk stopped short (cap or 429). Pull a recent window so the
+    # fallback path still sees comments near now, not only the oldest pages.
+    now_ms = int(time.time() * 1000)
+    for hours in (6, 24, 72):
+        tip = client.changes_pages(
+            max(0, now_ms - hours * 3600 * 1000),
+            max_pages=16,
+            retry=False,
+        )
+        posts = merge_rows_by_id(posts, list(tip.get("posts") or []))
+        comments = merge_rows_by_id(comments, list(tip.get("comments") or []))
+        if tip.get("truncated") and not (tip.get("comments") or tip.get("posts")):
             break
-        posts.extend(page.get("posts") or [])
-        comments.extend(page.get("comments") or [])
-        if not page.get("has_more"):
+        if tip.get("complete") and (tip.get("comments") or tip.get("posts")):
             break
-        nxt = page.get("next_since")
-        if nxt is None:
-            break
-        since = int(nxt)
     return posts, comments
 
 
