@@ -331,6 +331,7 @@
       });
       if (!res.ok) return lastHasNew;
       const data = await res.json();
+      if (data && data.warming) return lastHasNew;
       const citizens = Array.isArray(data.citizens) ? data.citizens : [];
       let hasNew = false;
       for (const c of citizens) {
@@ -392,6 +393,7 @@
         )
           .then((r) => (r.ok ? r.json() : null))
           .then((data) => {
+            if (!data || data.warming) return;
             const c = ((data && data.citizens) || [])[0];
             if (c && c.handle) markSeen(c.handle, itemIdsFromCitizen(c));
           })

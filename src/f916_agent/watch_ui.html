@@ -2482,6 +2482,14 @@
     let lastSnapFp = "";
     let lastPaintAt = 0;
     let timer = null;
+    let pollMs = 20000;
+    function armPoll() {
+      const next = (lastSnap && lastSnap.warming) ? 2000 : 20000;
+      if (timer && next === pollMs) return;
+      pollMs = next;
+      if (timer) clearInterval(timer);
+      timer = setInterval(() => load(false), pollMs);
+    }
     let loadGen = 0;
     let loading = false;
     /** Keys like post:108 / comment:456 that we've upvoted. */
@@ -2499,6 +2507,7 @@
       try {
         return JSON.stringify({
           mode: snap.mode,
+          warming: !!snap.warming,
           identity: snap.identity,
           me: snap.me,
           history: snap.history,
@@ -5452,9 +5461,11 @@ cross-witness
         refreshLikedKeys(snap);
         $("error").classList.add("hidden");
         $("updatedAt").textContent = `updated ${fmtTime(snap.generated_at)}`;
-        $("liveLabel").textContent = manual
-          ? (unchanged && !timesStale ? "up to date" : "refreshed")
-          : "live";
+        $("liveLabel").textContent = snap.warming
+          ? "warming…"
+          : (manual
+            ? (unchanged && !timesStale ? "up to date" : "refreshed")
+            : "live");
 
         if (unchanged && !manual && !timesStale) {
           // Quiet poll: keep scroll / expand state; only nudge clocks.
@@ -5562,6 +5573,7 @@ cross-witness
           loading = false;
           document.body.classList.remove("is-refreshing");
           if (btn) btn.disabled = false;
+          armPoll();
         }
       }
     }
@@ -5670,7 +5682,7 @@ cross-witness
     if (FRONT_ONLY || wantsNoCount()) {
       bumpHitCounter({ skipBump: wantsNoCount() });
     }
-    timer = setInterval(() => load(false), 20000);
+    armPoll();
     // Keep spend-reset + Engage countdowns live between snapshot refreshes
     setInterval(() => {
       paintSpendReset();

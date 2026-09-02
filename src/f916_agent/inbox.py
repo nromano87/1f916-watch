@@ -28,7 +28,7 @@ def _norm_parent(value: Any) -> Optional[int]:
 
 def _fetch_thread(client: Client, post_id: int) -> Optional[Dict[str, Any]]:
     try:
-        return client.post_get(post_id)
+        return client.post_get(post_id, retry=False)
     except ApiError:
         return None
 
@@ -125,7 +125,7 @@ def _front_posts(client: Client) -> List[Dict[str, Any]]:
 
 def _fetch_post_row(client: Client, post_id: int) -> Optional[Dict[str, Any]]:
     try:
-        data = client.post_get(post_id)
+        data = client.post_get(post_id, retry=False)
     except ApiError:
         return None
     post = (data or {}).get("post")
@@ -141,7 +141,7 @@ def build_mentions(
     own_post_ids: Optional[Set[int]] = None,
     own_comment_ids: Optional[Set[int]] = None,
     max_post_fetches: int = 40,
-    max_workers: int = 10,
+    max_workers: int = 4,
     limit: int = 40,
 ) -> Dict[str, Any]:
     """Third inbox bucket: someone named this handle outside reply-to-you paths.
@@ -393,7 +393,7 @@ def build_inbox_for_handle(
     changes_posts: Optional[Iterable[Dict[str, Any]]] = None,
     changes_comments: Optional[Iterable[Dict[str, Any]]] = None,
     include_mentions: bool = True,
-    max_workers: int = 10,
+    max_workers: int = 4,
     limit: int = 80,
     mention_limit: int = 40,
     max_mention_post_fetches: int = 40,
@@ -712,7 +712,7 @@ def build_inbox(
     client: Client,
     store: Store,
     *,
-    max_workers: int = 10,
+    max_workers: int = 4,
     limit: int = 80,
     include_mentions: bool = True,
     include_society_me: bool = True,

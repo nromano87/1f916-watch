@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import ipaddress
 import json
 import os
 import threading
@@ -14,11 +15,18 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 import html as html_mod
 import re
 from urllib.parse import parse_qs, urlparse
 
+from .chat_fly import (
+    fetch_fly_chat,
+    fly_app,
+    mirror_from_env,
+    push_fly_chat,
+    schedule_fly_restart,
+)
 from .chat_mod import (
     CHAT_ADMIN_NAME,
     CHAT_ADMIN_REMOVAL_TEXT,
@@ -28,7 +36,7 @@ from .chat_mod import (
 )
 from .client import ApiError, Client
 from .identity import Store
-from .inbox import build_inbox, build_inbox_for_handle
+from .inbox import build_inbox, build_inbox_for_handle, text_names_handle
 from .markdown_html import highlight_handle, to_html as md_html
 from .public_allowance import (
     load_public_allowance,
@@ -46,6 +54,20 @@ try:
     from . import admin_local as _admin_local
 except ImportError:  # pragma: no cover
     _admin_local = None  # type: ignore[assignment]
+
+
+class _WatchHTTPServer(ThreadingHTTPServer):
+    """Daemon threads so a wedged request cannot pin the process after shutdown.
+
+    The default ThreadingHTTPServer (daemon_threads=False) plus per-connection
+    threads is how Watch ran out of RAM: guestbook polls took an exclusive
+    flock, threads piled up, Fly health checks timed out, and the proxy 503'd.
+    """
+
+    daemon_threads = True
+    block_on_close = False
+    request_queue_size = 128
+
 
 API_LOCAL_RE = re.compile(r"^/api/local/([a-z-]+)/?$")
 
@@ -189,7 +211,7 @@ _STATE_TTL_SEC = 60.0
 # Permalinks do not move; cache until process restart.
 _COMMENT_META: Dict[int, Dict[str, Any]] = {}
 _COMMENT_META_LOCK = threading.Lock()
-_COMMENT_RESOLVE_WORKERS = 8
+_COMMENT_RESOLVE_WORKERS = 4
 _MOD_DETAIL_RE = re.compile(
     r"^(?P<action>removed|collapsed|restored|pinned|unpinned|bulletin)\s+"
     r"(?P<target_type>post|comment)\s+(?P<target_id>\d+)"
@@ -210,26 +232,45 @@ _INBOX_COND = threading.Condition(_INBOX_LOCK)
 _INBOX_REFRESHING: Dict[str, bool] = {}
 _INBOX_TTL_SEC = 90.0
 # Society front page — one shared build; UI polls ~20s.
-# Filtered fronts (?tag=/?exclude=) use a separate keyed cache.
+# Serve stale immediately and refresh in the background so TTL expiry
+# never blocks the tab. Filtered fronts (?tag=/?exclude=) use a keyed cache.
 _FRONT_SNAP_CACHE: Dict[str, Any] = {"fetched_at": 0.0, "snap": None}
 _FRONT_FILTER_CACHE: Dict[str, Dict[str, Any]] = {}
 _FRONT_SNAP_LOCK = threading.Lock()
 _FRONT_SNAP_COND = threading.Condition(_FRONT_SNAP_LOCK)
 _FRONT_SNAP_REFRESHING = False
 _FRONT_FILTER_REFRESHING: Dict[str, bool] = {}
-_FRONT_SNAP_TTL_SEC = 20.0
-_FRONT_FILTER_TTL_SEC = 30.0
+_FRONT_SNAP_TTL_SEC = 45.0
+_FRONT_FILTER_TTL_SEC = 45.0
 _HIT_LOCK = threading.Lock()
 
 # Docket + provenance boards — light public reads.
+# Serve stale immediately and refresh behind TTL so a tab never waits
+# on the society after the first successful fill.
 _BOARD_CACHE: Dict[str, Dict[str, Any]] = {}
 _BOARD_LOCK = threading.Lock()
+_BOARD_COND = threading.Condition(_BOARD_LOCK)
+_BOARD_REFRESHING: Dict[str, bool] = {}
 _BOARD_TTL_SEC = 45.0
 # GET /api/search — keyed by query; empty q never hits the society.
 _SEARCH_CACHE: Dict[str, Dict[str, Any]] = {}
 _SEARCH_LOCK = threading.Lock()
+_SEARCH_COND = threading.Condition(_SEARCH_LOCK)
+_SEARCH_REFRESHING: Dict[str, bool] = {}
 _SEARCH_TTL_SEC = 20.0
 _SEARCH_Q_MAX = 200
+# /api/official is on almost every page — one shared read.
+_OFFICIAL_CACHE: Dict[str, Any] = {"fetched_at": 0.0, "payload": None}
+_OFFICIAL_LOCK = threading.Lock()
+_OFFICIAL_TTL_SEC = 60.0
+# Per-handle public cards.
+_PUBLIC_SNAP_CACHE: Dict[str, Dict[str, Any]] = {}
+_PUBLIC_SNAP_COND = threading.Condition()
+_PUBLIC_SNAP_REFRESHING: Dict[str, bool] = {}
+_PUBLIC_SNAP_TTL_SEC = 45.0
+_CITIZENS_LIST_CACHE: Dict[str, Any] = {"fetched_at": 0.0, "people": None}
+_CITIZENS_LIST_LOCK = threading.Lock()
+_CITIZENS_LIST_TTL_SEC = 60.0
 _OFFICIAL_SECURITY_URL = "https://1f916.ai/.well-known/security.txt"
 _OFFICIAL_LLMS_URL = "https://1f916.ai/llms.txt"
 _OFFICIAL_OPENAPI_URL = "https://1f916.ai/openapi.json"
@@ -249,6 +290,8 @@ _CHAT_VID_RE = re.compile(
 # (localStorage); fall back to IP. Legacy owners may be a bare IP string.
 _CHAT_NAME_OWNERS: Dict[str, str] = {}
 _CHAT_LOADED_ROOT: Optional[str] = None
+# Localhost operator: memory is the live Fly guestbook; removes write through.
+_CHAT_MIRROR_FLY = False
 
 
 def _normalize_vid(raw: Any) -> str:
@@ -293,11 +336,35 @@ def _chat_name_has_vid(name_key: str, visitor_id: str) -> bool:
     return False
 
 
-def _chat_public_message(msg: Dict[str, Any]) -> Dict[str, Any]:
-    """Public payload — never leak visitor ids to other clients."""
-    if msg.get("removed") or chat_is_offensive(
-        str(msg.get("name") or ""), str(msg.get("text") or "")
-    ):
+def _chat_public_message(
+    msg: Dict[str, Any], *, operator: bool = False
+) -> Dict[str, Any]:
+    """Public payload — never leak visitor ids to other clients.
+
+    Operator (localhost) sees the stored body so they can pick rows to
+    tombstone. Everyone else gets house-rule redaction on the way out.
+    """
+    if msg.get("removed"):
+        return {
+            "id": msg["id"],
+            "name": CHAT_ADMIN_NAME,
+            "text": CHAT_ADMIN_REMOVAL_TEXT,
+            "t": msg["t"],
+            "removed": True,
+        }
+    name = str(msg.get("name") or "")
+    text = str(msg.get("text") or "")
+    if operator:
+        out: Dict[str, Any] = {
+            "id": msg["id"],
+            "name": msg["name"],
+            "text": msg["text"],
+            "t": msg["t"],
+        }
+        if chat_is_offensive(name, text):
+            out["flagged"] = True
+        return out
+    if chat_is_offensive(name, text):
         return {
             "id": msg["id"],
             "name": CHAT_ADMIN_NAME,
@@ -409,6 +476,34 @@ def _chat_client_ip(handler: BaseHTTPRequestHandler) -> str:
     return str(handler.client_address[0] if handler.client_address else "unknown")
 
 
+def _loopback_bind_host(host: str) -> bool:
+    """True when Watch was bound to loopback (not 0.0.0.0 / a public iface)."""
+    h = (host or "").strip().lower()
+    if h.startswith("[") and h.endswith("]"):
+        h = h[1:-1]
+    return h in ("127.0.0.1", "localhost", "::1")
+
+
+def _request_is_direct_loopback(handler: BaseHTTPRequestHandler) -> bool:
+    """TCP peer is loopback and no proxy named the client.
+
+    Cloudflare tunnels and Fly both present as 127.0.0.1 at the Python
+    socket, so a bind-host check plus missing forwarded headers is the
+    floor — not a peer-IP check alone.
+    """
+    if (handler.headers.get("Fly-Client-IP") or "").strip():
+        return False
+    if (handler.headers.get("X-Forwarded-For") or "").strip():
+        return False
+    peer = str(handler.client_address[0] if handler.client_address else "")
+    if peer.lower().startswith("::ffff:"):
+        peer = peer[7:]
+    try:
+        return ipaddress.ip_address(peer).is_loopback
+    except ValueError:
+        return peer in ("127.0.0.1", "::1", "localhost")
+
+
 def _chat_paths(store: Store) -> tuple:
     root = store.root
     return (
@@ -507,17 +602,17 @@ def _chat_sweep_locked(now: float) -> bool:
     return changed
 
 
+def _chat_dump_locked() -> Dict[str, Any]:
+    return {
+        "next_id": _CHAT_NEXT_ID,
+        "messages": list(_CHAT_MESSAGES),
+        "owners": dict(_CHAT_NAME_OWNERS),
+    }
+
+
 def _chat_persist_locked(store: Store) -> None:
     path, _lock, bak = _chat_paths(store)
-    _write_chat_data(
-        path,
-        {
-            "next_id": _CHAT_NEXT_ID,
-            "messages": list(_CHAT_MESSAGES),
-            "owners": dict(_CHAT_NAME_OWNERS),
-        },
-        backup=bak,
-    )
+    _write_chat_data(path, _chat_dump_locked(), backup=bak)
 
 
 def _chat_ensure_loaded_locked(store: Store) -> None:
@@ -578,25 +673,63 @@ def _chat_ensure_loaded_locked(store: Store) -> None:
     _CHAT_NEXT_ID = max(1, next_id)
     _CHAT_LOADED_ROOT = root_key
     now = time.time()
+    # Mirroring Fly: leave prod rows as-is so the operator can pick tombstones.
+    if _CHAT_MIRROR_FLY:
+        if _chat_prune_locked(now):
+            _chat_persist_locked(store)
+        return
     if _chat_sweep_locked(now) or _chat_prune_locked(now):
         _chat_persist_locked(store)
 
 
-def chat_snapshot(store: Store) -> Dict[str, Any]:
-    now = time.time()
+def seed_chat_from_fly(store: Store) -> Tuple[int, Optional[str]]:
+    """Replace the local guestbook with the live Fly volume copy."""
+    global _CHAT_LOADED_ROOT
+    data, err = fetch_fly_chat()
+    if err:
+        return 0, err
+    if not isinstance(data, dict):
+        return 0, "fly dump was not an object"
 
-    def _snap() -> Dict[str, Any]:
+    def _seed() -> int:
+        global _CHAT_LOADED_ROOT
+        path, _lock, bak = _chat_paths(store)
+        _write_chat_data(path, data, backup=bak)
+        _CHAT_LOADED_ROOT = None
         _chat_ensure_loaded_locked(store)
-        swept = _chat_sweep_locked(now)
-        pruned = _chat_prune_locked(now)
-        if swept or pruned:
-            _chat_persist_locked(store)
-        msgs = [_chat_public_message(m) for m in _CHAT_MESSAGES]
-        latest = int(msgs[-1]["id"]) if msgs else 0
-        taken = sorted(_CHAT_NAME_OWNERS.keys())
-        return {"messages": msgs, "latest_id": latest, "taken_names": taken}
+        return len(_CHAT_MESSAGES)
 
-    return _with_chat_file_lock(store, _snap)
+    n = _with_chat_file_lock(store, _seed)
+    return n, None
+
+
+def chat_snapshot(store: Store, *, operator: bool = False) -> Dict[str, Any]:
+    """In-memory guestbook for the poll path.
+
+    Do not exclusive-flock or rewrite the file on GET. Every open Watch tab
+    hits /api/chat every 8s; flock+sweep+fsync there serializes those
+    threads until Fly's /healthz check misses its deadline.
+    """
+    root_key = str(store.root.resolve())
+    with _CHAT_LOCK:
+        loaded = _CHAT_LOADED_ROOT == root_key
+    if not loaded:
+        _with_chat_file_lock(store, lambda: _chat_ensure_loaded_locked(store))
+
+    with _CHAT_LOCK:
+        msgs = list(_CHAT_MESSAGES)
+        taken = sorted(_CHAT_NAME_OWNERS.keys())
+        mirror = _CHAT_MIRROR_FLY
+    public = [_chat_public_message(m, operator=operator) for m in msgs]
+    latest = int(public[-1]["id"]) if public else 0
+    out: Dict[str, Any] = {
+        "messages": public,
+        "latest_id": latest,
+        "taken_names": taken,
+    }
+    if mirror:
+        out["chat_source"] = "fly"
+    return out
 
 
 def chat_post(
@@ -689,8 +822,10 @@ def chat_moderate(
         return 400, {"error": "bad ids", "hint": "pass id or ids"}
 
     now = time.time()
+    dump: Optional[Dict[str, Any]] = None
 
     def _mod() -> Tuple[int, Dict[str, Any]]:
+        nonlocal dump
         _chat_ensure_loaded_locked(store)
         found = {int(m["id"]): m for m in _CHAT_MESSAGES}
         missing = [mid for mid in want if mid not in found]
@@ -705,13 +840,25 @@ def chat_moderate(
         if changed:
             _chat_prune_locked(now)
             _chat_persist_locked(store)
+            if _CHAT_MIRROR_FLY:
+                dump = _chat_dump_locked()
         return 200, {
             "ok": True,
             "removed": removed,
             "message": CHAT_ADMIN_REMOVAL_TEXT,
         }
 
-    return _with_chat_file_lock(store, _mod)
+    code, payload = _with_chat_file_lock(store, _mod)
+    if dump is not None:
+        push_err = push_fly_chat(dump)
+        payload["pushed"] = push_err is None
+        if push_err:
+            payload["push_error"] = push_err
+            payload["hint"] = push_err
+        else:
+            schedule_fly_restart()
+            payload["restarting"] = True
+    return code, payload
 
 
 def _hit_paths(store: Store) -> tuple:
@@ -948,7 +1095,7 @@ _PRESENCE_MAX = 8000
 
 
 _PRESENCE_FLUSH_LOCK = threading.Lock()
-_PRESENCE_FLUSH_SEC = 3.0
+_PRESENCE_FLUSH_SEC = 15.0
 _presence_flushed_at = 0.0
 
 
@@ -1043,6 +1190,16 @@ def concurrent_viewers(
 _WATCHLIST_REPORT_LOCK = threading.Lock()
 _WATCHLIST_HANDLE_RE = re.compile(r"^[A-Za-z0-9_-]{2,32}$")
 _WATCHLIST_MAX_HANDLES = 24
+# Serve a stale watchlist bundle immediately; refresh behind it. Trail bodies
+# come from the shared /api/changes crawl — not a per-handle thread fetch.
+_WATCHLIST_INBOX_CACHE: Dict[str, Dict[str, Any]] = {}
+_WATCHLIST_INBOX_LOCK = threading.Lock()
+_WATCHLIST_INBOX_COND = threading.Condition(_WATCHLIST_INBOX_LOCK)
+_WATCHLIST_INBOX_REFRESHING: Dict[str, bool] = {}
+_WATCHLIST_INBOX_TTL_SEC = 45.0
+_CITIZEN_ID_CACHE: Dict[str, Dict[str, Any]] = {}
+_CITIZEN_ID_LOCK = threading.Lock()
+_CITIZEN_ID_TTL_SEC = 120.0
 
 
 def _watchlist_report_paths(store: Store) -> tuple:
@@ -1595,6 +1752,87 @@ def _watch_back_href(from_handle: Optional[str]) -> str:
     if handle.lower() in RESERVED_ROOTS:
         return "/"
     return "/{}".format(handle)
+
+
+def _retry_headers(err: ApiError) -> Optional[Dict[str, str]]:
+    ra = getattr(err, "retry_after", None)
+    try:
+        wait = int(round(float(ra))) if ra else 0
+    except (TypeError, ValueError):
+        wait = 0
+    if wait <= 0:
+        return None
+    return {"Retry-After": str(wait)}
+
+
+def _api_error_payload(err: ApiError) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"error": err.message or str(err)}
+    ra = getattr(err, "retry_after", None)
+    if ra:
+        try:
+            out["retry_after"] = int(round(float(ra)))
+        except (TypeError, ValueError):
+            pass
+    if err.status == 429:
+        out["retryable"] = True
+    return out
+
+
+def render_post_error_page(
+    err: ApiError,
+    *,
+    post_id: Optional[int] = None,
+) -> bytes:
+    """Watch-styled error for /post/:id when the square is unreachable."""
+    retry_after = getattr(err, "retry_after", None)
+    try:
+        wait = int(round(float(retry_after))) if retry_after else 0
+    except (TypeError, ValueError):
+        wait = 0
+    if err.status == 429:
+        title = "Rate limited"
+        if wait > 0:
+            detail = (
+                "1f916.ai asked Watch to wait at least {} seconds "
+                "(Cloudflare 1015). This page will retry."
+            ).format(wait)
+        else:
+            detail = (
+                "1f916.ai is rate-limiting Watch (Cloudflare 1015). "
+                "Wait a moment, then reload."
+            )
+    else:
+        title = "Could not load this post"
+        detail = err.message or str(err)
+    refresh = (
+        '<meta http-equiv="refresh" content="{}" />'.format(wait) if wait > 0 else ""
+    )
+    heading = "#{}".format(post_id) if post_id is not None else "Post"
+    return "".join(
+        [
+            "<!DOCTYPE html><html lang='en'><head><meta charset='utf-8' />",
+            "<meta name='viewport' content='width=device-width, initial-scale=1' />",
+            refresh,
+            "<title>{} — Watch</title>".format(_esc(title)),
+            FAVICON_LINK,
+            "<link rel='preconnect' href='https://fonts.googleapis.com' />",
+            "<link href='https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Fraunces:opsz,wght@9..144,600;9..144,700&display=swap' rel='stylesheet' />",
+            "<style>",
+            "body{margin:0;font-family:'DM Sans',system-ui,sans-serif;background:#e8eee9;color:#12201c;}",
+            ".shell{max-width:40rem;margin:0 auto;padding:28px 20px 64px;}",
+            "a{color:#0c7c66;text-decoration:none;}",
+            "h1{font-family:Fraunces,Georgia,serif;font-size:clamp(1.6rem,4vw,2.2rem);letter-spacing:-0.03em;line-height:1.15;margin:14px 0 10px;}",
+            "p{color:#5a6a64;font-size:15px;line-height:1.45;}",
+            ".back{font-size:13px;font-weight:600;}",
+            "</style></head><body><div class='shell'>",
+            _spend_reset_banner(),
+            "<a class='back' href='/'>&larr; Back to Watch</a>",
+            "<h1>{}</h1>".format(_esc(heading)),
+            "<p><strong>{}</strong></p>".format(_esc(title)),
+            "<p>{}</p>".format(_esc(detail)),
+            "</div></body></html>",
+        ]
+    ).encode("utf-8")
 
 
 def render_post_page(
@@ -2183,11 +2421,19 @@ a.pill:hover{{background:rgba(12,124,102,.18);border-color:rgba(12,124,102,.4)}}
     }}
     meta.textContent = handles.length + " watched · fetching inboxes…";
     err.hidden = true;
+    listEl.innerHTML = handles.map((h) =>
+      '<article class="card" id="' + esc(cardId(h)) + '" data-handle="' + esc(h) + '">' +
+      '<div class="card-top"><a class="handle" href="/' + encodeURIComponent(h) + '">' +
+      esc(h) + '</a><span class="pill muted">loading</span></div></article>'
+    ).join("");
     try {{
       const qs = handles.map(encodeURIComponent).join(",");
+      const deadline = Date.now() + 180000;
+      while (true) {{
       const res = await fetch("/api/watchlist-inbox?handles=" + qs, {{ cache: "no-store" }});
       if (!res.ok) throw new Error("HTTP " + res.status);
       const data = await res.json();
+      const warming = !!data.warming;
       const byKey = {{}};
       for (const c of (data.citizens || [])) {{
         if (c && c.handle) byKey[String(c.handle).toLowerCase()] = c;
@@ -2197,16 +2443,18 @@ a.pill:hover{{background:rgba(12,124,102,.18);border-color:rgba(12,124,102,.4)}}
       let newTotal = 0;
       for (const h of handles) {{
         const c = byKey[h.toLowerCase()] || {{ handle: h, error: "missing", inbox: {{ items: [], counts: {{ total: 0 }} }}, item_ids: [] }};
-        const ids = wl.itemIdsFromCitizen(c);
-        const unseen = wl.unseenCount(c.handle || h, ids);
+          const ids = wl.itemIdsFromCitizen(c);
+          const unseen = warming ? 0 : wl.unseenCount(c.handle || h, ids);
         unseenByKey[h.toLowerCase()] = unseen;
         newTotal += unseen;
         const counts = (c.inbox && c.inbox.counts) || {{}};
         const total = counts.total != null ? counts.total : ((c.inbox && c.inbox.items) || []).length;
         const items = (c.inbox && c.inbox.items) || [];
-        const inboxHtml = c.error
-          ? '<p class="meta">' + esc(c.error) + "</p>"
-          : (items.length
+          const inboxHtml = c.error
+            ? '<p class="meta">' + esc(c.error) + "</p>"
+            : (warming
+              ? '<p class="meta">Warming public trail…</p>'
+              : (items.length
             ? '<ul class="inbox-list">' + items.map((it) => {{
                 const postHref = it.post_id != null ? ('/post/' + encodeURIComponent(it.post_id)) : "";
                 const who = it.author
@@ -2219,14 +2467,14 @@ a.pill:hover{{background:rgba(12,124,102,.18);border-color:rgba(12,124,102,.4)}}
                   who + postBit + '</span><span>' + esc(fmtAgo(it.created_at)) + "</span></div>" +
                   '<div class="body">' + esc(it.body || "") + "</div></li>";
               }}).join("") + "</ul>"
-            : '<p class="meta">Inbox quiet.</p>');
+              : '<p class="meta">Inbox quiet.</p>'));
         cardByKey[h.toLowerCase()] =
           '<article class="card' + (unseen > 0 ? " has-new" : "") + '" id="' + esc(cardId(c.handle || h)) + '" data-handle="' + esc(c.handle || h) + '">' +
           '<div class="card-top">' +
           '<a class="handle" href="/' + encodeURIComponent(c.handle || h) + '">' + esc(c.handle || h) + "</a>" +
           (c.model ? '<span class="pill muted">' + esc(c.model) + "</span>" : "") +
           '<span class="pill">karma ' + esc(c.karma ?? "—") + "</span>" +
-          '<span class="pill' + (unseen > 0 ? " warn" : "") + '">inbox ' + esc(total) +
+          '<span class="pill' + (unseen > 0 ? " warn" : "") + '">inbox ' + (warming ? "…" : esc(total)) +
             (unseen > 0 ? (" · " + unseen + " new") : "") + "</span>" +
           '<div class="card-actions">' +
           '<a class="btn" href="/' + encodeURIComponent(c.handle || h) + '">Open</a>' +
@@ -2236,15 +2484,21 @@ a.pill:hover{{background:rgba(12,124,102,.18);border-color:rgba(12,124,102,.4)}}
       remainState = {{ handles, byKey, unseenByKey }};
       listEl.innerHTML = sortedRemainHandles().map((h) => cardByKey[h.toLowerCase()] || "").join("");
       renderRemainTable();
-      meta.textContent = handles.length + " watched" + (newTotal ? (" · " + newTotal + " new") : "");
-      // Opening the watchlist acknowledges activity.
-      wl.markAllSeen(handles.map((h) => byKey[h.toLowerCase()] || {{ handle: h, item_ids: [] }}));
       listEl.querySelectorAll("[data-unwatch]").forEach((btn) => {{
         btn.addEventListener("click", () => {{
           wl.remove(btn.getAttribute("data-unwatch"));
           load();
         }});
       }});
+      if (!warming) {{
+        meta.textContent = handles.length + " watched" + (newTotal ? (" · " + newTotal + " new") : "");
+        wl.markAllSeen(handles.map((h) => byKey[h.toLowerCase()] || {{ handle: h, item_ids: [] }}));
+        break;
+      }}
+      meta.textContent = handles.length + " watched · warming trail…";
+      if (Date.now() >= deadline) break;
+      await new Promise((r) => setTimeout(r, 1500));
+      }}
     }} catch (e) {{
       err.hidden = false;
       err.textContent = String(e && e.message ? e.message : e);
@@ -3284,11 +3538,6 @@ def _comment_meta_from_payload(payload: Any) -> Optional[Dict[str, Any]]:
         "post_title": cm.get("post_title"),
         "author": cm.get("author"),
         "parent_id": cm.get("parent_id"),
-        "body": cm.get("body"),
-        "created_at": cm.get("created_at"),
-        "votes": cm.get("votes"),
-        "mod_state": cm.get("mod_state"),
-        "flags": cm.get("flags"),
     }
 
 
@@ -3315,7 +3564,7 @@ def _resolve_comment_meta(client: Client, comment_ids: List[int]) -> Dict[int, D
 
     def _fetch(cid: int) -> Tuple[int, Optional[Dict[str, Any]]]:
         try:
-            payload = client.comment_get(cid)
+            payload = client.comment_get(cid, retry=False)
         except ApiError:
             return cid, None
         return cid, _comment_meta_from_payload(payload)
@@ -3333,8 +3582,190 @@ def _resolve_comment_meta(client: Client, comment_ids: List[int]) -> Dict[int, D
     return found
 
 
+def _swr_claim(
+    cache: Dict[str, Dict[str, Any]],
+    cond: threading.Condition,
+    refreshing: Dict[str, bool],
+    key: str,
+    ttl: float,
+    *,
+    field: str = "snap",
+) -> Tuple[Optional[Dict[str, Any]], bool]:
+    """Returns ``(payload, should_compute)``. Stale + should_compute means
+    return the last snapshot now and refresh behind it."""
+    with cond:
+        while True:
+            now = datetime.now(timezone.utc).timestamp()
+            entry = cache.get(key) or {}
+            cached = entry.get(field)
+            age = now - float(entry.get("fetched_at") or 0)
+            busy = bool(refreshing.get(key))
+            if cached is not None and age < ttl:
+                return dict(cached), False
+            if busy:
+                if cached is not None:
+                    return dict(cached), False
+                cond.wait(timeout=90)
+                continue
+            refreshing[key] = True
+            if cached is not None:
+                return dict(cached), True
+            return None, True
+
+
+_SWR_CACHE_MAX = 48
+
+
+def _evict_oldest_cache(
+    cache: Dict[str, Dict[str, Any]], *, max_items: int, keep: Optional[str] = None
+) -> None:
+    extra = len(cache) - max_items
+    if extra <= 0:
+        return
+    oldest = sorted(
+        cache.items(), key=lambda kv: float((kv[1] or {}).get("fetched_at") or 0)
+    )
+    dropped = 0
+    for cache_key, _ in oldest:
+        if keep is not None and cache_key == keep:
+            continue
+        cache.pop(cache_key, None)
+        dropped += 1
+        if dropped >= extra:
+            break
+
+
+def _swr_store(
+    cache: Dict[str, Dict[str, Any]],
+    cond: threading.Condition,
+    key: str,
+    snap: Dict[str, Any],
+    *,
+    field: str = "snap",
+) -> None:
+    with cond:
+        cache[key] = {
+            "fetched_at": datetime.now(timezone.utc).timestamp(),
+            field: snap,
+        }
+        _evict_oldest_cache(cache, max_items=_SWR_CACHE_MAX, keep=key)
+
+
+def _swr_release(
+    cond: threading.Condition, refreshing: Dict[str, bool], key: str
+) -> None:
+    with cond:
+        refreshing[key] = False
+        cond.notify_all()
+
+
+def _swr_get(
+    cache: Dict[str, Dict[str, Any]],
+    cond: threading.Condition,
+    refreshing: Dict[str, bool],
+    key: str,
+    ttl: float,
+    compute: Any,
+    *,
+    field: str = "snap",
+    name: str = "",
+) -> Dict[str, Any]:
+    """Keyed stale-while-revalidate. Cold cache still computes on the caller."""
+    cached, should_compute = _swr_claim(
+        cache, cond, refreshing, key, ttl, field=field
+    )
+    if not should_compute:
+        return cached or {}
+    if cached is not None:
+
+        def _run() -> None:
+            try:
+                snap = compute()
+                if snap:
+                    _swr_store(cache, cond, key, snap, field=field)
+            except Exception:
+                pass
+            finally:
+                _swr_release(cond, refreshing, key)
+
+        threading.Thread(
+            target=_run,
+            name=name or "swr-{}".format(key[:24]),
+            daemon=True,
+        ).start()
+        return cached
+    try:
+        snap = compute() or {}
+        if snap:
+            _swr_store(cache, cond, key, snap, field=field)
+        return dict(snap)
+    finally:
+        _swr_release(cond, refreshing, key)
+
+
+def _cached_official(client: Client) -> Dict[str, Any]:
+    """One shared /api/official read so board pages don't each hit the door."""
+    now = datetime.now(timezone.utc).timestamp()
+    with _OFFICIAL_LOCK:
+        payload = _OFFICIAL_CACHE.get("payload")
+        age = now - float(_OFFICIAL_CACHE.get("fetched_at") or 0)
+        if payload is not None and age < _OFFICIAL_TTL_SEC:
+            return dict(payload) if isinstance(payload, dict) else {}
+        stale = dict(payload) if isinstance(payload, dict) else None
+    try:
+        data = client.official() or {}
+    except ApiError:
+        if stale is not None:
+            return stale
+        raise
+    if not isinstance(data, dict):
+        data = {}
+    with _OFFICIAL_LOCK:
+        _OFFICIAL_CACHE["fetched_at"] = datetime.now(timezone.utc).timestamp()
+        _OFFICIAL_CACHE["payload"] = data
+    return dict(data)
+
+
+def _peek_board_snap(key: str) -> Optional[Dict[str, Any]]:
+    with _BOARD_LOCK:
+        snap = (_BOARD_CACHE.get(key) or {}).get("snap")
+        return dict(snap) if isinstance(snap, dict) else None
+
+
+def _board_swr(key: str, compute: Any) -> Dict[str, Any]:
+    return _swr_get(
+        _BOARD_CACHE,
+        _BOARD_COND,
+        _BOARD_REFRESHING,
+        key,
+        _BOARD_TTL_SEC,
+        compute,
+        name="board-{}".format(key[:20]),
+    )
+
+
 def _load_moderation_state(client: Client, *, force: bool = False) -> Dict[str, Any]:
     global _STATE_REFRESHING
+    if not force:
+        kick = False
+        stale: Optional[Dict[str, Any]] = None
+        with _STATE_COND:
+            cached = _STATE_CACHE.get("index")
+            fetched_at = float(_STATE_CACHE.get("fetched_at") or 0)
+            if cached is not None and fetched_at > 0:
+                age = datetime.now(timezone.utc).timestamp() - fetched_at
+                kick = age >= _STATE_TTL_SEC and not _STATE_REFRESHING
+                stale = dict(cached)
+        if stale is not None:
+            if kick:
+                threading.Thread(
+                    target=_load_moderation_state,
+                    args=(client,),
+                    kwargs={"force": True},
+                    name="state-refresh",
+                    daemon=True,
+                ).start()
+            return stale
     with _STATE_COND:
         while True:
             now = datetime.now(timezone.utc).timestamp()
@@ -3390,6 +3821,26 @@ def _load_moderation_state(client: Client, *, force: bool = False) -> Dict[str, 
 
 def _load_flags_index(client: Client, *, force: bool = False) -> Dict[str, Any]:
     global _FLAGS_REFRESHING
+    if not force:
+        kick = False
+        stale: Optional[Dict[str, Any]] = None
+        with _FLAGS_COND:
+            cached = _FLAGS_CACHE.get("index")
+            fetched_at = float(_FLAGS_CACHE.get("fetched_at") or 0)
+            if cached is not None and fetched_at > 0:
+                age = datetime.now(timezone.utc).timestamp() - fetched_at
+                kick = age >= _FLAGS_TTL_SEC and not _FLAGS_REFRESHING
+                stale = dict(cached)
+        if stale is not None:
+            if kick:
+                threading.Thread(
+                    target=_load_flags_index,
+                    args=(client,),
+                    kwargs={"force": True},
+                    name="flags-refresh",
+                    daemon=True,
+                ).start()
+            return stale
     with _FLAGS_COND:
         while True:
             now = datetime.now(timezone.utc).timestamp()
@@ -3510,6 +3961,26 @@ def _overlay_live_moderation(
 def _load_moderation_index(client: Client, *, force: bool = False) -> Dict[str, Any]:
     """Index maintainer actions so Watch can show real reasons, not the API stub."""
     global _MOD_REFRESHING
+    if not force:
+        kick = False
+        stale: Optional[Dict[str, Any]] = None
+        with _MOD_COND:
+            cached = _MOD_CACHE.get("index")
+            fetched_at = float(_MOD_CACHE.get("fetched_at") or 0)
+            if cached is not None and fetched_at > 0:
+                age = datetime.now(timezone.utc).timestamp() - fetched_at
+                kick = age >= _MOD_TTL_SEC and not _MOD_REFRESHING
+                stale = dict(cached)
+        if stale is not None:
+            if kick:
+                threading.Thread(
+                    target=_load_moderation_index,
+                    args=(client,),
+                    kwargs={"force": True},
+                    name="mod-refresh",
+                    daemon=True,
+                ).start()
+            return stale
     with _MOD_COND:
         while True:
             now = datetime.now(timezone.utc).timestamp()
@@ -3825,11 +4296,14 @@ def _probe_changes_post_gap(
     gone = 0
     for pid in holes:
         try:
-            data = client.post_get(pid) or {}
+            data = client.post_get(pid, retry=False) or {}
         except ApiError as e:
             if e.status == 404:
                 gone += 1
                 continue
+            if e.status == 429:
+                truncated = True
+                break
             # Transient/other errors: leave unclassified rather than invent a row.
             continue
         post = data.get("post") or {}
@@ -3882,8 +4356,17 @@ def _probe_changes_post_gap(
 
 
 def _load_changes_index(client: Client, *, force: bool = False) -> Dict[str, Any]:
-    """Crawl /api/changes once; concurrent callers wait for the in-flight refresh."""
+    """Crawl /api/changes once; concurrent callers wait for the in-flight refresh.
+
+    After the first fill, an expired TTL returns the last crawl immediately
+    and refreshes behind it — handle pages must not wait on 80 society pages.
+    """
     global _CHANGES_REFRESHING
+    if not force:
+        peeked = _peek_changes_index()
+        if peeked is not None:
+            _ensure_changes_index_async(client)
+            return peeked
     with _CHANGES_COND:
         while True:
             now = datetime.now(timezone.utc).timestamp()
@@ -3933,6 +4416,33 @@ def _load_changes_index(client: Client, *, force: bool = False) -> Dict[str, Any
         with _CHANGES_COND:
             _CHANGES_REFRESHING = False
             _CHANGES_COND.notify_all()
+
+
+def _peek_changes_index() -> Optional[Dict[str, Any]]:
+    """Return a completed /api/changes crawl, even if the TTL has lapsed."""
+    with _CHANGES_LOCK:
+        if float(_CHANGES_CACHE.get("fetched_at") or 0) <= 0:
+            return None
+        return dict(_CHANGES_CACHE)
+
+
+def _ensure_changes_index_async(client: Client) -> None:
+    """Warm /api/changes in the background. Front never waits on the 80-page crawl."""
+    with _CHANGES_COND:
+        now = datetime.now(timezone.utc).timestamp()
+        age = now - float(_CHANGES_CACHE.get("fetched_at") or 0)
+        if age < _CHANGES_TTL_SEC and float(_CHANGES_CACHE.get("fetched_at") or 0) > 0:
+            return
+        if _CHANGES_REFRESHING:
+            return
+
+    def _run() -> None:
+        try:
+            _load_changes_index(client, force=True)
+        except Exception:
+            pass
+
+    threading.Thread(target=_run, name="changes-refresh", daemon=True).start()
 
 
 def find_citizen(client: Client, handle: str) -> Optional[Dict[str, Any]]:
@@ -4017,25 +4527,419 @@ def _preview_inbox_item(item: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _watchlist_inbox_key(handles: List[str]) -> str:
+    return ",".join(sorted(h.lower() for h in handles))
+
+
+def _claim_watchlist_inbox(key: str) -> Tuple[Optional[Dict[str, Any]], bool]:
+    """Returns ``(payload, should_compute)``. Stale + should_compute means
+    return the last bundle now and refresh behind it."""
+    with _WATCHLIST_INBOX_COND:
+        while True:
+            now = datetime.now(timezone.utc).timestamp()
+            entry = _WATCHLIST_INBOX_CACHE.get(key) or {}
+            cached = entry.get("payload")
+            age = now - float(entry.get("fetched_at") or 0)
+            refreshing = bool(_WATCHLIST_INBOX_REFRESHING.get(key))
+            if cached is not None and age < _WATCHLIST_INBOX_TTL_SEC:
+                return dict(cached), False
+            if refreshing:
+                if cached is not None:
+                    return dict(cached), False
+                _WATCHLIST_INBOX_COND.wait(timeout=90)
+                continue
+            _WATCHLIST_INBOX_REFRESHING[key] = True
+            if cached is not None:
+                return dict(cached), True
+            return None, True
+
+
+def _store_watchlist_inbox(key: str, payload: Dict[str, Any]) -> None:
+    with _WATCHLIST_INBOX_COND:
+        _WATCHLIST_INBOX_CACHE[key] = {
+            "fetched_at": datetime.now(timezone.utc).timestamp(),
+            "payload": payload,
+        }
+
+
+def _release_watchlist_inbox(key: str) -> None:
+    with _WATCHLIST_INBOX_COND:
+        _WATCHLIST_INBOX_REFRESHING[key] = False
+        _WATCHLIST_INBOX_COND.notify_all()
+
+
+def _cached_find_citizen(client: Client, handle: str) -> Optional[Dict[str, Any]]:
+    needle = (handle or "").strip()
+    if not needle:
+        return None
+    key = needle.lower()
+    now = datetime.now(timezone.utc).timestamp()
+    with _CITIZEN_ID_LOCK:
+        row = _CITIZEN_ID_CACHE.get(key) or {}
+        age = now - float(row.get("fetched_at") or 0)
+        if row and age < _CITIZEN_ID_TTL_SEC and "person" in row:
+            person = row.get("person")
+            return dict(person) if isinstance(person, dict) else None
+    person = find_citizen(client, needle)
+    with _CITIZEN_ID_LOCK:
+        _CITIZEN_ID_CACHE[key] = {
+            "fetched_at": datetime.now(timezone.utc).timestamp(),
+            "person": dict(person) if isinstance(person, dict) else None,
+        }
+    return person
+
+
+def _own_trail_from_index(
+    handle: str,
+    all_posts: List[Dict[str, Any]],
+    all_comments: List[Dict[str, Any]],
+    gap: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """This citizen's posts + comments from the shared changes crawl."""
+    h_l = (handle or "").strip().lower()
+    seen_posts: Dict[int, Dict[str, Any]] = {}
+    for p in all_posts:
+        try:
+            pid = int(p.get("id"))
+        except (TypeError, ValueError):
+            continue
+        if pid not in seen_posts:
+            seen_posts[pid] = p
+    own_posts = [
+        p
+        for p in seen_posts.values()
+        if str(p.get("author") or "").strip().lower() == h_l
+    ]
+    own_ids = {int(p["id"]) for p in own_posts if p.get("id") is not None}
+    for p in gap.get("omitted_posts") or []:
+        if str(p.get("author") or "").strip().lower() != h_l:
+            continue
+        try:
+            pid = int(p.get("id"))
+        except (TypeError, ValueError):
+            continue
+        if pid in own_ids:
+            continue
+        own_posts.append(p)
+        own_ids.add(pid)
+    own_comments = [
+        c
+        for c in all_comments
+        if str(c.get("author") or "").strip().lower() == h_l
+    ]
+    return own_posts, own_comments
+
+
+def _watchlist_inbox_from_changes(
+    handle: str,
+    *,
+    own_posts: List[Dict[str, Any]],
+    own_comments: List[Dict[str, Any]],
+    all_posts: List[Dict[str, Any]],
+    all_comments: List[Dict[str, Any]],
+    preview_limit: int = 8,
+    id_limit: int = 200,
+) -> Dict[str, Any]:
+    """Replies + comment mentions from /api/changes — no per-thread fetches.
+
+    Citizen windows still crawl /api/post for the full inbox. Watchlist only
+    needs previews and unseen ids, which the shared crawl already has.
+    """
+    h_l = (handle or "").strip().lower()
+    own_post_ids: Set[int] = set()
+    post_titles: Dict[int, str] = {}
+    for p in own_posts:
+        if p.get("id") is None:
+            continue
+        try:
+            pid = int(p["id"])
+        except (TypeError, ValueError):
+            continue
+        own_post_ids.add(pid)
+        post_titles[pid] = p.get("title") or post_titles.get(pid, "")
+    for p in all_posts:
+        if p.get("id") is None:
+            continue
+        try:
+            pid = int(p["id"])
+        except (TypeError, ValueError):
+            continue
+        if pid not in post_titles and p.get("title"):
+            post_titles[pid] = p.get("title") or ""
+    own_comment_ids: Set[int] = set()
+    for c in own_comments:
+        if c.get("id") is None:
+            continue
+        try:
+            own_comment_ids.add(int(c["id"]))
+        except (TypeError, ValueError):
+            continue
+        pid = c.get("post_id")
+        if pid is not None:
+            try:
+                post_titles.setdefault(int(pid), c.get("post_title") or "")
+            except (TypeError, ValueError):
+                pass
+
+    items: List[Dict[str, Any]] = []
+    counts = {"on_post": 0, "on_comment": 0, "mention": 0, "total": 0}
+    for cm in all_comments:
+        author = str(cm.get("author") or "").strip()
+        if not author or author.lower() == h_l:
+            continue
+        if cm.get("id") is None:
+            continue
+        try:
+            cid = int(cm["id"])
+        except (TypeError, ValueError):
+            continue
+        try:
+            pid = int(cm["post_id"]) if cm.get("post_id") is not None else None
+        except (TypeError, ValueError):
+            pid = None
+        parent = _norm_parent_id(cm.get("parent_id"))
+        intended = _norm_parent_id(cm.get("intended_parent_id"))
+        body = cm.get("body") or ""
+        kind = None
+        source = None
+        key = "c:{}".format(cid)
+        if (parent is not None and parent in own_comment_ids) or (
+            intended is not None and intended in own_comment_ids
+        ):
+            kind = "on_comment"
+        elif pid is not None and pid in own_post_ids:
+            kind = "on_post"
+        elif text_names_handle(body, handle):
+            kind = "mention"
+            source = "comment"
+        else:
+            continue
+        counts[kind] = int(counts.get(kind) or 0) + 1
+        items.append(
+            {
+                "id": cid,
+                "kind": kind,
+                "key": key,
+                "source": source,
+                "post_id": pid,
+                "post_title": post_titles.get(pid or -1, ""),
+                "comment_id": cid,
+                "author": author,
+                "author_model": cm.get("author_model") or "",
+                "body": body,
+                "created_at": cm.get("created_at"),
+                "votes": int(cm.get("votes") or 0),
+            }
+        )
+    items.sort(key=lambda x: (x.get("created_at") or 0), reverse=True)
+    counts["total"] = len(items)
+    ids: List[str] = []
+    for it in items[:id_limit]:
+        iid = _watchlist_inbox_item_id(it)
+        if iid and iid not in ("c:", "p:"):
+            ids.append(iid)
+    return {
+        "built_at": datetime.now(timezone.utc).isoformat(),
+        "counts": counts,
+        "items": [_preview_inbox_item(it) for it in items[:preview_limit]],
+        "item_ids": ids,
+    }
+
+
+def _watchlist_entry_for_handle(
+    client: Client,
+    handle: str,
+    *,
+    all_posts: List[Dict[str, Any]],
+    all_comments: List[Dict[str, Any]],
+    gap: Dict[str, Any],
+    preview_limit: int,
+    warming: bool = False,
+) -> Tuple[Dict[str, Any], Optional[str]]:
+    lookup_error: Optional[str] = None
+    person: Optional[Dict[str, Any]] = None
+    try:
+        person = _cached_find_citizen(client, handle)
+    except ApiError as e:
+        lookup_error = "identity: {}".format(e)
+        person = {"handle": handle}
+    if not person:
+        return (
+            {
+                "handle": handle,
+                "error": "citizen not found",
+                "inbox": {"items": [], "counts": {"total": 0}},
+                "item_ids": [],
+                "posts_remaining": None,
+                "comments_remaining": None,
+            },
+            lookup_error,
+        )
+    h = str(person.get("handle") or handle)
+    karma_raw = person.get("karma")
+    try:
+        karma = int(karma_raw) if karma_raw is not None else None
+    except (TypeError, ValueError):
+        karma = None
+    entry: Dict[str, Any] = {
+        "handle": h,
+        "model": person.get("model"),
+        "karma": karma,
+        "citizen_id": person.get("id") or person.get("citizen_id"),
+        "error": None,
+        "inbox": {"items": [], "counts": {"total": 0}},
+        "item_ids": [],
+        "posts_remaining": None,
+        "comments_remaining": None,
+    }
+    if warming:
+        return entry, lookup_error
+    own_posts, own_comments = _own_trail_from_index(
+        h, all_posts, all_comments, gap
+    )
+    today = _allowance_from_ledger(own_posts, own_comments)
+    entry["posts_remaining"] = int(today.get("posts_remaining") or 0)
+    entry["comments_remaining"] = int(today.get("comments_remaining") or 0)
+    try:
+        activity = _watchlist_inbox_from_changes(
+            h,
+            own_posts=own_posts,
+            own_comments=own_comments,
+            all_posts=all_posts,
+            all_comments=all_comments,
+            preview_limit=preview_limit,
+        )
+        entry["item_ids"] = list(activity.get("item_ids") or [])
+        entry["inbox"] = {
+            "built_at": activity.get("built_at"),
+            "counts": activity.get("counts")
+            or {"on_post": 0, "on_comment": 0, "mention": 0, "total": 0},
+            "items": list(activity.get("items") or []),
+        }
+    except Exception as e:  # pragma: no cover
+        entry["error"] = "inbox: {}".format(e)
+    return entry, lookup_error
+
+
+def _compute_watchlist_inbox(
+    client: Client,
+    cleaned: List[str],
+    *,
+    preview_limit: int,
+) -> Dict[str, Any]:
+    errors: List[str] = []
+    _ensure_changes_index_async(client)
+    index = _peek_changes_index()
+    warming = not index
+    if not index:
+        index = {"posts": [], "comments": [], "gap": {}}
+
+    all_posts = list(index.get("posts") or [])
+    all_comments = list(index.get("comments") or [])
+    gap = dict(index.get("gap") or {})
+    by_handle: Dict[str, Tuple[Dict[str, Any], Optional[str]]] = {}
+    workers = min(4, len(cleaned)) or 1
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = {
+            pool.submit(
+                _watchlist_entry_for_handle,
+                client,
+                handle,
+                all_posts=all_posts,
+                all_comments=all_comments,
+                gap=gap,
+                preview_limit=preview_limit,
+                warming=warming,
+            ): handle
+            for handle in cleaned
+        }
+        for fut in as_completed(futs):
+            handle = futs[fut]
+            try:
+                by_handle[handle.lower()] = fut.result()
+            except Exception as e:  # pragma: no cover
+                by_handle[handle.lower()] = (
+                    {
+                        "handle": handle,
+                        "error": "inbox: {}".format(e),
+                        "inbox": {"items": [], "counts": {"total": 0}},
+                        "item_ids": [],
+                        "posts_remaining": None,
+                        "comments_remaining": None,
+                    },
+                    None,
+                )
+
+    citizens_out: List[Dict[str, Any]] = []
+    for handle in cleaned:
+        entry, lookup_error = by_handle.get(handle.lower()) or (
+            {
+                "handle": handle,
+                "error": "missing",
+                "inbox": {"items": [], "counts": {"total": 0}},
+                "item_ids": [],
+                "posts_remaining": None,
+                "comments_remaining": None,
+            },
+            None,
+        )
+        if lookup_error:
+            errors.append("{}: {}".format(handle, lookup_error))
+        citizens_out.append(entry)
+
+    out = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "mode": "watchlist",
+        "citizens": citizens_out,
+        "errors": errors,
+    }
+    if warming:
+        out["warming"] = True
+    return out
+
+
+def _refresh_watchlist_inbox(
+    client: Client,
+    cleaned: List[str],
+    key: str,
+    preview_limit: int,
+) -> Dict[str, Any]:
+    try:
+        payload = _compute_watchlist_inbox(
+            client, cleaned, preview_limit=preview_limit
+        )
+        if not payload.get("warming"):
+            _store_watchlist_inbox(key, payload)
+        return payload
+    finally:
+        _release_watchlist_inbox(key)
+
+
 def build_watchlist_inbox(
     client: Client,
     handles: List[str],
     *,
     preview_limit: int = 8,
 ) -> Dict[str, Any]:
-    """Lightweight inbox bundle for browser watchlists (shared changes crawl)."""
+    """Lightweight inbox bundle for browser watchlists (shared changes crawl).
+
+    Cold cache returns identity immediately with ``warming: true`` while
+    /api/changes fills in. After the first complete build, an expired TTL
+    returns the last bundle immediately and refreshes behind it. Trail
+    bodies come from /api/changes — Watchlist does not crawl /api/post.
+    """
     cleaned: List[str] = []
     seen_keys = set()
     for raw in handles:
         h = str(raw or "").strip()
-        if not h or not re.match(r"^[A-Za-z0-9_-]{2,32}$", h):
+        if not h or not _WATCHLIST_HANDLE_RE.match(h):
             continue
         key = h.lower()
         if key in seen_keys or key in RESERVED_ROOTS:
             continue
         seen_keys.add(key)
         cleaned.append(h)
-        if len(cleaned) >= 16:
+        if len(cleaned) >= _WATCHLIST_MAX_HANDLES:
             break
 
     if not cleaned:
@@ -4046,119 +4950,66 @@ def build_watchlist_inbox(
             "errors": [],
         }
 
-    errors: List[str] = []
-    index = {"posts": [], "comments": [], "gap": {}}
-    try:
-        index = _load_changes_index(client)
-    except ApiError as e:
-        errors.append("changes: {}".format(e))
-
-    all_posts = list(index.get("posts") or [])
-    all_comments = list(index.get("comments") or [])
-    gap = dict(index.get("gap") or {})
-    citizens_out: List[Dict[str, Any]] = []
-
-    for handle in cleaned:
-        person: Optional[Dict[str, Any]] = None
-        lookup_error: Optional[str] = None
-        try:
-            person = find_citizen(client, handle)
-        except ApiError as e:
-            lookup_error = "identity: {}".format(e)
-            errors.append("{}: {}".format(handle, lookup_error))
-            person = {"handle": handle}
-        if not person:
-            citizens_out.append(
-                {
-                    "handle": handle,
-                    "error": "citizen not found",
-                    "inbox": {"items": [], "counts": {"total": 0}},
-                    "item_ids": [],
-                    "posts_remaining": None,
-                    "comments_remaining": None,
-                }
-            )
-            continue
-        h = str(person.get("handle") or handle)
-        seen_posts: Dict[int, Dict[str, Any]] = {}
-        for p in all_posts:
-            try:
-                pid = int(p.get("id"))
-            except (TypeError, ValueError):
-                continue
-            if pid not in seen_posts:
-                seen_posts[pid] = p
-        own_posts = [p for p in seen_posts.values() if p.get("author") == h]
-        own_ids = {int(p["id"]) for p in own_posts if p.get("id") is not None}
-        for p in gap.get("omitted_posts") or []:
-            if p.get("author") != h:
-                continue
-            try:
-                pid = int(p.get("id"))
-            except (TypeError, ValueError):
-                continue
-            if pid in own_ids:
-                continue
-            own_posts.append(p)
-            own_ids.add(pid)
-        own_comments = [c for c in all_comments if c.get("author") == h]
-        today = _allowance_from_ledger(own_posts, own_comments)
-        karma_raw = person.get("karma")
-        try:
-            karma = int(karma_raw) if karma_raw is not None else None
-        except (TypeError, ValueError):
-            karma = None
-        entry: Dict[str, Any] = {
-            "handle": h,
-            "model": person.get("model"),
-            "karma": karma,
-            "citizen_id": person.get("id") or person.get("citizen_id"),
-            "error": None,
-            "inbox": {"items": [], "counts": {"total": 0}},
-            "item_ids": [],
-            "posts_remaining": int(today.get("posts_remaining") or 0),
-            "comments_remaining": int(today.get("comments_remaining") or 0),
-        }
-        try:
-            activity = _load_public_inbox(
-                client,
-                h,
-                own_posts=own_posts,
-                own_comments=own_comments,
-                changes_posts=all_posts,
-                changes_comments=all_comments,
-            )
-            items = list(activity.get("items") or [])
-            ids: List[str] = []
-            for it in items:
-                iid = _watchlist_inbox_item_id(it)
-                if iid and iid not in ("c:", "p:"):
-                    ids.append(iid)
-            entry["item_ids"] = ids
-            entry["inbox"] = {
-                "built_at": activity.get("built_at"),
-                "counts": activity.get("counts")
-                or {"on_post": 0, "on_comment": 0, "mention": 0, "total": 0},
-                "items": [_preview_inbox_item(it) for it in items[:preview_limit]],
-            }
-        except Exception as e:  # pragma: no cover
-            entry["error"] = "inbox: {}".format(e)
-        citizens_out.append(entry)
-
-    return {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "mode": "watchlist",
-        "citizens": citizens_out,
-        "errors": errors,
-    }
+    cache_key = _watchlist_inbox_key(cleaned)
+    cached, should_compute = _claim_watchlist_inbox(cache_key)
+    if not should_compute:
+        return cached or {}
+    if cached is not None:
+        threading.Thread(
+            target=_refresh_watchlist_inbox,
+            args=(client, cleaned, cache_key, preview_limit),
+            name="watchlist-inbox",
+            daemon=True,
+        ).start()
+        return cached
+    return _refresh_watchlist_inbox(client, cleaned, cache_key, preview_limit)
 
 
 def list_citizens(
     client: Client, store: Optional[Store] = None
 ) -> List[Dict[str, Any]]:
+    now = datetime.now(timezone.utc).timestamp()
+    kick = False
+    stale: Optional[List[Dict[str, Any]]] = None
+    with _CITIZENS_LIST_LOCK:
+        people = _CITIZENS_LIST_CACHE.get("people")
+        fetched_at = float(_CITIZENS_LIST_CACHE.get("fetched_at") or 0)
+        refreshing = bool(_CITIZENS_LIST_CACHE.get("refreshing"))
+        if isinstance(people, list) and fetched_at > 0:
+            age = now - fetched_at
+            kick = age >= _CITIZENS_LIST_TTL_SEC and not refreshing
+            if kick:
+                _CITIZENS_LIST_CACHE["refreshing"] = True
+            stale = [dict(p) for p in people if isinstance(p, dict)]
+    if stale is not None:
+        if kick:
+            def _run() -> None:
+                try:
+                    _refresh_citizens_list(client, store)
+                except Exception:
+                    with _CITIZENS_LIST_LOCK:
+                        _CITIZENS_LIST_CACHE["refreshing"] = False
+
+            threading.Thread(
+                target=_run,
+                name="citizens-refresh",
+                daemon=True,
+            ).start()
+        return stale
+    return _refresh_citizens_list(client, store)
+
+
+def _refresh_citizens_list(
+    client: Client, store: Optional[Store] = None
+) -> List[Dict[str, Any]]:
     try:
         data = client.citizens_full() or {}
     except ApiError:
+        with _CITIZENS_LIST_LOCK:
+            cached = _CITIZENS_LIST_CACHE.get("people")
+            _CITIZENS_LIST_CACHE["refreshing"] = False
+        if isinstance(cached, list) and cached:
+            return [dict(p) for p in cached if isinstance(p, dict)]
         return []
     people = data if isinstance(data, list) else (data.get("citizens") or [])
 
@@ -4207,6 +5058,10 @@ def list_citizens(
             }
         )
     out.sort(key=lambda p: (-int(p.get("karma") or 0), str(p.get("handle") or "").lower()))
+    with _CITIZENS_LIST_LOCK:
+        _CITIZENS_LIST_CACHE["fetched_at"] = datetime.now(timezone.utc).timestamp()
+        _CITIZENS_LIST_CACHE["people"] = list(out)
+        _CITIZENS_LIST_CACHE["refreshing"] = False
     return out
 
 
@@ -4249,6 +5104,37 @@ def _load_public_inbox(
 ) -> Dict[str, Any]:
     key = (handle or "").strip().lower()
     scope = _inbox_scope_key(own_posts, own_comments)
+    if not force:
+        kick = False
+        stale: Optional[Dict[str, Any]] = None
+        with _INBOX_COND:
+            cached = _INBOX_CACHE.get(key) or {}
+            box = cached.get("box")
+            fetched_at = float(cached.get("fetched_at") or 0)
+            if (
+                box is not None
+                and cached.get("scope") == scope
+                and fetched_at > 0
+            ):
+                age = datetime.now(timezone.utc).timestamp() - fetched_at
+                kick = age >= _INBOX_TTL_SEC and not _INBOX_REFRESHING.get(key)
+                stale = dict(box)
+        if stale is not None:
+            if kick:
+                threading.Thread(
+                    target=_load_public_inbox,
+                    args=(client, handle),
+                    kwargs={
+                        "own_posts": own_posts,
+                        "own_comments": own_comments,
+                        "changes_posts": changes_posts,
+                        "changes_comments": changes_comments,
+                        "force": True,
+                    },
+                    name="inbox-refresh",
+                    daemon=True,
+                ).start()
+            return stale
     with _INBOX_COND:
         while True:
             now = datetime.now(timezone.utc).timestamp()
@@ -4284,6 +5170,7 @@ def _load_public_inbox(
                 "scope": scope,
                 "box": box,
             }
+            _evict_oldest_cache(_INBOX_CACHE, max_items=_SWR_CACHE_MAX, keep=key)
         return box
     finally:
         with _INBOX_COND:
@@ -4331,18 +5218,22 @@ def _allowance_from_ledger(
     }
 
 
-def build_public_snapshot(
+def _compute_public_snapshot(
     client: Client,
     handle: str,
     *,
     store: Optional[Store] = None,
+    quick: bool = False,
 ) -> Dict[str, Any]:
     """Society-visible Watch view for any citizen — no local secret.
+
+    ``quick`` skips thread crawls and extra society reads so the first
+    paint can return from the shared /api/changes crawl.
     """
     errors: List[str] = []
     person: Optional[Dict[str, Any]] = None
     try:
-        person = find_citizen(client, handle)
+        person = _cached_find_citizen(client, handle)
     except ApiError as e:
         errors.append("citizen: {}".format(e))
         person = {"handle": handle}
@@ -4379,31 +5270,39 @@ def build_public_snapshot(
     attest: Dict[str, Any] = {}
     official: Dict[str, Any] = {}
     try:
-        official = client.official() or {}
+        official = _cached_official(client)
     except ApiError as e:
         errors.append("official: {}".format(e))
-    try:
-        attest = client.attest() or {}
-    except ApiError as e:
-        errors.append("attest: {}".format(e))
+    if not quick:
+        try:
+            attest = client.attest() or {}
+        except ApiError as e:
+            errors.append("attest: {}".format(e))
 
     index = {"posts": [], "comments": [], "gap": {}}
     try:
-        index = _load_changes_index(client)
+        if quick:
+            _ensure_changes_index_async(client)
+            peeked = _peek_changes_index()
+            if peeked:
+                index = peeked
+        else:
+            index = _load_changes_index(client)
     except ApiError as e:
         errors.append("changes: {}".format(e))
 
     h = str(person.get("handle") or handle)
     record: Dict[str, Any] = {}
-    try:
-        record = client.record(h) or {}
-    except ApiError as e:
-        errors.append("record: {}".format(e))
     keys_public: Dict[str, Any] = {}
-    try:
-        keys_public = client.keys(h) or {}
-    except ApiError as e:
-        errors.append("keys: {}".format(e))
+    if not quick:
+        try:
+            record = client.record(h) or {}
+        except ApiError as e:
+            errors.append("record: {}".format(e))
+        try:
+            keys_public = client.keys(h) or {}
+        except ApiError as e:
+            errors.append("keys: {}".format(e))
     gap = dict(index.get("gap") or {})
     # Deduplicate crawl duplicates; keep first-seen metadata.
     seen_posts: Dict[int, Dict[str, Any]] = {}
@@ -4438,7 +5337,7 @@ def build_public_snapshot(
         own_comments,
         posts=list(seen_posts.values()) + list(gap.get("omitted_posts") or []),
         comments=list(index.get("comments") or []),
-        client=client,
+        client=None if quick else client,
     )
     # /api/changes omits comment counts; tally from the same crawl as a first pass.
     own_posts = _enrich_rows_comments(
@@ -4476,14 +5375,25 @@ def build_public_snapshot(
                 for v in load_vote_log(store, limit=120)
             ]
     try:
-        activity = _load_public_inbox(
-            client,
-            h,
-            own_posts=own_posts,
-            own_comments=own_comments,
-            changes_posts=list(index.get("posts") or []),
-            changes_comments=list(index.get("comments") or []),
-        )
+        if quick:
+            activity = _watchlist_inbox_from_changes(
+                h,
+                own_posts=own_posts,
+                own_comments=own_comments,
+                all_posts=list(index.get("posts") or []),
+                all_comments=list(index.get("comments") or []),
+                preview_limit=80,
+                id_limit=200,
+            )
+        else:
+            activity = _load_public_inbox(
+                client,
+                h,
+                own_posts=own_posts,
+                own_comments=own_comments,
+                changes_posts=list(index.get("posts") or []),
+                changes_comments=list(index.get("comments") or []),
+            )
         inbox = {
             "built_at": activity.get("built_at"),
             "items": activity.get("items") or [],
@@ -4494,12 +5404,13 @@ def build_public_snapshot(
             "mention_coverage": activity.get("mention_coverage") or {},
         }
         karma = list(activity.get("karma") or activity.get("likes") or [])
-        # /api/changes omits votes + comment counts; backfill from thread fetches.
-        own_posts = _enrich_rows_votes(own_posts, activity.get("post_votes"))
-        own_posts = _enrich_rows_comments(own_posts, activity.get("post_comments"))
-        own_comments = _enrich_rows_votes(
-            own_comments, activity.get("comment_votes")
-        )
+        if not quick:
+            # /api/changes omits votes + comment counts; backfill from thread fetches.
+            own_posts = _enrich_rows_votes(own_posts, activity.get("post_votes"))
+            own_posts = _enrich_rows_comments(own_posts, activity.get("post_comments"))
+            own_comments = _enrich_rows_votes(
+                own_comments, activity.get("comment_votes")
+            )
     except Exception as e:  # pragma: no cover
         errors.append("inbox: {}".format(e))
 
@@ -4602,27 +5513,28 @@ def build_public_snapshot(
     attest_latest = None
 
     identity_events: List[Dict[str, Any]] = []
-    try:
-        ev_payload = client.events() or {}
-        events = ev_payload.get("events") or ev_payload or []
-        if isinstance(events, list):
-            for ev in events[-30:]:
-                kind = str((ev or {}).get("kind") or "").lower()
-                if (
-                    kind in (
-                        "key_rotation",
-                        "model_correction",
-                        "custody_changed",
-                        "model_corrected",
-                    )
-                    or "model" in kind
-                    or "rotat" in kind
-                    or "custody" in kind
-                ):
-                    identity_events.append(ev)
-            identity_events = identity_events[-12:]
-    except ApiError as e:
-        errors.append("events: {}".format(e))
+    if not quick:
+        try:
+            ev_payload = client.events() or {}
+            events = ev_payload.get("events") or ev_payload or []
+            if isinstance(events, list):
+                for ev in events[-30:]:
+                    kind = str((ev or {}).get("kind") or "").lower()
+                    if (
+                        kind in (
+                            "key_rotation",
+                            "model_correction",
+                            "custody_changed",
+                            "model_corrected",
+                        )
+                        or "model" in kind
+                        or "rotat" in kind
+                        or "custody" in kind
+                    ):
+                        identity_events.append(ev)
+                identity_events = identity_events[-12:]
+        except ApiError as e:
+            errors.append("events: {}".format(e))
 
     # Public (and stale-local) dash: surface cycle receipts from the published
     # allowance blob so GitHub Actions runs show up on Watch.
@@ -4680,9 +5592,102 @@ def build_public_snapshot(
         "record": record,
         "keys": keys_public,
         "badge_url": "/badge/{}.svg".format(h),
-        "listings": _listings_for_handle(client, h, errors),
+        "listings": _listings_for_handle(client, h, errors, blocking=not quick),
         "errors": errors,
     }
+
+
+def build_public_snapshot(
+    client: Client,
+    handle: str,
+    *,
+    store: Optional[Store] = None,
+) -> Dict[str, Any]:
+    """Society-visible Watch view for any citizen — no local secret.
+
+    Cold cache returns a trail built from /api/changes immediately
+    (``warming: true``) while thread-fetched votes fill in behind it.
+    After the first complete build, an expired TTL returns stale now.
+    """
+    key = (handle or "").strip().lower()
+    if not key:
+        return _compute_public_snapshot(client, handle, store=store, quick=True)
+
+    cached, should_compute = _swr_claim(
+        _PUBLIC_SNAP_CACHE,
+        _PUBLIC_SNAP_COND,
+        _PUBLIC_SNAP_REFRESHING,
+        key,
+        _PUBLIC_SNAP_TTL_SEC,
+    )
+    if not should_compute:
+        return cached or {}
+    if cached is not None:
+
+        def _run_full() -> None:
+            try:
+                snap = _compute_public_snapshot(
+                    client, handle, store=store, quick=False
+                )
+                if snap and not snap.get("error"):
+                    _swr_store(
+                        _PUBLIC_SNAP_CACHE,
+                        _PUBLIC_SNAP_COND,
+                        key,
+                        snap,
+                    )
+            except Exception:
+                pass
+            finally:
+                _swr_release(
+                    _PUBLIC_SNAP_COND, _PUBLIC_SNAP_REFRESHING, key
+                )
+
+        threading.Thread(
+            target=_run_full, name="public-{}".format(key[:16]), daemon=True
+        ).start()
+        return cached
+    try:
+        light = _compute_public_snapshot(
+            client, handle, store=store, quick=True
+        )
+        if light.get("error"):
+            _swr_release(_PUBLIC_SNAP_COND, _PUBLIC_SNAP_REFRESHING, key)
+            return light
+        stored = dict(light)
+        stored["warming"] = True
+        _swr_store(_PUBLIC_SNAP_CACHE, _PUBLIC_SNAP_COND, key, stored)
+        with _PUBLIC_SNAP_COND:
+            _PUBLIC_SNAP_COND.notify_all()
+
+        def _run_full() -> None:
+            try:
+                snap = _compute_public_snapshot(
+                    client, handle, store=store, quick=False
+                )
+                if snap and not snap.get("error"):
+                    _swr_store(
+                        _PUBLIC_SNAP_CACHE,
+                        _PUBLIC_SNAP_COND,
+                        key,
+                        snap,
+                    )
+            except Exception:
+                pass
+            finally:
+                _swr_release(
+                    _PUBLIC_SNAP_COND, _PUBLIC_SNAP_REFRESHING, key
+                )
+
+        threading.Thread(
+            target=_run_full, name="public-{}".format(key[:16]), daemon=True
+        ).start()
+        light = dict(light)
+        light["warming"] = True
+        return light
+    except Exception:
+        _swr_release(_PUBLIC_SNAP_COND, _PUBLIC_SNAP_REFRESHING, key)
+        raise
 
 
 def _front_comment_titles(posts: List[Dict[str, Any]]) -> Dict[int, str]:
@@ -4808,16 +5813,34 @@ def _front_comments_feed(
     return _enrich_comment_context(out, posts=posts, comments=comments)
 
 
+def _tag_labels_from_thread(data: Dict[str, Any]) -> List[str]:
+    """Labels from GET /api/post — listing endpoints omit tags."""
+    labels: List[str] = []
+    rows = data.get("tags") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        return labels
+    for row in rows:
+        if isinstance(row, dict):
+            label = str(row.get("tag") or "").strip()
+        else:
+            label = str(row or "").strip()
+        if label and label not in labels:
+            labels.append(label)
+    return labels
+
+
 def _front_comments_top(
     client: Client,
     front_posts: List[Dict[str, Any]],
     moderation: Optional[Dict[str, Any]],
     *,
     limit: int = 120,
-) -> Tuple[List[Dict[str, Any]], Dict[int, int], Dict[int, int]]:
+) -> Tuple[List[Dict[str, Any]], Dict[int, int], Dict[int, int], Dict[str, Any]]:
     """Most-upvoted comments from front-post threads (where votes are public).
 
-    Also returns post_id → flags from /api/post (listing endpoints omit flags).
+    Also returns post_id → flags and tags from /api/post (listing omits both),
+    plus a newest-on-front comment list so the tab is not empty while the
+    square-wide /api/changes crawl is still warming.
     """
     post_ids: List[int] = []
     titles: Dict[int, str] = {}
@@ -4834,6 +5857,7 @@ def _front_comments_top(
     threads = fetch_threads(client, post_ids) if post_ids else {}
     vote_map: Dict[int, int] = {}
     post_flags: Dict[int, int] = {}
+    post_tags: Dict[str, List[str]] = {}
     rows: List[Dict[str, Any]] = []
     for pid, data in threads.items():
         post = data.get("post") or {}
@@ -4844,6 +5868,9 @@ def _front_comments_top(
             post_flags[int(pid)] = int(post.get("flags") or 0)
         except (TypeError, ValueError):
             post_flags[int(pid)] = 0
+        labels = _tag_labels_from_thread(data if isinstance(data, dict) else {})
+        if labels:
+            post_tags[str(int(pid))] = labels
         for cm in data.get("comments") or []:
             row = dict(cm)
             row["post_id"] = pid
@@ -4858,6 +5885,11 @@ def _front_comments_top(
             row["votes"] = votes
             rows.append(_attach_moderation(row, moderation, target_type="comment"))
     rows = _enrich_comment_context(rows, posts=front_posts, comments=rows)
+    newest = sorted(
+        rows,
+        key=lambda c: int(c.get("created_at") or 0),
+        reverse=True,
+    )
     rows.sort(
         key=lambda c: (
             int(c.get("votes") or 0),
@@ -4865,7 +5897,15 @@ def _front_comments_top(
         ),
         reverse=True,
     )
-    return rows[:limit], vote_map, post_flags
+    return (
+        rows[:limit],
+        vote_map,
+        post_flags,
+        {
+            "post_tags": post_tags,
+            "comments_new": newest[:limit],
+        },
+    )
 
 
 def _enrich_front_blob_flags(
@@ -4895,39 +5935,322 @@ def _front_filter_key(tag: Optional[str], exclude: Optional[str]) -> str:
     return "{}|{}".format(tag or "", exclude or "")
 
 
-def _build_post_tags_index(client: Client, errors: List[str]) -> Dict[str, List[str]]:
-    """Map post id → tag names by probing each label on /api/front?tag=."""
-    index: Dict[str, List[str]] = {}
-    try:
-        payload = client.tags() or {}
-    except ApiError as e:
-        errors.append("tags: {}".format(e))
-        return index
-    rows = payload.get("tags") if isinstance(payload, dict) else None
-    if not isinstance(rows, list):
-        return index
-    for row in rows:
-        if not isinstance(row, dict):
+def _identity_events_from_payload(payload: Any) -> List[Dict[str, Any]]:
+    events = payload.get("events") if isinstance(payload, dict) else payload
+    if not isinstance(events, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for ev in events[-30:]:
+        kind = str((ev or {}).get("kind") or "").lower()
+        if (
+            kind
+            in (
+                "key_rotation",
+                "model_correction",
+                "custody_changed",
+                "model_corrected",
+            )
+            or "model" in kind
+            or "rotat" in kind
+            or "custody" in kind
+        ):
+            out.append(ev)
+    return out[-12:]
+
+
+def _enrich_front_blob_tags(
+    blob: Dict[str, Any], post_tags: Optional[Dict[str, List[str]]]
+) -> Dict[str, Any]:
+    """Copy thread-fetched labels onto listing rows so cards can render chips."""
+    if not blob:
+        return blob or {}
+    if not post_tags:
+        return blob
+    out = dict(blob)
+    posts: List[Dict[str, Any]] = []
+    for p in list(blob.get("posts") or []):
+        if not isinstance(p, dict):
             continue
-        label = str(row.get("tag") or "").strip()
-        if not label:
-            continue
+        row = dict(p)
         try:
-            blob = client.front("top", limit=100, tag=label) or {}
-        except ApiError as e:
-            errors.append("front?tag={}: {}".format(label, e))
+            pid = str(int(row.get("id")))
+        except (TypeError, ValueError):
+            posts.append(row)
             continue
-        for p in (blob.get("posts") if isinstance(blob, dict) else None) or []:
-            if not isinstance(p, dict):
+        labels = post_tags.get(pid)
+        if labels and not row.get("tags"):
+            row["tags"] = list(labels)
+        posts.append(row)
+    out["posts"] = posts
+    return out
+
+
+def _claim_front_snapshot(
+    *, filtered: bool, fkey: str
+) -> Tuple[Optional[Dict[str, Any]], bool]:
+    """Cache claim for the front snapshot.
+
+    Returns ``(snap, should_compute)``. A stale snap with ``should_compute``
+    means the caller should refresh in the background and return stale now.
+    """
+    global _FRONT_SNAP_REFRESHING
+    ttl = _FRONT_FILTER_TTL_SEC if filtered else _FRONT_SNAP_TTL_SEC
+    with _FRONT_SNAP_COND:
+        while True:
+            now = datetime.now(timezone.utc).timestamp()
+            if filtered:
+                entry = _FRONT_FILTER_CACHE.get(fkey) or {}
+                cached = entry.get("snap")
+                age = now - float(entry.get("fetched_at") or 0)
+                refreshing = bool(_FRONT_FILTER_REFRESHING.get(fkey))
+            else:
+                cached = _FRONT_SNAP_CACHE.get("snap")
+                age = now - float(_FRONT_SNAP_CACHE.get("fetched_at") or 0)
+                refreshing = bool(_FRONT_SNAP_REFRESHING)
+            if cached is not None and age < ttl:
+                return dict(cached), False
+            if refreshing:
+                if cached is not None:
+                    return dict(cached), False
+                _FRONT_SNAP_COND.wait(timeout=90)
                 continue
+            if filtered:
+                _FRONT_FILTER_REFRESHING[fkey] = True
+            else:
+                _FRONT_SNAP_REFRESHING = True
+            if cached is not None:
+                return dict(cached), True
+            return None, True
+
+
+def _front_post_count(snap: Optional[Dict[str, Any]]) -> int:
+    if not snap:
+        return 0
+    return len(((snap.get("front") or {}).get("posts") or []))
+
+
+def _store_front_snapshot(
+    snap: Dict[str, Any], *, filtered: bool, fkey: str
+) -> None:
+    now = datetime.now(timezone.utc).timestamp()
+    with _FRONT_SNAP_COND:
+        if filtered:
+            prev = (_FRONT_FILTER_CACHE.get(fkey) or {}).get("snap")
+        else:
+            prev = _FRONT_SNAP_CACHE.get("snap")
+        # A 429/blip refresh must not blank a window people are already reading.
+        if _front_post_count(snap) == 0 and _front_post_count(prev) > 0:
+            if filtered:
+                entry = _FRONT_FILTER_CACHE.get(fkey) or {}
+                entry["fetched_at"] = now
+                _FRONT_FILTER_CACHE[fkey] = entry
+            else:
+                _FRONT_SNAP_CACHE["fetched_at"] = now
+            return
+        if filtered:
+            _FRONT_FILTER_CACHE[fkey] = {"fetched_at": now, "snap": snap}
+        else:
+            _FRONT_SNAP_CACHE["fetched_at"] = now
+            _FRONT_SNAP_CACHE["snap"] = snap
+
+
+def _release_front_snapshot(*, filtered: bool, fkey: str) -> None:
+    global _FRONT_SNAP_REFRESHING
+    with _FRONT_SNAP_COND:
+        if filtered:
+            _FRONT_FILTER_REFRESHING[fkey] = False
+        else:
+            _FRONT_SNAP_REFRESHING = False
+        _FRONT_SNAP_COND.notify_all()
+
+
+def _compute_front_snapshot(
+    client: Client,
+    tag_q: Optional[str],
+    exclude_q: Optional[str],
+    *,
+    filtered: bool,
+) -> Dict[str, Any]:
+    """Fetch society front sources. Tags come from /api/post, not per-label probes."""
+    errors: List[str] = []
+    bucket: Dict[str, Any] = {}
+
+    def _fetch(label: str, fn: Any) -> None:
+        try:
+            bucket[label] = fn()
+        except ApiError as e:
+            errors.append("{}: {}".format(label, e))
+        except Exception as e:  # pragma: no cover
+            errors.append("{}: {}".format(label, e))
+
+    jobs = (
+        (
+            "front",
+            lambda: client.front("top", limit=100, tag=tag_q, exclude=exclude_q)
+            or {},
+        ),
+        (
+            "front_new",
+            lambda: client.front("new", limit=100, tag=tag_q, exclude=exclude_q)
+            or {},
+        ),
+        ("moderation", lambda: _load_moderation_index(client)),
+        ("flags", lambda: _load_flags_index(client)),
+        ("official", lambda: _cached_official(client)),
+        ("tags", lambda: client.tags() or {}),
+        ("events", lambda: client.events() or {}),
+        ("stats", lambda: build_stats_snapshot(client)),
+    )
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futs = [pool.submit(_fetch, label, fn) for label, fn in jobs]
+        for fut in futs:
+            fut.result()
+
+    front = bucket.get("front") if isinstance(bucket.get("front"), dict) else {}
+    front_new = (
+        bucket.get("front_new") if isinstance(bucket.get("front_new"), dict) else {}
+    )
+    moderation = bucket.get("moderation")
+    if not isinstance(moderation, dict):
+        moderation = _empty_moderation_index()
+    flags_index = bucket.get("flags")
+    if not isinstance(flags_index, dict):
+        flags_index = _empty_flags_index()
+    official = bucket.get("official") if isinstance(bucket.get("official"), dict) else {}
+    tags_payload = bucket.get("tags") if isinstance(bucket.get("tags"), dict) else {}
+    identity_events = _identity_events_from_payload(bucket.get("events"))
+    stats_snap = bucket.get("stats") if isinstance(bucket.get("stats"), dict) else {}
+    society_stats = stats_snap.get("stats") or {}
+    for err in stats_snap.get("errors") or []:
+        if err not in errors:
+            errors.append(err)
+
+    front_comments: List[Dict[str, Any]] = []
+    front_comments_top: List[Dict[str, Any]] = []
+    vote_map: Dict[int, int] = {}
+    post_flags: Dict[int, int] = {}
+    extra: Dict[str, Any] = {}
+    thread_posts: List[Dict[str, Any]] = []
+    seen_pids: set = set()
+    for p in list((front or {}).get("posts") or []) + list(
+        (front_new or {}).get("posts") or []
+    ):
+        try:
+            pid = int(p.get("id"))
+        except (TypeError, ValueError):
+            continue
+        if pid in seen_pids:
+            continue
+        seen_pids.add(pid)
+        thread_posts.append(p)
+    try:
+        front_comments_top, vote_map, post_flags, extra = _front_comments_top(
+            client,
+            thread_posts,
+            moderation,
+        )
+    except Exception as e:  # pragma: no cover
+        errors.append("front_comments_top: {}".format(e))
+        extra = {}
+
+    post_tags: Dict[str, List[str]] = dict(extra.get("post_tags") or {})
+    if filtered:
+        applied = (
+            (front.get("filters_applied") if isinstance(front, dict) else None) or {}
+        )
+        include = applied.get("tag") if isinstance(applied, dict) else None
+        if not isinstance(include, list):
+            include = [t for t in (tag_q or "").split(",") if t]
+        for p in thread_posts:
             try:
                 pid = str(int(p.get("id")))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, AttributeError):
                 continue
-            bucket = index.setdefault(pid, [])
-            if label not in bucket:
-                bucket.append(label)
-    return index
+            labels = list(post_tags.get(pid) or [])
+            for label in include:
+                if label and label not in labels:
+                    labels.append(label)
+            if labels:
+                post_tags[pid] = labels
+
+    front = _enrich_front_blob_flags(front, post_flags)
+    front_new = _enrich_front_blob_flags(front_new, post_flags)
+    front = _enrich_front_blob_tags(front, post_tags)
+    front_new = _enrich_front_blob_tags(front_new, post_tags)
+    front["posts"] = _enrich_rows_flags(
+        list(front.get("posts") or []), flags_index, target_type="post"
+    )
+    front_new["posts"] = _enrich_rows_flags(
+        list(front_new.get("posts") or []), flags_index, target_type="post"
+    )
+    front_comments_top = _enrich_rows_flags(
+        front_comments_top, flags_index, target_type="comment"
+    )
+    if not filtered:
+        _ensure_changes_index_async(client)
+        index = _peek_changes_index()
+        if index:
+            try:
+                front_comments = _front_comments_feed(
+                    list(index.get("comments") or []),
+                    list(index.get("posts") or []),
+                    moderation,
+                    vote_map=vote_map,
+                )
+            except Exception as e:  # pragma: no cover
+                errors.append("front_comments: {}".format(e))
+        if not front_comments:
+            front_comments = list(extra.get("comments_new") or [])
+    front_comments = _enrich_rows_flags(
+        front_comments, flags_index, target_type="comment"
+    )
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "mode": "front",
+        "front": front,
+        "front_new": front_new,
+        "front_comments": front_comments,
+        "front_comments_top": front_comments_top,
+        "filters": {
+            "tag": tag_q,
+            "exclude": exclude_q,
+        },
+        "filters_applied": (front.get("filters_applied") if isinstance(front, dict) else None)
+        or (front_new.get("filters_applied") if isinstance(front_new, dict) else None),
+        "tags": tags_payload,
+        "post_tags": post_tags,
+        "moderation": {
+            "count": moderation.get("count") or 0,
+            "by_key": moderation.get("by_key") or {},
+            "source": moderation.get("source")
+            or "/api/events?kind=moderation",
+            "moderation_state": moderation.get("moderation_state") or {},
+        },
+        "flags": _flags_public_blob(flags_index),
+        "stats": society_stats,
+        "official": official,
+        "official_security_url": "https://1f916.ai/.well-known/security.txt",
+        "identity_events": identity_events,
+        "errors": errors,
+    }
+
+
+def _refresh_front_snapshot(
+    client: Client,
+    tag_q: Optional[str],
+    exclude_q: Optional[str],
+    *,
+    filtered: bool,
+    fkey: str,
+) -> Dict[str, Any]:
+    try:
+        snap = _compute_front_snapshot(
+            client, tag_q, exclude_q, filtered=filtered
+        )
+        _store_front_snapshot(snap, filtered=filtered, fkey=fkey)
+        return dict(snap)
+    finally:
+        _release_front_snapshot(filtered=filtered, fkey=fkey)
 
 
 def build_front_snapshot(
@@ -4941,227 +6264,30 @@ def build_front_snapshot(
     Optional ``tag`` / ``exclude`` (comma-separated) pass through to
     /api/front and /api/new. Unfiltered responses stay on the primary cache;
     filtered views use a keyed cache so chip toggles stay cheap.
+
+    Cold cache blocks until the first build. After that, an expired TTL
+    returns the last snap immediately and refreshes behind it.
     """
-    global _FRONT_SNAP_REFRESHING
     tag_q = _normalize_tag_csv(tag)
     exclude_q = _normalize_tag_csv(exclude)
     filtered = bool(tag_q or exclude_q)
     fkey = _front_filter_key(tag_q, exclude_q)
 
-    if filtered:
-        with _FRONT_SNAP_COND:
-            while True:
-                entry = _FRONT_FILTER_CACHE.get(fkey) or {}
-                age = datetime.now(timezone.utc).timestamp() - float(
-                    entry.get("fetched_at") or 0
-                )
-                cached = entry.get("snap")
-                if age < _FRONT_FILTER_TTL_SEC and cached is not None:
-                    return dict(cached)
-                if _FRONT_FILTER_REFRESHING.get(fkey):
-                    _FRONT_SNAP_COND.wait(timeout=90)
-                    continue
-                _FRONT_FILTER_REFRESHING[fkey] = True
-                break
-    else:
-        with _FRONT_SNAP_COND:
-            while True:
-                now = datetime.now(timezone.utc).timestamp()
-                age = now - float(_FRONT_SNAP_CACHE.get("fetched_at") or 0)
-                cached = _FRONT_SNAP_CACHE.get("snap")
-                if age < _FRONT_SNAP_TTL_SEC and cached is not None:
-                    return dict(cached)
-                if _FRONT_SNAP_REFRESHING:
-                    _FRONT_SNAP_COND.wait(timeout=90)
-                    continue
-                _FRONT_SNAP_REFRESHING = True
-                break
-
-    try:
-        errors: List[str] = []
-        front: Dict[str, Any] = {}
-        front_new: Dict[str, Any] = {}
-        try:
-            front = (
-                client.front("top", limit=100, tag=tag_q, exclude=exclude_q) or {}
-            )
-        except ApiError as e:
-            errors.append("front: {}".format(e))
-        try:
-            front_new = (
-                client.front("new", limit=100, tag=tag_q, exclude=exclude_q) or {}
-            )
-        except ApiError as e:
-            errors.append("front_new: {}".format(e))
-        try:
-            moderation = _load_moderation_index(client)
-        except ApiError as e:
-            errors.append("moderation: {}".format(e))
-            moderation = _empty_moderation_index()
-        flags_index: Dict[str, Any] = _empty_flags_index()
-        try:
-            flags_index = _load_flags_index(client)
-        except ApiError as e:
-            errors.append("flags: {}".format(e))
-        official: Dict[str, Any] = {}
-        try:
-            official = client.official() or {}
-        except ApiError as e:
-            errors.append("official: {}".format(e))
-        tags_payload: Dict[str, Any] = {}
-        try:
-            tags_payload = client.tags() or {}
-        except ApiError as e:
-            errors.append("tags: {}".format(e))
-        post_tags: Dict[str, List[str]] = {}
-        if not filtered:
-            post_tags = _build_post_tags_index(client, errors)
-        else:
-            # Filtered window: every returned row carries the include set.
-            applied = (
-                (front.get("filters_applied") if isinstance(front, dict) else None)
-                or {}
-            )
-            include = applied.get("tag") if isinstance(applied, dict) else None
-            if not isinstance(include, list):
-                include = [t for t in (tag_q or "").split(",") if t]
-            for p in list((front or {}).get("posts") or []) + list(
-                (front_new or {}).get("posts") or []
-            ):
-                try:
-                    pid = str(int(p.get("id")))
-                except (TypeError, ValueError, AttributeError):
-                    continue
-                post_tags[pid] = list(include)
-        identity_events: List[Dict[str, Any]] = []
-        try:
-            ev_payload = client.events() or {}
-            events = ev_payload.get("events") or ev_payload or []
-            if isinstance(events, list):
-                for ev in events[-30:]:
-                    kind = str((ev or {}).get("kind") or "").lower()
-                    if (
-                        kind
-                        in (
-                            "key_rotation",
-                            "model_correction",
-                            "custody_changed",
-                            "model_corrected",
-                        )
-                        or "model" in kind
-                        or "rotat" in kind
-                        or "custody" in kind
-                    ):
-                        identity_events.append(ev)
-                identity_events = identity_events[-12:]
-        except ApiError as e:
-            errors.append("events: {}".format(e))
-        front_comments: List[Dict[str, Any]] = []
-        front_comments_top: List[Dict[str, Any]] = []
-        vote_map: Dict[int, int] = {}
-        post_flags: Dict[int, int] = {}
-        # Union top + new so flag backfill covers both sort bases.
-        thread_posts: List[Dict[str, Any]] = []
-        seen_pids: set = set()
-        for p in list((front or {}).get("posts") or []) + list(
-            (front_new or {}).get("posts") or []
-        ):
-            try:
-                pid = int(p.get("id"))
-            except (TypeError, ValueError):
-                continue
-            if pid in seen_pids:
-                continue
-            seen_pids.add(pid)
-            thread_posts.append(p)
-        try:
-            front_comments_top, vote_map, post_flags = _front_comments_top(
-                client,
-                thread_posts,
-                moderation,
-            )
-        except Exception as e:  # pragma: no cover
-            errors.append("front_comments_top: {}".format(e))
-        front = _enrich_front_blob_flags(front, post_flags)
-        front_new = _enrich_front_blob_flags(front_new, post_flags)
-        front["posts"] = _enrich_rows_flags(
-            list(front.get("posts") or []), flags_index, target_type="post"
-        )
-        front_new["posts"] = _enrich_rows_flags(
-            list(front_new.get("posts") or []), flags_index, target_type="post"
-        )
-        front_comments_top = _enrich_rows_flags(
-            front_comments_top, flags_index, target_type="comment"
-        )
-        if not filtered:
-            try:
-                index = _load_changes_index(client)
-                front_comments = _front_comments_feed(
-                    list(index.get("comments") or []),
-                    list(index.get("posts") or []),
-                    moderation,
-                    vote_map=vote_map,
-                )
-            except ApiError as e:
-                errors.append("front_comments: {}".format(e))
-        front_comments = _enrich_rows_flags(
-            front_comments, flags_index, target_type="comment"
-        )
-        society_stats: Dict[str, Any] = {}
-        try:
-            stats_snap = build_stats_snapshot(client)
-            society_stats = stats_snap.get("stats") or {}
-            for err in stats_snap.get("errors") or []:
-                if err not in errors:
-                    errors.append(err)
-        except Exception as e:  # pragma: no cover
-            errors.append("stats: {}".format(e))
-        snap = {
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "mode": "front",
-            "front": front,
-            "front_new": front_new,
-            "front_comments": front_comments,
-            "front_comments_top": front_comments_top,
-            "filters": {
-                "tag": tag_q,
-                "exclude": exclude_q,
-            },
-            "filters_applied": (front.get("filters_applied") if isinstance(front, dict) else None)
-            or (front_new.get("filters_applied") if isinstance(front_new, dict) else None),
-            "tags": tags_payload,
-            "post_tags": post_tags,
-            "moderation": {
-                "count": moderation.get("count") or 0,
-                "by_key": moderation.get("by_key") or {},
-                "source": moderation.get("source")
-                or "/api/events?kind=moderation",
-                "moderation_state": moderation.get("moderation_state") or {},
-            },
-            "flags": _flags_public_blob(flags_index),
-            "stats": society_stats,
-            "official": official,
-            "official_security_url": "https://1f916.ai/.well-known/security.txt",
-            "identity_events": identity_events,
-            "errors": errors,
-        }
-        with _FRONT_SNAP_COND:
-            if filtered:
-                _FRONT_FILTER_CACHE[fkey] = {
-                    "fetched_at": datetime.now(timezone.utc).timestamp(),
-                    "snap": snap,
-                }
-            else:
-                _FRONT_SNAP_CACHE["fetched_at"] = datetime.now(timezone.utc).timestamp()
-                _FRONT_SNAP_CACHE["snap"] = snap
-            return dict(snap)
-    finally:
-        with _FRONT_SNAP_COND:
-            if filtered:
-                _FRONT_FILTER_REFRESHING[fkey] = False
-            else:
-                _FRONT_SNAP_REFRESHING = False
-            _FRONT_SNAP_COND.notify_all()
+    cached, should_compute = _claim_front_snapshot(filtered=filtered, fkey=fkey)
+    if not should_compute:
+        return cached or {}
+    if cached is not None:
+        threading.Thread(
+            target=_refresh_front_snapshot,
+            args=(client, tag_q, exclude_q),
+            kwargs={"filtered": filtered, "fkey": fkey},
+            name="front-snap",
+            daemon=True,
+        ).start()
+        return cached
+    return _refresh_front_snapshot(
+        client, tag_q, exclude_q, filtered=filtered, fkey=fkey
+    )
 
 
 def _board_snapshot(
@@ -5169,37 +6295,30 @@ def _board_snapshot(
     client: Client,
     fetcher: Any,
 ) -> Dict[str, Any]:
-    """TTL cache for light board endpoints (docket / provenance)."""
-    with _BOARD_LOCK:
-        entry = _BOARD_CACHE.get(key) or {}
-        age = datetime.now(timezone.utc).timestamp() - float(entry.get("fetched_at") or 0)
-        if age < _BOARD_TTL_SEC and entry.get("snap") is not None:
-            return dict(entry["snap"])
-    errors: List[str] = []
-    payload: Dict[str, Any] = {}
-    official: Dict[str, Any] = {}
-    try:
-        payload = fetcher() or {}
-    except ApiError as e:
-        errors.append("{}: {}".format(key, e))
-    try:
-        official = client.official() or {}
-    except ApiError as e:
-        errors.append("official: {}".format(e))
-    snap = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "mode": key,
-        key: payload,
-        "official": official,
-        "official_security_url": "https://1f916.ai/.well-known/security.txt",
-        "errors": errors,
-    }
-    with _BOARD_LOCK:
-        _BOARD_CACHE[key] = {
-            "fetched_at": datetime.now(timezone.utc).timestamp(),
-            "snap": snap,
+    """Stale-while-revalidate cache for light board endpoints (docket / provenance)."""
+
+    def _compute() -> Dict[str, Any]:
+        errors: List[str] = []
+        payload: Dict[str, Any] = {}
+        official: Dict[str, Any] = {}
+        try:
+            payload = fetcher() or {}
+        except ApiError as e:
+            errors.append("{}: {}".format(key, e))
+        try:
+            official = _cached_official(client)
+        except ApiError as e:
+            errors.append("official: {}".format(e))
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "mode": key,
+            key: payload,
+            "official": official,
+            "official_security_url": "https://1f916.ai/.well-known/security.txt",
+            "errors": errors,
         }
-    return dict(snap)
+
+    return _board_swr(key, _compute)
 
 
 def build_docket_snapshot(client: Client) -> Dict[str, Any]:
@@ -5208,77 +6327,72 @@ def build_docket_snapshot(client: Client) -> Dict[str, Any]:
 
 def build_flags_snapshot(client: Client) -> Dict[str, Any]:
     """Flag queue + moderated-set census for /flags."""
-    with _BOARD_LOCK:
-        entry = _BOARD_CACHE.get("flags") or {}
-        age = datetime.now(timezone.utc).timestamp() - float(entry.get("fetched_at") or 0)
-        if age < _BOARD_TTL_SEC and entry.get("snap") is not None:
-            return dict(entry["snap"])
-    errors: List[str] = []
-    flags_index: Dict[str, Any] = _empty_flags_index()
-    moderation_state: Dict[str, Any] = _empty_moderation_state()
-    official: Dict[str, Any] = {}
-    try:
-        flags_index = _load_flags_index(client)
-    except ApiError as e:
-        errors.append("flags: {}".format(e))
-    try:
-        moderation_state = _load_moderation_state(client)
-    except ApiError as e:
-        errors.append("moderation-state: {}".format(e))
-    try:
-        official = client.official() or {}
-    except ApiError as e:
-        errors.append("official: {}".format(e))
-    mod_comment_ids = list(((moderation_state.get("live") or {}).get("comment") or {}).keys())
-    permalinks = _resolve_comment_meta(client, mod_comment_ids)
-    snap = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "mode": "flags",
-        "flags": {
-            "count": flags_index.get("count"),
-            "answered": flags_index.get("answered"),
-            "unanswered": flags_index.get("unanswered"),
-            "queue": flags_index.get("queue") or [],
-            "what_this_is": flags_index.get("what_this_is") or "",
-            "thresholds": flags_index.get("thresholds") or "",
-            "source": "/api/flags",
-        },
-        "moderation_state": {
-            "through_event_id": moderation_state.get("through_event_id"),
-            "latest_moderation_event_id": moderation_state.get(
-                "latest_moderation_event_id"
-            ),
-            "is_current": moderation_state.get("is_current"),
-            "posts": moderation_state.get("posts") or {},
-            "comments": moderation_state.get("comments") or {},
-            "counts": moderation_state.get("counts") or {},
-            "events_applied": moderation_state.get("events_applied"),
-            "events_ignored": moderation_state.get("events_ignored"),
-            "replay_matches_live_state": moderation_state.get(
-                "replay_matches_live_state"
-            ),
-            "what_this_is": moderation_state.get("what_this_is") or "",
-            "how_to_use": moderation_state.get("how_to_use") or "",
-            "honesty": moderation_state.get("honesty") or "",
-            "source": "/api/moderation-state",
-        },
-        "comment_permalinks": {
-            str(cid): {
-                "post_id": meta.get("post_id"),
-                "post_title": meta.get("post_title"),
-            }
-            for cid, meta in permalinks.items()
-        },
-        "official": official,
-        "official_security_url": "https://1f916.ai/.well-known/security.txt",
-        "errors": errors,
-    }
-    with _BOARD_LOCK:
-        _BOARD_CACHE["flags"] = {
-            "fetched_at": datetime.now(timezone.utc).timestamp(),
-            "snap": snap,
+
+    def _compute() -> Dict[str, Any]:
+        errors: List[str] = []
+        flags_index: Dict[str, Any] = _empty_flags_index()
+        moderation_state: Dict[str, Any] = _empty_moderation_state()
+        official: Dict[str, Any] = {}
+        try:
+            flags_index = _load_flags_index(client)
+        except ApiError as e:
+            errors.append("flags: {}".format(e))
+        try:
+            moderation_state = _load_moderation_state(client)
+        except ApiError as e:
+            errors.append("moderation-state: {}".format(e))
+        try:
+            official = _cached_official(client)
+        except ApiError as e:
+            errors.append("official: {}".format(e))
+        mod_comment_ids = list(
+            ((moderation_state.get("live") or {}).get("comment") or {}).keys()
+        )
+        permalinks = _resolve_comment_meta(client, mod_comment_ids)
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "mode": "flags",
+            "flags": {
+                "count": flags_index.get("count"),
+                "answered": flags_index.get("answered"),
+                "unanswered": flags_index.get("unanswered"),
+                "queue": flags_index.get("queue") or [],
+                "what_this_is": flags_index.get("what_this_is") or "",
+                "thresholds": flags_index.get("thresholds") or "",
+                "source": "/api/flags",
+            },
+            "moderation_state": {
+                "through_event_id": moderation_state.get("through_event_id"),
+                "latest_moderation_event_id": moderation_state.get(
+                    "latest_moderation_event_id"
+                ),
+                "is_current": moderation_state.get("is_current"),
+                "posts": moderation_state.get("posts") or {},
+                "comments": moderation_state.get("comments") or {},
+                "counts": moderation_state.get("counts") or {},
+                "events_applied": moderation_state.get("events_applied"),
+                "events_ignored": moderation_state.get("events_ignored"),
+                "replay_matches_live_state": moderation_state.get(
+                    "replay_matches_live_state"
+                ),
+                "what_this_is": moderation_state.get("what_this_is") or "",
+                "how_to_use": moderation_state.get("how_to_use") or "",
+                "honesty": moderation_state.get("honesty") or "",
+                "source": "/api/moderation-state",
+            },
+            "comment_permalinks": {
+                str(cid): {
+                    "post_id": meta.get("post_id"),
+                    "post_title": meta.get("post_title"),
+                }
+                for cid, meta in permalinks.items()
+            },
+            "official": official,
+            "official_security_url": "https://1f916.ai/.well-known/security.txt",
+            "errors": errors,
         }
-    return dict(snap)
+
+    return _board_swr("flags", _compute)
 
 
 def build_stats_snapshot(client: Client) -> Dict[str, Any]:
@@ -5304,38 +6418,41 @@ def build_search_snapshot(client: Client, q: Optional[str] = None) -> Dict[str, 
             "official_openapi_url": _OFFICIAL_OPENAPI_URL,
             "errors": [],
         }
-    with _SEARCH_LOCK:
-        entry = _SEARCH_CACHE.get(query) or {}
-        age = datetime.now(timezone.utc).timestamp() - float(entry.get("fetched_at") or 0)
-        if age < _SEARCH_TTL_SEC and entry.get("snap") is not None:
-            return dict(entry["snap"])
-    errors: List[str] = []
-    payload: Dict[str, Any] = {}
-    official: Dict[str, Any] = {}
-    try:
-        payload = client.search(query, limit=50) or {}
-    except ApiError as e:
-        errors.append("search: {}".format(e))
-    try:
-        official = client.official() or {}
-    except ApiError as e:
-        errors.append("official: {}".format(e))
-    snap = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "mode": "search",
-        "query": query,
-        "search": payload if isinstance(payload, dict) else {},
-        "official": official,
-        "official_security_url": _OFFICIAL_SECURITY_URL,
-        "official_llms_url": _OFFICIAL_LLMS_URL,
-        "official_openapi_url": _OFFICIAL_OPENAPI_URL,
-        "errors": errors,
-    }
-    with _SEARCH_LOCK:
-        _SEARCH_CACHE[query] = {
-            "fetched_at": datetime.now(timezone.utc).timestamp(),
-            "snap": snap,
+
+    def _compute() -> Dict[str, Any]:
+        errors: List[str] = []
+        payload: Dict[str, Any] = {}
+        official: Dict[str, Any] = {}
+        try:
+            payload = client.search(query, limit=50) or {}
+        except ApiError as e:
+            errors.append("search: {}".format(e))
+        try:
+            official = _cached_official(client)
+        except ApiError as e:
+            errors.append("official: {}".format(e))
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "mode": "search",
+            "query": query,
+            "search": payload if isinstance(payload, dict) else {},
+            "official": official,
+            "official_security_url": _OFFICIAL_SECURITY_URL,
+            "official_llms_url": _OFFICIAL_LLMS_URL,
+            "official_openapi_url": _OFFICIAL_OPENAPI_URL,
+            "errors": errors,
         }
+
+    snap = _swr_get(
+        _SEARCH_CACHE,
+        _SEARCH_COND,
+        _SEARCH_REFRESHING,
+        query,
+        _SEARCH_TTL_SEC,
+        _compute,
+        name="search-snap",
+    )
+    with _SEARCH_COND:
         if len(_SEARCH_CACHE) > 32:
             oldest = sorted(
                 _SEARCH_CACHE.items(),
@@ -5343,7 +6460,7 @@ def build_search_snapshot(client: Client, q: Optional[str] = None) -> Dict[str, 
             )
             for key, _ in oldest[: max(0, len(_SEARCH_CACHE) - 32)]:
                 _SEARCH_CACHE.pop(key, None)
-    return dict(snap)
+    return snap
 
 
 def render_search_page() -> bytes:
@@ -5379,50 +6496,43 @@ def build_porch_snapshot(client: Client, day: Optional[str] = None) -> Dict[str,
     """GET /api/porch for today or one archived UTC day. Never knocks or speaks."""
     day_q = _normalize_porch_day(day)
     cache_key = "porch:" + (day_q or "today")
-    with _BOARD_LOCK:
-        entry = _BOARD_CACHE.get(cache_key) or {}
-        age = datetime.now(timezone.utc).timestamp() - float(entry.get("fetched_at") or 0)
-        if age < _BOARD_TTL_SEC and entry.get("snap") is not None:
-            return dict(entry["snap"])
-    errors: List[str] = []
-    payload: Dict[str, Any] = {}
-    official: Dict[str, Any] = {}
-    try:
-        payload = client.porch(day=day_q) or {}
-    except ApiError as e:
-        errors.append("porch: {}".format(e))
-        payload = {"error": str(e)}
-    if not isinstance(payload, dict):
-        payload = {}
-    try:
-        official = client.official() or {}
-    except ApiError as e:
-        errors.append("official: {}".format(e))
-    served = str(payload.get("day") or day_q or "")
-    snap = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "mode": "porch",
-        "day": served,
-        "prev_day": _shift_porch_day(served, -1) if served else None,
-        "next_day": _shift_porch_day(served, 1) if served else None,
-        "porch": payload,
-        "prose_url": (
-            "https://1f916.ai/porch/" + served
-            if served and not payload.get("is_today")
-            else "https://1f916.ai/porch"
-        ),
-        "official": official,
-        "official_security_url": _OFFICIAL_SECURITY_URL,
-        "official_llms_url": _OFFICIAL_LLMS_URL,
-        "official_openapi_url": _OFFICIAL_OPENAPI_URL,
-        "errors": errors,
-    }
-    with _BOARD_LOCK:
-        _BOARD_CACHE[cache_key] = {
-            "fetched_at": datetime.now(timezone.utc).timestamp(),
-            "snap": snap,
+
+    def _compute() -> Dict[str, Any]:
+        errors: List[str] = []
+        payload: Dict[str, Any] = {}
+        official: Dict[str, Any] = {}
+        try:
+            payload = client.porch(day=day_q) or {}
+        except ApiError as e:
+            errors.append("porch: {}".format(e))
+            payload = {"error": str(e)}
+        if not isinstance(payload, dict):
+            payload = {}
+        try:
+            official = _cached_official(client)
+        except ApiError as e:
+            errors.append("official: {}".format(e))
+        served = str(payload.get("day") or day_q or "")
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "mode": "porch",
+            "day": served,
+            "prev_day": _shift_porch_day(served, -1) if served else None,
+            "next_day": _shift_porch_day(served, 1) if served else None,
+            "porch": payload,
+            "prose_url": (
+                "https://1f916.ai/porch/" + served
+                if served and not payload.get("is_today")
+                else "https://1f916.ai/porch"
+            ),
+            "official": official,
+            "official_security_url": _OFFICIAL_SECURITY_URL,
+            "official_llms_url": _OFFICIAL_LLMS_URL,
+            "official_openapi_url": _OFFICIAL_OPENAPI_URL,
+            "errors": errors,
         }
-    return dict(snap)
+
+    return _board_swr(cache_key, _compute)
 
 
 def render_porch_page() -> bytes:
@@ -5497,55 +6607,59 @@ def _public_mcp_funnel(probe: Dict[str, Any]) -> Dict[str, Any]:
 
 def build_mcp_funnel_snapshot(client: Client) -> Dict[str, Any]:
     """MCP doors + the funnel gate for /mcp-funnel. Never presents a bearer."""
-    with _BOARD_LOCK:
-        entry = _BOARD_CACHE.get("mcp-funnel") or {}
-        age = datetime.now(timezone.utc).timestamp() - float(entry.get("fetched_at") or 0)
-        if age < _BOARD_TTL_SEC and entry.get("snap") is not None:
-            return dict(entry["snap"])
-    errors: List[str] = []
-    surface: Dict[str, Any] = {}
-    funnel_probe: Dict[str, Any] = {"status": 0, "body": {}}
-    doors: List[Dict[str, Any]] = []
-    official: Dict[str, Any] = {}
-    try:
-        surface = client.surface() or {}
-    except ApiError as e:
-        errors.append("surface: {}".format(e))
-    try:
-        funnel_probe = client.mcp_funnel()
-    except Exception as e:  # noqa: BLE001 — board still renders the rest
-        errors.append("mcp-funnel: {}".format(e))
-        funnel_probe = {"status": 0, "body": {"error": str(e)}}
-    for path in ("/mcp", "/mcp/read"):
-        try:
-            probe = client.probe_get(path)
-        except Exception as e:  # noqa: BLE001
-            errors.append("{}: {}".format(path, e))
-            probe = {"status": 0, "body": str(e)}
-        doors.append({"path": path, "get": probe})
-    try:
-        official = client.official() or {}
-    except ApiError as e:
-        errors.append("official: {}".format(e))
-    snap = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "mode": "mcp-funnel",
-        "mcp_funnel": _public_mcp_funnel(funnel_probe),
-        "mcp_doors": doors,
-        "mcp_routes": _mcp_routes_from_surface(surface),
-        "mcp_discovery": _surface_routes(surface, _MCP_DISCOVERY_PATHS),
-        "official": official,
-        "official_security_url": _OFFICIAL_SECURITY_URL,
-        "official_llms_url": _OFFICIAL_LLMS_URL,
-        "official_openapi_url": _OFFICIAL_OPENAPI_URL,
-        "errors": errors,
-    }
-    with _BOARD_LOCK:
-        _BOARD_CACHE["mcp-funnel"] = {
-            "fetched_at": datetime.now(timezone.utc).timestamp(),
-            "snap": snap,
+
+    def _compute() -> Dict[str, Any]:
+        errors: List[str] = []
+        bucket: Dict[str, Any] = {}
+
+        def _fetch(label: str, fn: Any) -> None:
+            try:
+                bucket[label] = fn()
+            except Exception as e:  # noqa: BLE001 — board still renders the rest
+                errors.append("{}: {}".format(label, e))
+                bucket[label] = e
+
+        jobs = (
+            ("surface", lambda: client.surface() or {}),
+            ("mcp-funnel", client.mcp_funnel),
+            ("/mcp", lambda: client.probe_get("/mcp")),
+            ("/mcp/read", lambda: client.probe_get("/mcp/read")),
+            ("official", lambda: _cached_official(client)),
+        )
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futs = [pool.submit(_fetch, label, fn) for label, fn in jobs]
+            for fut in futs:
+                fut.result()
+
+        surface = bucket.get("surface") if isinstance(bucket.get("surface"), dict) else {}
+        funnel_probe = bucket.get("mcp-funnel")
+        if not isinstance(funnel_probe, dict):
+            funnel_probe = {
+                "status": 0,
+                "body": {"error": str(bucket.get("mcp-funnel") or "unreachable")},
+            }
+        doors: List[Dict[str, Any]] = []
+        for path in ("/mcp", "/mcp/read"):
+            probe = bucket.get(path)
+            if not isinstance(probe, dict):
+                probe = {"status": 0, "body": str(probe)}
+            doors.append({"path": path, "get": probe})
+        official = bucket.get("official") if isinstance(bucket.get("official"), dict) else {}
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "mode": "mcp-funnel",
+            "mcp_funnel": _public_mcp_funnel(funnel_probe),
+            "mcp_doors": doors,
+            "mcp_routes": _mcp_routes_from_surface(surface),
+            "mcp_discovery": _surface_routes(surface, _MCP_DISCOVERY_PATHS),
+            "official": official,
+            "official_security_url": _OFFICIAL_SECURITY_URL,
+            "official_llms_url": _OFFICIAL_LLMS_URL,
+            "official_openapi_url": _OFFICIAL_OPENAPI_URL,
+            "errors": errors,
         }
-    return dict(snap)
+
+    return _board_swr("mcp-funnel", _compute)
 
 
 def build_provenance_snapshot(client: Client) -> Dict[str, Any]:
@@ -5554,74 +6668,88 @@ def build_provenance_snapshot(client: Client) -> Dict[str, Any]:
 
 def build_trust_snapshot(client: Client) -> Dict[str, Any]:
     """Checkpoints + witnesses + attestation ledger for /trust."""
-    with _BOARD_LOCK:
-        entry = _BOARD_CACHE.get("trust") or {}
-        age = datetime.now(timezone.utc).timestamp() - float(entry.get("fetched_at") or 0)
-        if age < _BOARD_TTL_SEC and entry.get("snap") is not None:
-            return dict(entry["snap"])
-    errors: List[str] = []
-    checkpoint: Dict[str, Any] = {}
-    witnesses: Dict[str, Any] = {}
-    attestations: Dict[str, Any] = {}
-    official: Dict[str, Any] = {}
-    try:
-        checkpoint = client.checkpoint() or {}
-    except ApiError as e:
-        errors.append("checkpoint: {}".format(e))
-    try:
-        witnesses = client.witnesses() or {}
-    except ApiError as e:
-        errors.append("witnesses: {}".format(e))
-    for row in list(witnesses.get("witnesses") or []):
-        if not isinstance(row, dict):
-            continue
-        try:
-            wid = int(row.get("id"))
-        except (TypeError, ValueError):
-            continue
-        try:
-            hist = client.witness_history(wid) or {}
-        except ApiError as e:
-            errors.append("witnesses/{}/history: {}".format(wid, e))
-            row["history"] = {"error": str(e), "events": []}
-            continue
-        row["history"] = {
-            "events": list(hist.get("events") or []),
-            "chained": hist.get("chained"),
-            "predates_chaining": hist.get("predates_chaining"),
+
+    def _compute() -> Dict[str, Any]:
+        errors: List[str] = []
+        bucket: Dict[str, Any] = {}
+
+        def _fetch(label: str, fn: Any) -> None:
+            try:
+                bucket[label] = fn()
+            except ApiError as e:
+                errors.append("{}: {}".format(label, e))
+
+        jobs = (
+            ("checkpoint", lambda: client.checkpoint() or {}),
+            ("witnesses", lambda: client.witnesses() or {}),
+            ("attestations", lambda: client.attestations() or {}),
+            ("legacy-manifest", lambda: client.legacy_manifest() or {}),
+            ("official", lambda: _cached_official(client)),
+        )
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futs = [pool.submit(_fetch, label, fn) for label, fn in jobs]
+            for fut in futs:
+                fut.result()
+
+        checkpoint = (
+            bucket.get("checkpoint") if isinstance(bucket.get("checkpoint"), dict) else {}
+        )
+        witnesses = (
+            bucket.get("witnesses") if isinstance(bucket.get("witnesses"), dict) else {}
+        )
+        attestations = (
+            bucket.get("attestations")
+            if isinstance(bucket.get("attestations"), dict)
+            else {}
+        )
+        legacy_manifest = (
+            bucket.get("legacy-manifest")
+            if isinstance(bucket.get("legacy-manifest"), dict)
+            else {}
+        )
+        official = (
+            bucket.get("official") if isinstance(bucket.get("official"), dict) else {}
+        )
+
+        rows = [r for r in list(witnesses.get("witnesses") or []) if isinstance(r, dict)]
+
+        def _hist(row: Dict[str, Any]) -> None:
+            try:
+                wid = int(row.get("id"))
+            except (TypeError, ValueError):
+                return
+            try:
+                hist = client.witness_history(wid) or {}
+            except ApiError as e:
+                errors.append("witnesses/{}/history: {}".format(wid, e))
+                row["history"] = {"error": str(e), "events": []}
+                return
+            row["history"] = {
+                "events": list(hist.get("events") or []),
+                "chained": hist.get("chained"),
+                "predates_chaining": hist.get("predates_chaining"),
+            }
+
+        if rows:
+            with ThreadPoolExecutor(max_workers=min(4, len(rows))) as pool:
+                futs = [pool.submit(_hist, row) for row in rows]
+                for fut in futs:
+                    fut.result()
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "mode": "trust",
+            "checkpoint": checkpoint,
+            "witnesses": witnesses,
+            "attestations": attestations,
+            "legacy_manifest": legacy_manifest,
+            "official": official,
+            "official_security_url": _OFFICIAL_SECURITY_URL,
+            "official_llms_url": _OFFICIAL_LLMS_URL,
+            "official_openapi_url": _OFFICIAL_OPENAPI_URL,
+            "errors": errors,
         }
-    try:
-        attestations = client.attestations() or {}
-    except ApiError as e:
-        errors.append("attestations: {}".format(e))
-    legacy_manifest: Dict[str, Any] = {}
-    try:
-        legacy_manifest = client.legacy_manifest() or {}
-    except ApiError as e:
-        errors.append("legacy-manifest: {}".format(e))
-    try:
-        official = client.official() or {}
-    except ApiError as e:
-        errors.append("official: {}".format(e))
-    snap = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "mode": "trust",
-        "checkpoint": checkpoint,
-        "witnesses": witnesses,
-        "attestations": attestations,
-        "legacy_manifest": legacy_manifest,
-        "official": official,
-        "official_security_url": _OFFICIAL_SECURITY_URL,
-        "official_llms_url": _OFFICIAL_LLMS_URL,
-        "official_openapi_url": _OFFICIAL_OPENAPI_URL,
-        "errors": errors,
-    }
-    with _BOARD_LOCK:
-        _BOARD_CACHE["trust"] = {
-            "fetched_at": datetime.now(timezone.utc).timestamp(),
-            "snap": snap,
-        }
-    return dict(snap)
+
+    return _board_swr("trust", _compute)
 
 
 def build_attestation_snapshot(client: Client, attestation_id: int) -> Dict[str, Any]:
@@ -5643,7 +6771,7 @@ def build_attestation_snapshot(client: Client, attestation_id: int) -> Dict[str,
             "errors": errors,
         }
     try:
-        official = client.official() or {}
+        official = _cached_official(client)
     except ApiError as e:
         errors.append("official: {}".format(e))
     return {
@@ -5702,93 +6830,103 @@ def build_listings_snapshot(
 ) -> Dict[str, Any]:
     """Open+expired listings, rail census, payouts, guide, and security for /listings."""
     cache_key = "listings:" + (docket or "")
-    with _BOARD_LOCK:
-        entry = _BOARD_CACHE.get(cache_key) or {}
-        age = datetime.now(timezone.utc).timestamp() - float(entry.get("fetched_at") or 0)
-        if age < _BOARD_TTL_SEC and entry.get("snap") is not None:
-            return dict(entry["snap"])
-    errors: List[str] = []
-    listings: Dict[str, Any] = {}
-    details: List[Dict[str, Any]] = []
-    payouts: Dict[str, Any] = {}
-    guide: Dict[str, Any] = {}
-    security: Dict[str, Any] = {}
-    rail: Dict[str, Any] = {}
-    official: Dict[str, Any] = {}
-    try:
-        listings = client.listings(include_expired=True) or {}
-    except ApiError as e:
-        errors.append("listings: {}".format(e))
-    ids: List[int] = []
-    seen: set = set()
-    for row in list(listings.get("listings") or []):
-        lid = _coerce_listing_id(row)
-        if lid is None or lid in seen:
-            continue
-        seen.add(lid)
-        ids.append(lid)
-    if ids:
-        with ThreadPoolExecutor(max_workers=min(8, len(ids))) as pool:
-            futs = {pool.submit(client.listing, i): i for i in ids}
-            for fut in as_completed(futs):
-                i = futs[fut]
-                try:
-                    payload = fut.result() or {}
-                    if isinstance(payload, dict):
-                        details.append(payload)
-                except ApiError as e:
-                    errors.append("listings/{}: {}".format(i, e))
+
+    def _compute() -> Dict[str, Any]:
+        errors: List[str] = []
+        extras: Dict[str, Any] = {}
+
+        def _fetch(label: str, fn: Any) -> None:
+            try:
+                extras[label] = fn()
+            except ApiError as e:
+                errors.append("{}: {}".format(label, e))
+
+        listings: Dict[str, Any] = {}
+        try:
+            listings = client.listings(include_expired=True) or {}
+        except ApiError as e:
+            errors.append("listings: {}".format(e))
+        ids: List[int] = []
+        seen: set = set()
+        for row in list(listings.get("listings") or []):
+            lid = _coerce_listing_id(row)
+            if lid is None or lid in seen:
+                continue
+            seen.add(lid)
+            ids.append(lid)
+        details: List[Dict[str, Any]] = []
+        satellite = (
+            ("payouts", lambda: client.payouts(docket=docket or None) or {}),
+            ("listings/guide", lambda: client.listings_guide() or {}),
+            ("listings/security", lambda: client.listings_security() or {}),
+            ("rail", lambda: client.rail() or {}),
+            ("official", lambda: _cached_official(client)),
+        )
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futs = [pool.submit(_fetch, label, fn) for label, fn in satellite]
+            if ids:
+                detail_futs = {
+                    pool.submit(client.listing, i, retry=False): i for i in ids
+                }
+                for fut in as_completed(detail_futs):
+                    i = detail_futs[fut]
+                    try:
+                        payload = fut.result() or {}
+                        if isinstance(payload, dict):
+                            details.append(payload)
+                    except ApiError as e:
+                        errors.append("listings/{}: {}".format(i, e))
+            for fut in futs:
+                fut.result()
         details.sort(key=lambda d: int(_coerce_listing_id(d) or 0))
-    try:
-        payouts = client.payouts(docket=docket or None) or {}
-    except ApiError as e:
-        errors.append("payouts: {}".format(e))
-    try:
-        guide = client.listings_guide() or {}
-    except ApiError as e:
-        errors.append("listings/guide: {}".format(e))
-    try:
-        security = client.listings_security() or {}
-    except ApiError as e:
-        errors.append("listings/security: {}".format(e))
-    try:
-        rail = client.rail() or {}
-    except ApiError as e:
-        errors.append("rail: {}".format(e))
-    try:
-        official = client.official() or {}
-    except ApiError as e:
-        errors.append("official: {}".format(e))
-    snap = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "mode": "listings",
-        "listings": listings,
-        "listing_details": details,
-        "payouts": payouts,
-        "guide": guide,
-        "security": security,
-        "rail": rail,
-        "official": official,
-        "official_security_url": "https://1f916.ai/.well-known/security.txt",
-        "errors": errors,
-    }
-    with _BOARD_LOCK:
-        _BOARD_CACHE[cache_key] = {
-            "fetched_at": datetime.now(timezone.utc).timestamp(),
-            "snap": snap,
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "mode": "listings",
+            "listings": listings,
+            "listing_details": details,
+            "payouts": extras.get("payouts")
+            if isinstance(extras.get("payouts"), dict)
+            else {},
+            "guide": extras.get("listings/guide")
+            if isinstance(extras.get("listings/guide"), dict)
+            else {},
+            "security": extras.get("listings/security")
+            if isinstance(extras.get("listings/security"), dict)
+            else {},
+            "rail": extras.get("rail") if isinstance(extras.get("rail"), dict) else {},
+            "official": extras.get("official")
+            if isinstance(extras.get("official"), dict)
+            else {},
+            "official_security_url": "https://1f916.ai/.well-known/security.txt",
+            "errors": errors,
         }
-    return dict(snap)
+
+    return _board_swr(cache_key, _compute)
 
 
 def _listings_for_handle(
-    client: Client, handle: str, errors: List[str]
+    client: Client, handle: str, errors: List[str], *, blocking: bool = True
 ) -> Dict[str, Any]:
     funded: List[Dict[str, Any]] = []
     submitted: List[Dict[str, Any]] = []
-    try:
-        snap = build_listings_snapshot(client)
-    except Exception as e:  # noqa: BLE001 — citizen page still renders
-        errors.append("listings: {}".format(e))
+    snap: Optional[Dict[str, Any]] = None
+    if blocking:
+        try:
+            snap = build_listings_snapshot(client)
+        except Exception as e:  # noqa: BLE001 — citizen page still renders
+            errors.append("listings: {}".format(e))
+            return {"funded": [], "submitted": [], "source": "/api/listings"}
+    else:
+        snap = _peek_board_snap("listings:")
+        if snap is None:
+            threading.Thread(
+                target=build_listings_snapshot,
+                args=(client,),
+                name="listings-warm",
+                daemon=True,
+            ).start()
+            return {"funded": [], "submitted": [], "source": "/api/listings"}
+    if not isinstance(snap, dict):
         return {"funded": [], "submitted": [], "source": "/api/listings"}
     for detail in snap.get("listing_details") or []:
         if not isinstance(detail, dict):
@@ -5840,7 +6978,7 @@ def build_listing_snapshot(client: Client, listing_id: int) -> Dict[str, Any]:
             "errors": errors,
         }
     try:
-        official = client.official() or {}
+        official = _cached_official(client)
     except ApiError as e:
         errors.append("official: {}".format(e))
     return {
@@ -5873,7 +7011,7 @@ def build_payout_binding_snapshot(client: Client, binding_id: int) -> Dict[str, 
             "errors": errors,
         }
     try:
-        official = client.official() or {}
+        official = _cached_official(client)
     except ApiError as e:
         errors.append("official: {}".format(e))
     return {
@@ -6093,15 +7231,27 @@ h1{{font-family:Fraunces,Georgia,serif;font-size:clamp(1.8rem,4vw,2.4rem);margin
 .top-bar-inner{{padding:10px 16px}}
 .site-nav{{display:flex;flex-wrap:wrap;gap:8px;align-items:center}}
 .brand{{font-family:Fraunces,Georgia,serif;font-weight:700;color:#12201c;text-decoration:none;margin-right:8px}}
+a{{color:#0c7c66;text-decoration:none}}
+a.who-link{{font-weight:600}}
 .btn{{font:inherit;font-size:13px;font-weight:600;border:1px solid rgba(18,32,28,.12);background:#fff;color:#12201c;padding:7px 12px;border-radius:999px;text-decoration:none;cursor:pointer}}
 .btn.active{{background:rgba(12,124,102,.12);border-color:rgba(12,124,102,.35);color:#0c7c66}}
 .meta{{color:#5a6a64;font-size:13px;margin:0 0 12px}}
-.row{{display:block;background:rgba(255,255,255,.75);border:1px solid rgba(18,32,28,.1);border-radius:14px;padding:14px 16px;margin:0 0 10px;text-decoration:none;color:inherit}}
+.row{{display:block;background:rgba(255,255,255,.75);border:1px solid rgba(18,32,28,.1);border-radius:14px;padding:14px 16px;margin:0 0 10px;text-decoration:none;color:inherit;scroll-margin-top:72px}}
 .row .top{{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:6px}}
-.pill{{display:inline-flex;font-size:11px;font-weight:700;padding:3px 8px;border-radius:999px;background:rgba(12,124,102,.1);color:#0c7c66;border:1px solid rgba(12,124,102,.22)}}
+.pill{{display:inline-flex;align-items:center;font-size:11px;font-weight:700;padding:3px 8px;border-radius:999px;background:rgba(12,124,102,.1);color:#0c7c66;border:1px solid rgba(12,124,102,.22)}}
+a.pill{{text-decoration:none;cursor:pointer}}
+a.pill:hover{{background:rgba(12,124,102,.18);border-color:rgba(12,124,102,.4)}}
 .pill.warn{{background:rgba(212,148,64,.18);color:#9a5b16;border-color:rgba(154,91,22,.25)}}
 .pill.bad{{background:rgba(180,60,60,.12);color:#8a2a2a;border-color:rgba(140,40,40,.25)}}
 .pill.ok{{background:rgba(12,124,102,.14);color:#0a6a57}}
+.pill.muted{{background:rgba(18,32,28,.06);color:#5a6a64;border-color:rgba(18,32,28,.1)}}
+.pill-wrap{{display:flex;flex-wrap:wrap;gap:8px}}
+.day-nav{{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:0 0 16px}}
+.sec{{background:rgba(255,255,255,.75);border:1px solid rgba(18,32,28,.1);border-radius:16px;padding:14px 16px;margin:0 0 14px}}
+.sec .sec-h{{margin:0 0 10px}}
+.trunc{{margin:0 0 16px;padding:12px 14px;border-radius:12px;background:rgba(212,148,64,.16);border:1px solid rgba(154,91,22,.28);color:#9a5b16;font-size:13px;font-weight:550;line-height:1.5}}
+.body{{margin:6px 0 0;color:#12201c;font-size:14px;line-height:1.5}}
+.body a{{font-weight:600}}
 .title{{font-weight:650;font-size:15px;line-height:1.35;margin:0 0 6px}}
 .title a{{color:inherit;text-decoration:none}}
 .title a:hover{{color:#0c7c66}}
@@ -6218,7 +7368,19 @@ function statusPill(status) {{
 function citizenLink(handle) {{
   const label = String(handle || "").trim() || "?";
   if (!/^[A-Za-z0-9_-]{{2,32}}$/.test(label)) return "<span>" + esc(label) + "</span>";
-  return '<a href="/' + encodeURIComponent(label) + '">' + esc(label) + "</a>";
+  return '<a class="who-link" href="/' + encodeURIComponent(label) + '">' + esc(label) + "</a>";
+}}
+function porchWhoPill(raw) {{
+  const h = (raw && typeof raw === "object") ? (raw.handle || raw.author) : raw;
+  const label = String(h || "").trim() || "?";
+  if (!/^[A-Za-z0-9_-]{{2,32}}$/.test(label)) return '<span class="pill muted">' + esc(label) + "</span>";
+  return '<a class="pill" href="/' + encodeURIComponent(label) + '">' + esc(label) + "</a>";
+}}
+function porchCitePill(raw) {{
+  const t = String(raw || "");
+  const post = t.match(/^#(\\d+)$/);
+  if (post) return '<a class="pill" href="/post/' + esc(post[1]) + '">' + esc(t) + "</a>";
+  return '<span class="pill muted">' + esc(t) + "</span>";
 }}
 function renderOfficial(snap) {{
   const off = (snap && snap.official) || {{}};
@@ -6843,42 +8005,36 @@ function renderPorch(snap) {{
   const prev = snap.prev_day;
   const next = snap.next_day;
   const prose = snap.prose_url || "https://1f916.ai/porch";
-  const nav = '<p class="note" style="margin:0 0 12px">'
-    + (prev ? '<a href="/porch/' + esc(prev) + '">← ' + esc(prev) + "</a>" : "")
-    + ' · <a href="/porch">Today</a> · '
-    + (next && !today ? '<a href="/porch/' + esc(next) + '">' + esc(next) + " →</a>" : esc("—"))
-    + ' · <a href="' + esc(prose) + '" target="_blank" rel="noopener noreferrer">society prose</a>'
-    + "</p>";
+  const navBits = [];
+  if (prev) navBits.push('<a class="btn" href="/porch/' + esc(prev) + '">← ' + esc(prev) + "</a>");
+  navBits.push('<a class="btn' + (today ? " active" : "") + '" href="/porch">Today</a>');
+  if (next && !today) navBits.push('<a class="btn" href="/porch/' + esc(next) + '">' + esc(next) + " →</a>");
+  navBits.push('<a class="btn" href="' + esc(prose) + '" target="_blank" rel="noopener noreferrer">society prose</a>');
+  const nav = '<div class="day-nav">' + navBits.join("") + "</div>";
   const presence = Array.isArray(payload.recently_knocked_or_spoke)
     ? payload.recently_knocked_or_spoke : [];
   const presentHtml = presence.length
-    ? '<div class="sec-h">Present (last ' + esc(payload.recent_window_minutes ?? 15) + " min)</div>"
-      + '<p class="note">' + presence.map((p) => {{
-        const h = (p && typeof p === "object") ? (p.handle || p.author) : p;
-        return citizenLink(h);
-      }}).join(" · ") + "</p>"
+    ? '<section class="sec"><div class="sec-h">Present (last '
+      + esc(payload.recent_window_minutes ?? 15) + " min)</div>"
+      + '<div class="pill-wrap">' + presence.map(porchWhoPill).join("") + "</div></section>"
     : "";
   const cited = Array.isArray(payload.cited) ? payload.cited : [];
   const citedHtml = cited.length
-    ? '<div class="sec-h">Cited today</div><p class="note">' + cited.map((c) => {{
-        const t = String(c || "");
-        const post = t.match(/^#(\\d+)$/);
-        if (post) return '<a href="/post/' + esc(post[1]) + '">' + esc(t) + "</a>";
-        return esc(t);
-      }}).join(" · ") + "</p>"
+    ? '<section class="sec"><div class="sec-h">Cited today</div>'
+      + '<div class="pill-wrap">' + cited.map(porchCitePill).join("") + "</div></section>"
     : "";
   const truncNote = payload.truncated
-    ? '<p class="note">Day truncated; more lines exist past next_since '
+    ? '<p class="trunc">Day truncated; more lines exist past next_since '
       + esc(payload.next_since != null ? payload.next_since : "—") + ".</p>"
     : "";
-  const errNote = payload.error ? '<p class="note">' + esc(payload.error) + "</p>" : "";
+  const errNote = payload.error ? '<p class="err">' + esc(payload.error) + "</p>" : "";
   const lineCards = lines.map((ln) => {{
     const id = ln && ln.id != null ? String(ln.id) : "";
     return '<article class="row" id="p-' + esc(id) + '"><div class="top">'
       + (id ? '<span class="pill">#' + esc(id) + "</span>" : "")
-      + '<span class="pill">' + citizenLink(ln && ln.author) + "</span>"
-      + '<span class="pill">' + esc(fmtPorchWhen(ln && ln.created_at)) + "</span>"
-      + '</div><p class="note" style="color:#12201c;font-size:14px;line-height:1.5">'
+      + porchWhoPill(ln && ln.author)
+      + '<span class="pill muted">' + esc(fmtPorchWhen(ln && ln.created_at)) + "</span>"
+      + '</div><p class="body">'
       + linkPorchBody((ln && ln.body) || "") + "</p></article>";
   }}).join("");
   document.getElementById("boardList").innerHTML =
@@ -7064,50 +8220,67 @@ def verify_base_usdc_balance(address: str) -> Dict[str, Any]:
 
 def build_treasury_snapshot(client: Client) -> Dict[str, Any]:
     """Public books + independent Base balanceOf — live treasury page."""
-    errors: List[str] = []
-    books: Dict[str, Any] = {}
-    official: Dict[str, Any] = {}
-    attest: Dict[str, Any] = {}
-    try:
-        books = client.treasury() or {}
-    except ApiError as e:
-        errors.append("treasury: {}".format(e))
-    try:
-        official = client.official() or {}
-    except ApiError as e:
-        errors.append("official: {}".format(e))
-    try:
-        attest = client.attest_full() or {}
-        # Don't ship page list noise to the UI.
+
+    def _compute() -> Dict[str, Any]:
+        errors: List[str] = []
+        bucket: Dict[str, Any] = {}
+
+        def _fetch(label: str, fn: Any) -> None:
+            try:
+                bucket[label] = fn()
+            except ApiError as e:
+                errors.append("{}: {}".format(label, e))
+
+        jobs = (
+            ("books", lambda: client.treasury() or {}),
+            ("official", lambda: _cached_official(client)),
+            ("attest", lambda: client.attest_full() or {}),
+        )
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futs = [pool.submit(_fetch, label, fn) for label, fn in jobs]
+            for fut in futs:
+                fut.result()
+
+        books = bucket.get("books") if isinstance(bucket.get("books"), dict) else {}
+        official = (
+            bucket.get("official") if isinstance(bucket.get("official"), dict) else {}
+        )
+        attest = bucket.get("attest") if isinstance(bucket.get("attest"), dict) else {}
         if isinstance(attest, dict):
             attest = {k: v for k, v in attest.items() if k not in ("expect_checks",)}
-    except ApiError as e:
-        errors.append("attest: {}".format(e))
 
-    wallet = (books.get("wallet") if isinstance(books, dict) else None) or {}
-    off_treas = (official.get("treasury") if isinstance(official, dict) else None) or {}
-    address = (
-        (wallet.get("address") if isinstance(wallet, dict) else None)
-        or (off_treas.get("address") if isinstance(off_treas, dict) else None)
-        or ""
-    )
-    chain_verify = verify_base_usdc_balance(str(address))
-    if not chain_verify.get("ok"):
-        errors.append("chain_verify: {}".format(chain_verify.get("error") or "failed"))
+        wallet = (books.get("wallet") if isinstance(books, dict) else None) or {}
+        off_treas = (
+            (official.get("treasury") if isinstance(official, dict) else None) or {}
+        )
+        address = (
+            (wallet.get("address") if isinstance(wallet, dict) else None)
+            or (off_treas.get("address") if isinstance(off_treas, dict) else None)
+            or ""
+        )
+        chain_verify = verify_base_usdc_balance(str(address))
+        if not chain_verify.get("ok"):
+            errors.append(
+                "chain_verify: {}".format(chain_verify.get("error") or "failed")
+            )
 
-    assets = books.get("assets") if isinstance(books, dict) else None
-    return {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "mode": "treasury",
-        "books": books,
-        "assets": assets if isinstance(assets, dict) else {},
-        "assets_note": (books.get("assets_note") if isinstance(books, dict) else None),
-        "official": official,
-        "official_security_url": "https://1f916.ai/.well-known/security.txt",
-        "attest": attest,
-        "chain_verify": chain_verify,
-        "errors": errors,
-    }
+        assets = books.get("assets") if isinstance(books, dict) else None
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "mode": "treasury",
+            "books": books,
+            "assets": assets if isinstance(assets, dict) else {},
+            "assets_note": (
+                books.get("assets_note") if isinstance(books, dict) else None
+            ),
+            "official": official,
+            "official_security_url": "https://1f916.ai/.well-known/security.txt",
+            "attest": attest,
+            "chain_verify": chain_verify,
+            "errors": errors,
+        }
+
+    return _board_swr("treasury", _compute)
 
 
 def build_snapshot(client: Client, store: Store, journal: Any = None) -> Dict[str, Any]:
@@ -7124,6 +8297,7 @@ def make_handler(
     journal: Any = None,
     *,
     allow_local_actions: bool = False,
+    allow_local_chat_mod: bool = False,
 ):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt: str, *args: Any) -> None:
@@ -7177,12 +8351,16 @@ def make_handler(
             content_type: str,
             *,
             set_nocount: Optional[bool] = None,
+            extra_headers: Optional[Dict[str, str]] = None,
         ) -> None:
             try:
                 self.send_response(code)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Cache-Control", "no-store")
+                if extra_headers:
+                    for name, value in extra_headers.items():
+                        self.send_header(name, value)
                 self._security_headers()
                 if set_nocount is not None:
                     self.send_header(
@@ -7209,6 +8387,10 @@ def make_handler(
             if not isinstance(data, dict):
                 raise ValueError("JSON object required")
             return data
+
+        def _allow_local_chat_mod(self) -> bool:
+            """Tombstone UI/API — only a Watch bound to loopback, hit directly."""
+            return bool(allow_local_chat_mod) and _request_is_direct_loopback(self)
 
         def _run_local_action(self, action: str) -> Tuple[int, Dict[str, Any]]:
             """Engage/spend is not part of public Watch."""
@@ -7296,9 +8478,11 @@ def make_handler(
                 return
 
             if path == "/api/chat":
-                raw = json.dumps(chat_snapshot(store), ensure_ascii=False).encode(
-                    "utf-8"
-                )
+                operator = self._allow_local_chat_mod()
+                payload = chat_snapshot(store, operator=operator)
+                if operator:
+                    payload["local_mod"] = True
+                raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
                 self._send(200, raw, "application/json; charset=utf-8")
                 return
 
@@ -7909,8 +9093,13 @@ def make_handler(
                     raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
                     self._send(200, raw, "application/json; charset=utf-8")
                 except ApiError as e:
-                    raw = json.dumps({"error": str(e)}).encode("utf-8")
-                    self._send(e.status, raw, "application/json; charset=utf-8")
+                    raw = json.dumps(_api_error_payload(e)).encode("utf-8")
+                    self._send(
+                        e.status,
+                        raw,
+                        "application/json; charset=utf-8",
+                        extra_headers=_retry_headers(e),
+                    )
                 return
 
             m_post = POST_ID_RE.match(path)
@@ -7973,8 +9162,13 @@ def make_handler(
                 except ApiError as e:
                     self._send(
                         e.status,
-                        "Post error: {}".format(e).encode("utf-8"),
-                        "text/plain; charset=utf-8",
+                        _html_with_chat(
+                            render_post_error_page(
+                                e, post_id=int(m_post.group(1))
+                            )
+                        ),
+                        "text/html; charset=utf-8",
+                        extra_headers=_retry_headers(e),
                     )
                 return
 
@@ -8020,12 +9214,13 @@ def make_handler(
                 return
 
             if path == "/api/chat/moderate":
-                denied = _publish_auth_failure(self)
-                if denied is not None:
-                    code, payload = denied
-                    raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-                    self._send(code, raw, "application/json; charset=utf-8")
-                    return
+                if not self._allow_local_chat_mod():
+                    denied = _publish_auth_failure(self)
+                    if denied is not None:
+                        code, payload = denied
+                        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                        self._send(code, raw, "application/json; charset=utf-8")
+                        return
                 try:
                     body = self._read_json_body(max_bytes=4096)
                 except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as e:
@@ -8116,13 +9311,37 @@ def serve(
 ) -> None:
     store = Store(data_dir)
     client = Client(base=base)
-    handler = make_handler(client, store, allow_local_actions=False)
-    httpd = ThreadingHTTPServer((host, port), handler)
+    local_chat_mod = _loopback_bind_host(host)
+    global _CHAT_MIRROR_FLY
+    _CHAT_MIRROR_FLY = False
+    handler = make_handler(
+        client,
+        store,
+        allow_local_actions=False,
+        allow_local_chat_mod=local_chat_mod,
+    )
+    httpd = _WatchHTTPServer((host, port), handler)
     url = "http://{}:{}/".format(host, port)
     print("1F916 Watch (public window)")
     print("  {}".format(url))
     print("  data: {}".format(store.root))
     print("  read-only — engage lives in 1f916-operator")
+    if local_chat_mod and mirror_from_env():
+        print("  chat: pulling live guestbook from {} via fly ssh…".format(fly_app()))
+        _CHAT_MIRROR_FLY = True
+        n, err = seed_chat_from_fly(store)
+        if err:
+            _CHAT_MIRROR_FLY = False
+            print("  chat: live pull failed ({}) — using this machine's file".format(err))
+        else:
+            print(
+                "  chat: {} live messages — remove writes through to Fly".format(n)
+            )
+    if local_chat_mod:
+        if _CHAT_MIRROR_FLY:
+            print("  chat tombstone: remove on a message (prod guestbook)")
+        else:
+            print("  chat tombstone (localhost only): remove on a Human chat message")
     if (
         _admin_local is not None
         and _admin_local.available()
@@ -8138,6 +9357,31 @@ def serve(
         if callable(banner):
             print("  {}".format(banner()))
     print("  Ctrl+C to stop")
+    def _warm() -> None:
+        try:
+            build_front_snapshot(client)
+        except Exception:
+            pass
+        _ensure_changes_index_async(client)
+        for fn in (
+            lambda: build_stats_snapshot(client),
+            lambda: build_docket_snapshot(client),
+            lambda: build_porch_snapshot(client),
+            lambda: build_listings_snapshot(client),
+            lambda: build_treasury_snapshot(client),
+            lambda: build_flags_snapshot(client),
+            lambda: list_citizens(client, store),
+        ):
+            try:
+                fn()
+            except Exception:
+                pass
+
+    threading.Thread(
+        target=_warm,
+        name="watch-warmup",
+        daemon=True,
+    ).start()
     if open_browser:
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
     try:

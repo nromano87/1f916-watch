@@ -105,6 +105,9 @@
   var lastMsgs = [];
   var ignored = {};
   var myName = "";
+  var localMod = false;
+  var chatSource = "";
+  var tombstoning = false;
   var scrollAnchor = null;
   var restoringScroll = false;
   var saveScrollTimer = null;
@@ -198,6 +201,29 @@
     return !!ignored[String(name || "").trim().toLowerCase()];
   }
 
+  function isLocalHost() {
+    var h = String(location.hostname || "").toLowerCase();
+    return h === "localhost" || h === "127.0.0.1" || h === "::1" || h === "[::1]";
+  }
+
+  function canTombstone() {
+    return localMod && isLocalHost();
+  }
+
+  function paintLocalHint() {
+    var p = panel.querySelector("header p");
+    if (!p) return;
+    if (canTombstone() && chatSource === "fly") {
+      p.textContent = "Live Fly guestbook. Click remove to tombstone on prod.";
+    } else if (canTombstone()) {
+      p.textContent =
+        "Localhost: click remove to tombstone a message. Removals stay on the log.";
+    } else {
+      p.textContent =
+        "No slurs, hate, or harassment. Removals stay on the log.";
+    }
+  }
+
   function isMine(name) {
     return (
       !!myName &&
@@ -243,6 +269,7 @@
     "#f916-chat-panel header{display:block;padding:6px 104px 14px 16px;border-bottom:1px solid rgba(18,32,28,.08);}" +
     "#f916-chat-panel header h2{margin:0;font:700 1.35rem/1.15 Fraunces,Georgia,serif;letter-spacing:-.03em;}" +
     "#f916-chat-panel header p{margin:4px 0 0;font-size:12px;color:#5a6a64;font-weight:500;line-height:1.35;}" +
+    "#f916-chat-panel header p:empty{display:none;}" +
     "#f916-chat-panel .tools{position:absolute;top:10px;right:10px;z-index:2;display:flex;gap:6px;}" +
     "#f916-chat-panel.full .tools{top:max(10px,env(safe-area-inset-top));right:max(10px,env(safe-area-inset-right));}" +
     "#f916-chat-panel .tools button{border:0;background:rgba(18,32,28,.06);width:40px;height:40px;border-radius:12px;font:700 18px/1 system-ui;color:#5a6a64;cursor:pointer;padding:0;display:flex;align-items:center;justify-content:center;}" +
@@ -258,11 +285,15 @@
     "#f916-chat-log .msg.removed{background:rgba(18,32,28,.04);border-style:dashed;border-color:rgba(18,32,28,.12);box-shadow:none;}" +
     "#f916-chat-log .msg.removed .who{color:#5a6a64;}" +
     "#f916-chat-log .msg.removed .body{color:#5a6a64;font-style:italic;font-size:14px;}" +
+    "#f916-chat-log .msg.flagged{border-color:rgba(212,85,42,.35);}" +
     "#f916-chat-log .msg .meta{display:flex;gap:10px;align-items:center;margin-bottom:6px;font-size:12px;color:#5a6a64;}" +
     "#f916-chat-log .msg .who{font-weight:700;color:#0c7c66;font-size:13px;}" +
     "#f916-chat-log .msg .meta-right{margin-left:auto;display:flex;gap:10px;align-items:center;}" +
     "#f916-chat-log .msg .ignore{border:0;background:rgba(18,32,28,.05);color:#5a6a64;font:600 12px/1 \"DM Sans\",system-ui,sans-serif;cursor:pointer;padding:8px 10px;border-radius:999px;min-height:32px;}" +
     "#f916-chat-log .msg .ignore:active{background:rgba(212,85,42,.12);color:#d4552a;}" +
+    "#f916-chat-log .msg .tombstone{border:0;background:rgba(212,85,42,.1);color:#d4552a;font:600 12px/1 \"DM Sans\",system-ui,sans-serif;cursor:pointer;padding:8px 10px;border-radius:999px;min-height:32px;}" +
+    "#f916-chat-log .msg .tombstone:active{background:rgba(212,85,42,.2);}" +
+    "#f916-chat-log .msg .tombstone:disabled{opacity:.55;cursor:wait;}" +
     "#f916-chat-log .msg .body{font-size:16px;line-height:1.45;white-space:pre-wrap;word-break:break-word;}" +
     "#f916-chat-log .msg .body mark.mention-hl{background:linear-gradient(180deg,rgba(212,148,64,.55) 0%,rgba(212,148,64,.28) 100%);color:inherit;padding:0.05em 0.2em;margin:0 -0.05em;border-radius:0.25em;box-decoration-break:clone;-webkit-box-decoration-break:clone;font-weight:650;}" +
     "#f916-chat-ignored{padding:0 14px 12px;border-bottom:1px solid rgba(18,32,28,.06);font-size:13px;color:#5a6a64;display:none;}" +
@@ -396,9 +427,11 @@
   }
 
   function visibleMessages(msgs) {
+    var list = msgs || [];
+    if (canTombstone()) return list.slice();
     var out = [];
-    for (var i = 0; i < (msgs || []).length; i++) {
-      if (!isIgnored(msgs[i].name)) out.push(msgs[i]);
+    for (var i = 0; i < list.length; i++) {
+      if (!isIgnored(list[i].name)) out.push(list[i]);
     }
     return out;
   }
@@ -550,6 +583,8 @@
         JSON.stringify({
           messages: (data && data.messages) || [],
           latest_id: (data && data.latest_id) || 0,
+          local_mod: !!(data && data.local_mod),
+          chat_source: (data && data.chat_source) || "",
         })
       );
     } catch (_) {}
@@ -670,11 +705,26 @@
     for (var i = 0; i < visible.length; i++) {
       var m = visible[i];
       var removed = !!m.removed;
+      var flagged = !removed && !!m.flagged;
       var mine = !removed && isMine(m.name);
+      var tools = "";
+      if (!removed && canTombstone()) {
+        tools +=
+          '<button type="button" class="tombstone" data-tombstone="' +
+          m.id +
+          '" aria-label="Tombstone this message">remove</button>';
+      }
+      if (!mine && !removed) {
+        tools +=
+          '<button type="button" class="ignore" data-ignore="' +
+          esc(m.name) +
+          '">ignore</button>';
+      }
       html.push(
         '<div class="msg' +
           (mine ? " mine" : "") +
           (removed ? " removed" : "") +
+          (flagged ? " flagged" : "") +
           '" data-id="' +
           m.id +
           '"><div class="meta"><span class="who">' +
@@ -682,11 +732,7 @@
           '</span><div class="meta-right"><span>' +
           ago(m.t) +
           "</span>" +
-          (mine || removed
-            ? ""
-            : '<button type="button" class="ignore" data-ignore="' +
-              esc(m.name) +
-              '">ignore</button>') +
+          tools +
           '</div></div><div class="body">' +
           (removed ? esc(m.text) : formatBody(m.text)) +
           "</div></div>"
@@ -726,6 +772,13 @@
   }
 
   function applyPayload(data) {
+    if (data && Object.prototype.hasOwnProperty.call(data, "local_mod")) {
+      localMod = !!data.local_mod;
+    }
+    if (data && Object.prototype.hasOwnProperty.call(data, "chat_source")) {
+      chatSource = String(data.chat_source || "");
+    }
+    paintLocalHint();
     var msgs = (data && data.messages) || [];
     lastMsgs = msgs;
     latestId = Math.max(
@@ -736,8 +789,54 @@
       var id = parseInt(msgs[j].id, 10) || 0;
       if (id > latestId) latestId = id;
     }
-    saveCache({ messages: msgs, latest_id: latestId });
+    saveCache({
+      messages: msgs,
+      latest_id: latestId,
+      local_mod: localMod,
+      chat_source: chatSource,
+    });
     renderAll();
+  }
+
+  async function tombstoneMessage(rawId) {
+    var id = parseInt(rawId, 10) || 0;
+    if (!id || !canTombstone() || tombstoning) return;
+    if (
+      !window.confirm(
+        chatSource === "fly"
+          ? "Remove this message on the live site? It stays on the log as an admin note."
+          : "Remove this message from Human chat? It stays on the log as an admin note."
+      )
+    ) {
+      return;
+    }
+    tombstoning = true;
+    var buttons = logEl ? logEl.querySelectorAll("[data-tombstone]") : [];
+    for (var i = 0; i < buttons.length; i++) buttons[i].disabled = true;
+    if (errEl) errEl.textContent = "";
+    try {
+      var res = await fetch("/api/chat/moderate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: id }),
+      });
+      var data = await res.json().catch(function () {
+        return {};
+      });
+      if (!res.ok) {
+        if (errEl) errEl.textContent = data.hint || data.error || "remove failed";
+        return;
+      }
+      if (data.push_error && errEl) {
+        errEl.textContent = "saved here, but Fly push failed: " + data.push_error;
+      }
+      await poll();
+    } catch (_) {
+      if (errEl) errEl.textContent = "network error";
+    } finally {
+      tombstoning = false;
+      renderAll();
+    }
   }
 
   async function poll() {
@@ -809,6 +908,12 @@
       if (open) captureScrollAnchor();
     });
     logEl.addEventListener("click", function (e) {
+      var tomb = e.target.closest("[data-tombstone]");
+      if (tomb) {
+        e.preventDefault();
+        tombstoneMessage(tomb.getAttribute("data-tombstone") || "");
+        return;
+      }
       var btn = e.target.closest("[data-ignore]");
       if (!btn) return;
       ignoreName(btn.getAttribute("data-ignore") || "");

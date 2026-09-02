@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import re
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -12,6 +14,18 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 DEFAULT_BASE = "https://1f916.ai"
+
+# Cloudflare 1015 (and origin 429/503): wait, then retry with a cap so a
+# Watch page load cannot stack 30s → 60s → 120s sleeps.
+_RETRYABLE_STATUSES = frozenset({429, 503})
+_MAX_RETRIES = 5
+_MAX_SLEEP_SEC = 30.0
+_MAX_TOTAL_SLEEP_SEC = 45.0
+_DEFAULT_RETRY_AFTER = 30.0
+_HTTP_CONCURRENCY = 4
+_RATE_LOCK = threading.Lock()
+_COOLDOWN_UNTIL = 0.0
+_HTTP_SEMA = threading.BoundedSemaphore(_HTTP_CONCURRENCY)
 
 # Legacy footers (no longer appended). Stripped when comparing / drafting.
 _AUTO_SIGNOFF_RE = re.compile(
@@ -28,11 +42,75 @@ def strip_auto_signoff(body: str) -> str:
 
 
 class ApiError(RuntimeError):
-    def __init__(self, status: int, message: str, payload: Any = None):
+    def __init__(
+        self,
+        status: int,
+        message: str,
+        payload: Any = None,
+        retry_after: Optional[float] = None,
+    ):
         self.status = status
         self.message = message
         self.payload = payload
+        self.retry_after = retry_after
         super().__init__("HTTP {}: {}".format(status, message))
+
+
+def _error_message(payload: Any, raw: str, reason: Any) -> str:
+    """Prefer title/detail over dumping a Cloudflare JSON body."""
+    if isinstance(payload, dict):
+        title = str(payload.get("title") or "").strip()
+        detail = str(payload.get("detail") or "").strip()
+        err = payload.get("error")
+        if title and detail:
+            return "{} — {}".format(title, detail)
+        if isinstance(err, str) and err.strip():
+            return err.strip()
+        if title:
+            return title
+        if detail:
+            return detail
+    text = (raw or "").strip()
+    if text and not text.startswith("{") and not text.startswith("<"):
+        return text
+    return str(reason or "request failed")
+
+
+def _retry_after_seconds(payload: Any, headers: Any) -> float:
+    if isinstance(payload, dict) and payload.get("retry_after") is not None:
+        try:
+            return max(1.0, min(float(payload["retry_after"]), 120.0))
+        except (TypeError, ValueError):
+            pass
+    if headers is not None:
+        raw = headers.get("Retry-After")
+        if raw is not None:
+            try:
+                return max(1.0, min(float(str(raw).strip()), 120.0))
+            except (TypeError, ValueError):
+                pass
+    return _DEFAULT_RETRY_AFTER
+
+
+def _is_retryable(status: int, payload: Any) -> bool:
+    if status not in _RETRYABLE_STATUSES:
+        return False
+    if isinstance(payload, dict) and payload.get("retryable") is False:
+        return False
+    return True
+
+
+def _cooldown_remaining() -> float:
+    with _RATE_LOCK:
+        return max(0.0, _COOLDOWN_UNTIL - time.monotonic())
+
+
+def _set_cooldown(seconds: float) -> None:
+    global _COOLDOWN_UNTIL
+    until = time.monotonic() + max(0.0, seconds)
+    with _RATE_LOCK:
+        if until > _COOLDOWN_UNTIL:
+            _COOLDOWN_UNTIL = until
 
 
 @dataclass
@@ -60,6 +138,7 @@ class Client:
         query: Optional[Dict[str, Any]] = None,
         auth: bool = False,
         extra_headers: Optional[Dict[str, str]] = None,
+        retry: bool = True,
     ) -> Any:
         data = None
         headers = {"Accept": "application/json"}
@@ -76,25 +155,71 @@ class Client:
         req = urllib.request.Request(
             self._url(path, query), data=data, headers=headers, method=method
         )
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                raw = resp.read()
-                if not raw:
-                    return None
-                return json.loads(raw.decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            raw = e.read().decode("utf-8", errors="replace")
-            payload: Any = None
+        attempts = 0
+        slept = 0.0
+        last_error: Optional[ApiError] = None
+        while True:
+            remaining = _cooldown_remaining()
+            if remaining > 0:
+                if not retry:
+                    raise ApiError(
+                        429,
+                        "rate limited — retry in {:.0f}s".format(remaining),
+                        retry_after=remaining,
+                    )
+                wait = min(remaining, _MAX_SLEEP_SEC, _MAX_TOTAL_SLEEP_SEC - slept)
+                if wait < 1:
+                    if last_error:
+                        raise last_error
+                    raise ApiError(
+                        429,
+                        "rate limited — retry in {:.0f}s".format(remaining),
+                        retry_after=remaining,
+                    )
+                time.sleep(wait)
+                slept += wait
+            if not _HTTP_SEMA.acquire(timeout=60):
+                raise ApiError(
+                    429,
+                    "rate limited — too many in-flight society requests",
+                    retry_after=_cooldown_remaining() or _DEFAULT_RETRY_AFTER,
+                )
             try:
-                payload = json.loads(raw)
-                message = (
-                    payload.get("error")
-                    if isinstance(payload, dict)
-                    else raw
-                ) or raw
-            except json.JSONDecodeError:
-                message = raw or e.reason
-            raise ApiError(e.code, str(message), payload=payload) from e
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    raw = resp.read()
+                    if not raw:
+                        return None
+                    return json.loads(raw.decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                raw = e.read().decode("utf-8", errors="replace")
+                payload: Any = None
+                try:
+                    payload = json.loads(raw)
+                except json.JSONDecodeError:
+                    payload = None
+                message = _error_message(payload, raw, e.reason)
+                retry_after = _retry_after_seconds(payload, e.headers)
+                err = ApiError(
+                    e.code, str(message), payload=payload, retry_after=retry_after
+                )
+                last_error = err
+                if _is_retryable(e.code, payload):
+                    _set_cooldown(retry_after)
+                if not (retry and _is_retryable(e.code, payload)):
+                    raise err from e
+                attempts += 1
+                if attempts > _MAX_RETRIES:
+                    raise err from e
+                wait = min(
+                    retry_after * (2 ** (attempts - 1)),
+                    _MAX_SLEEP_SEC,
+                    _MAX_TOTAL_SLEEP_SEC - slept,
+                )
+                if wait < 1:
+                    raise err from e
+                _set_cooldown(wait)
+            finally:
+                _HTTP_SEMA.release()
 
     def front(
         self,
@@ -119,12 +244,16 @@ class Client:
             query["exclude"] = exclude
         return self.request("GET", path, query=query or None)
 
-    def post_get(self, post_id: int) -> Any:
-        return self.request("GET", "/api/post/{}".format(post_id))
+    def post_get(self, post_id: int, *, retry: bool = True) -> Any:
+        return self.request(
+            "GET", "/api/post/{}".format(post_id), retry=retry
+        )
 
-    def comment_get(self, comment_id: int) -> Any:
+    def comment_get(self, comment_id: int, *, retry: bool = True) -> Any:
         """GET /api/comment/:id — one comment, including post_id for permalinks."""
-        return self.request("GET", "/api/comment/{}".format(int(comment_id)))
+        return self.request(
+            "GET", "/api/comment/{}".format(int(comment_id)), retry=retry
+        )
 
     def search(self, q: str, *, limit: Optional[int] = None) -> Any:
         """GET /api/search — substring match over post title and body."""
@@ -155,9 +284,11 @@ class Client:
             query["since"] = int(since)
         return self.request("GET", "/api/listings", query=query or None)
 
-    def listing(self, listing_id: int) -> Any:
+    def listing(self, listing_id: int, *, retry: bool = True) -> Any:
         """GET /api/listings/:id — one listing plus submissions and bindings."""
-        return self.request("GET", "/api/listings/{}".format(int(listing_id)))
+        return self.request(
+            "GET", "/api/listings/{}".format(int(listing_id)), retry=retry
+        )
 
     def listings_guide(self) -> Any:
         """GET /api/listings/guide — versioned how-and-why of the payment rail."""
