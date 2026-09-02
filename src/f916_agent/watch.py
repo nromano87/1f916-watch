@@ -191,10 +191,9 @@ _CHANGES_LOCK = threading.Lock()
 _CHANGES_COND = threading.Condition(_CHANGES_LOCK)
 _CHANGES_REFRESHING = False
 _CHANGES_TTL_SEC = 60.0
-_CHANGES_MAX_PAGES = 80
 _CHANGES_INCREMENTAL_PAGES = 16
-_CHANGES_TIP_PAGES = 16
-_CHANGES_TIP_LOOKBACK_SEC = (6 * 3600, 24 * 3600, 72 * 3600)
+_CHANGES_TIP_PAGES = 6
+_CHANGES_TIP_LOOKBACK_SEC = (30 * 60, 2 * 3600, 6 * 3600, 24 * 3600)
 _CHANGES_TIP_STALE_SEC = 30 * 60
 # Society bug: collapsed/removed rows can be omitted from /api/changes while
 # still serving on /api/post/:id. Cap probes so a wild ID hole can't stall Watch.
@@ -4365,13 +4364,19 @@ def _probe_changes_post_gap(
     }
 
 
+def _row_created_at_ms(row: Any) -> int:
+    if not isinstance(row, dict):
+        return 0
+    try:
+        return int(row.get("created_at") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _newest_created_at_ms(rows: List[Dict[str, Any]]) -> int:
     newest = 0
     for row in rows or []:
-        try:
-            newest = max(newest, int(row.get("created_at") or 0))
-        except (TypeError, ValueError):
-            continue
+        newest = max(newest, _row_created_at_ms(row))
     return newest
 
 
@@ -4384,11 +4389,12 @@ def _changes_tip_is_stale(comments: List[Dict[str, Any]]) -> bool:
 
 
 def _fetch_changes_tip(client: Client) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Newest /api/changes rows by walking a recent window through to now.
+    """Newest /api/changes rows without walking the whole square.
 
-    Timestamp mode is oldest-first, so a multi-day ``since`` on a single
-    page returns the *start* of that window. Page until ``has_more`` is
-    false (or the cap) so the last page is the live tip.
+    Timestamp mode is oldest-first and ``has_more`` can stay true because
+    posts/nulls saturated — so a long lookback on the request path used to
+    stall Watch, then 429 and store an empty Comments tab. Keep this to a
+    handful of pages from a recent ``since``, and only call it off-request.
     """
     now_ms = int(time.time() * 1000)
     last_posts: List[Dict[str, Any]] = []
@@ -4406,17 +4412,8 @@ def _fetch_changes_tip(client: Client) -> Tuple[List[Dict[str, Any]], List[Dict[
                 break
             continue
         last_posts, last_comments = posts, comments
-        if walked.get("complete"):
+        if walked.get("complete") or comments:
             return posts, comments
-        extra = client.changes_pages(
-            int(walked.get("next_since") or 0),
-            max_pages=_CHANGES_TIP_PAGES,
-            retry=False,
-        )
-        return (
-            merge_rows_by_id(posts, list(extra.get("posts") or [])),
-            merge_rows_by_id(comments, list(extra.get("comments") or [])),
-        )
     return last_posts, last_comments
 
 
@@ -4477,12 +4474,20 @@ def _load_changes_index(client: Client, *, force: bool = False) -> Dict[str, Any
             break
 
     try:
+        # Tip first so Comments can refresh even if the origin walk 429s.
+        with _CHANGES_COND:
+            cached_comments = list(_CHANGES_CACHE.get("comments") or [])
+        if (not had_data) or _changes_tip_is_stale(cached_comments):
+            try:
+                tip_posts, tip_comments = _fetch_changes_tip(client)
+            except ApiError:
+                tip_posts, tip_comments = [], []
+            if tip_posts or tip_comments:
+                _ingest_changes_rows(tip_posts, tip_comments)
+
         start = resume if had_data else 0
-        max_pages = (
-            _CHANGES_INCREMENTAL_PAGES if had_data else _CHANGES_MAX_PAGES
-        )
         walked = client.changes_pages(
-            start, max_pages=max_pages, retry=not had_data
+            start, max_pages=_CHANGES_INCREMENTAL_PAGES, retry=False
         )
         posts_delta = list(walked.get("posts") or [])
         comments_delta = list(walked.get("comments") or [])
@@ -4493,19 +4498,6 @@ def _load_changes_index(client: Client, *, force: bool = False) -> Dict[str, Any
             walked.get("pages") or posts_delta or comments_delta
         )
 
-        tip_posts: List[Dict[str, Any]] = []
-        tip_comments: List[Dict[str, Any]] = []
-        with _CHANGES_COND:
-            cached_comments = list(_CHANGES_CACHE.get("comments") or [])
-        need_tip = (not complete) or _changes_tip_is_stale(
-            merge_rows_by_id(cached_comments, comments_delta)
-        )
-        if need_tip:
-            try:
-                tip_posts, tip_comments = _fetch_changes_tip(client)
-            except ApiError:
-                tip_posts, tip_comments = [], []
-
         gap: Dict[str, Any] = {}
         prev_gap: Dict[str, Any] = {}
         with _CHANGES_COND:
@@ -4515,9 +4507,6 @@ def _load_changes_index(client: Client, *, force: bool = False) -> Dict[str, Any
             comments = merge_rows_by_id(
                 list(_CHANGES_CACHE.get("comments") or []), comments_delta
             )
-            if tip_posts or tip_comments:
-                posts = merge_rows_by_id(posts, tip_posts)
-                comments = merge_rows_by_id(comments, tip_comments)
             prev_gap = dict(_CHANGES_CACHE.get("gap") or {})
             if made_progress or not had_data:
                 _CHANGES_CACHE["next_since"] = next_since
@@ -4525,7 +4514,9 @@ def _load_changes_index(client: Client, *, force: bool = False) -> Dict[str, Any
                 _CHANGES_CACHE["complete"] = True
             elif made_progress:
                 _CHANGES_CACHE["complete"] = False
-            if made_progress or tip_comments or tip_posts or not had_data:
+            # An empty 429 must not look like a successful fill — that froze
+            # Comments on "no comments yet" for the whole TTL.
+            if made_progress or comments or posts:
                 _CHANGES_CACHE["fetched_at"] = datetime.now(
                     timezone.utc
                 ).timestamp()
@@ -4537,7 +4528,7 @@ def _load_changes_index(client: Client, *, force: bool = False) -> Dict[str, Any
         # Do not call _load_moderation_index here: front-snapshot loads mod then
         # changes, and nesting would deadlock under singleflight. Callers that
         # need reasons enrich omitted_posts themselves.
-        if stored_complete or (not had_data and not truncated):
+        if stored_complete or (not had_data and not truncated and made_progress):
             try:
                 gap = _probe_changes_post_gap(client, snapshot_posts)
             except Exception:
@@ -5927,7 +5918,7 @@ def _front_comments_feed(
     titles = _front_comment_titles(posts)
     ranked = sorted(
         comments or [],
-        key=lambda c: int(c.get("created_at") or 0),
+        key=_row_created_at_ms,
         reverse=True,
     )
     out: List[Dict[str, Any]] = []
@@ -6025,13 +6016,13 @@ def _front_comments_top(
     rows = _enrich_comment_context(rows, posts=front_posts, comments=rows)
     newest = sorted(
         rows,
-        key=lambda c: int(c.get("created_at") or 0),
+        key=_row_created_at_ms,
         reverse=True,
     )
     rows.sort(
         key=lambda c: (
             int(c.get("votes") or 0),
-            int(c.get("created_at") or 0),
+            _row_created_at_ms(c),
         ),
         reverse=True,
     )
@@ -6327,23 +6318,13 @@ def _compute_front_snapshot(
     if not filtered:
         _ensure_changes_index_async(client)
         index = _peek_changes_index() or {}
-        source_comments = list(index.get("comments") or [])
-        source_posts = list(index.get("posts") or [])
-        if _changes_tip_is_stale(source_comments):
-            try:
-                tip_posts, tip_comments = _fetch_changes_tip(client)
-                if tip_posts or tip_comments:
-                    _ingest_changes_rows(tip_posts, tip_comments)
-                    source_comments = merge_rows_by_id(
-                        source_comments, tip_comments
-                    )
-                    source_posts = merge_rows_by_id(source_posts, tip_posts)
-            except Exception as e:  # pragma: no cover
-                errors.append("front_comments_tip: {}".format(e))
         source_comments = merge_rows_by_id(
-            source_comments, list(extra.get("comments_new") or [])
+            list(index.get("comments") or []),
+            list(extra.get("comments_new") or []),
         )
-        source_posts = merge_rows_by_id(source_posts, thread_posts)
+        source_posts = merge_rows_by_id(
+            list(index.get("posts") or []), thread_posts
+        )
         if source_comments:
             try:
                 front_comments = _front_comments_feed(
