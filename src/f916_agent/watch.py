@@ -240,6 +240,18 @@ _INBOX_LOCK = threading.Lock()
 _INBOX_COND = threading.Condition(_INBOX_LOCK)
 _INBOX_REFRESHING: Dict[str, bool] = {}
 _INBOX_TTL_SEC = 90.0
+# When the square 429s Watch's /api/changes crawl, the house look still has
+# comments_on_your_posts from GET /api/me. Merge that so Inbox isn't empty.
+_HOUSE_HEALTHZ_URL = os.environ.get(
+    "F916_HOUSE_HEALTHZ", "https://f916-house.fly.dev/healthz"
+)
+_HOUSE_HEALTHZ_CACHE: Dict[str, Any] = {"fetched_at": 0.0, "data": None}
+_HOUSE_HEALTHZ_LOCK = threading.Lock()
+_HOUSE_HEALTHZ_TTL_SEC = 30.0
+# /api/new still lists today's posts when /api/changes is months behind.
+_NEW_FEED_CACHE: Dict[str, Any] = {"fetched_at": 0.0, "posts": []}
+_NEW_FEED_LOCK = threading.Lock()
+_NEW_FEED_TTL_SEC = 20.0
 # Society front page — one shared build; UI polls ~20s.
 # Serve stale immediately and refresh in the background so TTL expiry
 # never blocks the tab. Filtered fronts (?tag=/?exclude=) use a keyed cache.
@@ -2461,9 +2473,7 @@ a.pill:hover{{background:rgba(12,124,102,.18);border-color:rgba(12,124,102,.4)}}
         const items = (c.inbox && c.inbox.items) || [];
           const inboxHtml = c.error
             ? '<p class="meta">' + esc(c.error) + "</p>"
-            : (warming
-              ? '<p class="meta">Warming public trail…</p>'
-              : (items.length
+            : (items.length
             ? '<ul class="inbox-list">' + items.map((it) => {{
                 const postHref = it.post_id != null ? ('/post/' + encodeURIComponent(it.post_id)) : "";
                 const who = it.author
@@ -2476,7 +2486,9 @@ a.pill:hover{{background:rgba(12,124,102,.18);border-color:rgba(12,124,102,.4)}}
                   who + postBit + '</span><span>' + esc(fmtAgo(it.created_at)) + "</span></div>" +
                   '<div class="body">' + esc(it.body || "") + "</div></li>";
               }}).join("") + "</ul>"
-              : '<p class="meta">Inbox quiet.</p>'));
+              : (warming
+                ? '<p class="meta">Warming public trail…</p>'
+                : '<p class="meta">Inbox quiet.</p>'));
         cardByKey[h.toLowerCase()] =
           '<article class="card' + (unseen > 0 ? " has-new" : "") + '" id="' + esc(cardId(c.handle || h)) + '" data-handle="' + esc(c.handle || h) + '">' +
           '<div class="card-top">' +
@@ -4388,31 +4400,49 @@ def _changes_tip_is_stale(comments: List[Dict[str, Any]]) -> bool:
     return (now_ms - newest) > (_CHANGES_TIP_STALE_SEC * 1000)
 
 
-def _fetch_changes_tip(client: Client) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def _fetch_changes_tip(
+    client: Client, *, max_pages: Optional[int] = None
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Newest /api/changes rows without walking the whole square.
 
-    Timestamp mode is oldest-first and ``has_more`` can stay true because
-    posts/nulls saturated — so a long lookback on the request path used to
-    stall Watch, then 429 and store an empty Comments tab. Keep this to a
-    handful of pages from a recent ``since``, and only call it off-request.
+    Timestamp mode is oldest-first: the first pages of a 24h lookback are
+    yesterday, not now. Walk each window toward ``now`` until ``complete``
+    so Mine/Inbox see today's rows instead of the oldest slice.
     """
     now_ms = int(time.time() * 1000)
+    pages = int(max_pages or _CHANGES_TIP_PAGES)
     last_posts: List[Dict[str, Any]] = []
     last_comments: List[Dict[str, Any]] = []
     for lookback in _CHANGES_TIP_LOOKBACK_SEC:
-        walked = client.changes_pages(
-            max(0, now_ms - int(lookback) * 1000),
-            max_pages=_CHANGES_TIP_PAGES,
-            retry=False,
-        )
-        posts = list(walked.get("posts") or [])
-        comments = list(walked.get("comments") or [])
+        cursor = max(0, now_ms - int(lookback) * 1000)
+        posts: List[Dict[str, Any]] = []
+        comments: List[Dict[str, Any]] = []
+        complete = False
+        truncated = False
+        for _ in range(4):
+            walked = client.changes_pages(
+                cursor,
+                max_pages=max(1, pages),
+                retry=False,
+            )
+            posts = merge_rows_by_id(posts, list(walked.get("posts") or []))
+            comments = merge_rows_by_id(
+                comments, list(walked.get("comments") or [])
+            )
+            try:
+                cursor = int(walked.get("next_since") or cursor)
+            except (TypeError, ValueError):
+                pass
+            truncated = bool(walked.get("truncated"))
+            complete = bool(walked.get("complete"))
+            if complete or truncated or not walked.get("pages"):
+                break
         if not posts and not comments:
-            if walked.get("truncated"):
+            if truncated:
                 break
             continue
         last_posts, last_comments = posts, comments
-        if walked.get("complete") or comments:
+        if complete:
             return posts, comments
     return last_posts, last_comments
 
@@ -4524,6 +4554,11 @@ def _load_changes_index(client: Client, *, force: bool = False) -> Dict[str, Any
             _CHANGES_CACHE["comments"] = comments
             stored_complete = bool(_CHANGES_CACHE.get("complete"))
             snapshot_posts = list(posts)
+
+        try:
+            _ingest_changes_rows(_load_new_feed_posts(client), [])
+        except Exception:
+            pass
 
         # Do not call _load_moderation_index here: front-snapshot loads mod then
         # changes, and nesting would deadlock under singleflight. Callers that
@@ -4759,6 +4794,192 @@ def _own_trail_from_index(
     return own_posts, own_comments
 
 
+def _fetch_house_healthz() -> Dict[str, Any]:
+    """Last house wake (look/inbox). Cached; never required for Watch to boot."""
+    now = datetime.now(timezone.utc).timestamp()
+    with _HOUSE_HEALTHZ_LOCK:
+        age = now - float(_HOUSE_HEALTHZ_CACHE.get("fetched_at") or 0)
+        cached = _HOUSE_HEALTHZ_CACHE.get("data")
+        if cached is not None and age < _HOUSE_HEALTHZ_TTL_SEC:
+            return dict(cached)
+    try:
+        req = urllib.request.Request(
+            _HOUSE_HEALTHZ_URL,
+            headers={"Accept": "application/json", "User-Agent": "f916-watch"},
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if not isinstance(data, dict):
+            data = {}
+    except (
+        OSError,
+        TimeoutError,
+        urllib.error.URLError,
+        json.JSONDecodeError,
+        ValueError,
+    ):
+        data = {}
+    with _HOUSE_HEALTHZ_LOCK:
+        _HOUSE_HEALTHZ_CACHE["fetched_at"] = now
+        _HOUSE_HEALTHZ_CACHE["data"] = data
+    return dict(data)
+
+
+def house_look_for_handle(
+    handle: str, healthz: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    h = (handle or "").strip()
+    data = healthz if healthz is not None else _fetch_house_healthz()
+    last = data.get("last") if isinstance(data, dict) else None
+    if not isinstance(last, dict) or not h:
+        return {}
+    row = last.get(h) or last.get(h.lower())
+    if not isinstance(row, dict):
+        return {}
+    look = row.get("look")
+    return look if isinstance(look, dict) else {}
+
+
+def merge_house_look_inbox(
+    inbox: Dict[str, Any], look: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Add house GET /api/me newest rows onto a Watch inbox box."""
+    inbox = dict(inbox or {})
+    items = list(inbox.get("items") or [])
+    seen: Set[int] = set()
+    for it in items:
+        cid = it.get("comment_id") if it.get("comment_id") is not None else it.get("id")
+        if cid is None:
+            continue
+        try:
+            seen.add(int(cid))
+        except (TypeError, ValueError):
+            continue
+    kind_map = {
+        "comments_on_your_posts": "on_post",
+        "replies": "on_comment",
+        "mentions_of_you": "society_mention",
+        "in_threads_you_joined": "joined_thread",
+    }
+    for row in look.get("newest") or []:
+        if not isinstance(row, dict):
+            continue
+        cid = row.get("id")
+        if cid is None:
+            continue
+        try:
+            cid_i = int(cid)
+        except (TypeError, ValueError):
+            continue
+        if cid_i in seen:
+            continue
+        seen.add(cid_i)
+        kind = kind_map.get(str(row.get("kind") or ""), "on_post")
+        items.append(
+            {
+                "id": cid_i,
+                "kind": kind,
+                "key": "c:{}".format(cid_i),
+                "post_id": row.get("post_id"),
+                "comment_id": cid_i,
+                "author": row.get("author") or "",
+                "body": row.get("body") or "",
+                "created_at": row.get("created_at"),
+                "source": "house_look",
+            }
+        )
+    items.sort(key=lambda x: (x.get("created_at") or 0), reverse=True)
+    inbox["items"] = items
+    counts = dict(inbox.get("counts") or {})
+    counts["total"] = len(items)
+    for k in ("on_post", "on_comment", "mention", "joined_thread", "society_mention"):
+        counts[k] = sum(1 for it in items if it.get("kind") == k)
+    inbox["counts"] = counts
+    return inbox
+
+
+def _load_new_feed_posts(client: Client) -> List[Dict[str, Any]]:
+    """GET /api/new, cached — today's posts can miss /api/changes."""
+    now = datetime.now(timezone.utc).timestamp()
+    with _NEW_FEED_LOCK:
+        age = now - float(_NEW_FEED_CACHE.get("fetched_at") or 0)
+        posts = _NEW_FEED_CACHE.get("posts")
+        if (
+            isinstance(posts, list)
+            and age < _NEW_FEED_TTL_SEC
+            and float(_NEW_FEED_CACHE.get("fetched_at") or 0) > 0
+        ):
+            return list(posts)
+    try:
+        data = client.front(order="new", limit=100) or {}
+        fetched = [p for p in (data.get("posts") or []) if isinstance(p, dict)]
+    except (ApiError, OSError, TimeoutError, urllib.error.URLError):
+        with _NEW_FEED_LOCK:
+            return list(_NEW_FEED_CACHE.get("posts") or [])
+    with _NEW_FEED_LOCK:
+        _NEW_FEED_CACHE["fetched_at"] = now
+        _NEW_FEED_CACHE["posts"] = fetched
+    return list(fetched)
+
+
+def _recent_own_posts_from_new(client: Client, handle: str) -> List[Dict[str, Any]]:
+    """Today's posts can miss /api/changes. /api/new still lists them."""
+    h_l = (handle or "").strip().lower()
+    if not h_l:
+        return []
+    out: List[Dict[str, Any]] = []
+    for p in _load_new_feed_posts(client):
+        if str(p.get("author") or "").strip().lower() != h_l:
+            continue
+        if p.get("id") is None:
+            continue
+        out.append(p)
+    return out
+
+
+def _append_own_posts(
+    own_posts: List[Dict[str, Any]],
+    own_ids: Set[int],
+    rows: List[Dict[str, Any]],
+    handle: str,
+) -> None:
+    h_l = (handle or "").strip().lower()
+    for p in rows:
+        if not isinstance(p, dict) or p.get("id") is None:
+            continue
+        if str(p.get("author") or "").strip().lower() != h_l:
+            continue
+        try:
+            pid = int(p["id"])
+        except (TypeError, ValueError):
+            continue
+        if pid in own_ids:
+            continue
+        own_posts.append(p)
+        own_ids.add(pid)
+
+
+def _apply_published_remaining(
+    entry: Dict[str, Any],
+    store: Optional[Store],
+    handle: str,
+) -> None:
+    """Watchlist remaining must use the published blob, not an empty ledger."""
+    if store is None:
+        return
+    blob = load_public_allowance(store, handle)
+    if not blob:
+        return
+    today = blob.get("today") or {}
+    for key in ("posts_remaining", "comments_remaining"):
+        if today.get(key) is None:
+            continue
+        try:
+            entry[key] = int(today[key])
+        except (TypeError, ValueError):
+            continue
+
+
 def _watchlist_inbox_from_changes(
     handle: str,
     *,
@@ -4883,6 +5104,8 @@ def _watchlist_entry_for_handle(
     all_comments: List[Dict[str, Any]],
     gap: Dict[str, Any],
     preview_limit: int,
+    store: Optional[Store] = None,
+    house_look: Optional[Dict[str, Any]] = None,
     warming: bool = False,
 ) -> Tuple[Dict[str, Any], Optional[str]]:
     lookup_error: Optional[str] = None
@@ -4921,29 +5144,66 @@ def _watchlist_entry_for_handle(
         "posts_remaining": None,
         "comments_remaining": None,
     }
-    if warming:
-        return entry, lookup_error
     own_posts, own_comments = _own_trail_from_index(
         h, all_posts, all_comments, gap
+    )
+    own_ids: Set[int] = set()
+    for p in own_posts:
+        if p.get("id") is None:
+            continue
+        try:
+            own_ids.add(int(p["id"]))
+        except (TypeError, ValueError):
+            continue
+    _append_own_posts(
+        own_posts, own_ids, _recent_own_posts_from_new(client, h), h
     )
     today = _allowance_from_ledger(own_posts, own_comments)
     entry["posts_remaining"] = int(today.get("posts_remaining") or 0)
     entry["comments_remaining"] = int(today.get("comments_remaining") or 0)
+    _apply_published_remaining(entry, store, h)
+    look = house_look if isinstance(house_look, dict) else {}
     try:
-        activity = _watchlist_inbox_from_changes(
-            h,
-            own_posts=own_posts,
-            own_comments=own_comments,
-            all_posts=all_posts,
-            all_comments=all_comments,
-            preview_limit=preview_limit,
+        if warming and not own_posts and not own_comments:
+            activity: Dict[str, Any] = {
+                "built_at": datetime.now(timezone.utc).isoformat(),
+                "counts": {"on_post": 0, "on_comment": 0, "mention": 0, "total": 0},
+                "items": [],
+                "item_ids": [],
+            }
+        else:
+            activity = _watchlist_inbox_from_changes(
+                h,
+                own_posts=own_posts,
+                own_comments=own_comments,
+                all_posts=all_posts,
+                all_comments=all_comments,
+                preview_limit=preview_limit,
+            )
+        box = merge_house_look_inbox(
+            {
+                "items": list(activity.get("items") or []),
+                "counts": activity.get("counts")
+                or {"on_post": 0, "on_comment": 0, "mention": 0, "total": 0},
+            },
+            look,
         )
-        entry["item_ids"] = list(activity.get("item_ids") or [])
+        items = list(box.get("items") or [])
+        ids = list(activity.get("item_ids") or [])
+        seen_ids = set(ids)
+        for it in items:
+            iid = _watchlist_inbox_item_id(it)
+            if iid and iid not in ("c:", "p:") and iid not in seen_ids:
+                ids.append(iid)
+                seen_ids.add(iid)
+        entry["item_ids"] = ids
         entry["inbox"] = {
             "built_at": activity.get("built_at"),
-            "counts": activity.get("counts")
+            "counts": box.get("counts")
             or {"on_post": 0, "on_comment": 0, "mention": 0, "total": 0},
-            "items": list(activity.get("items") or []),
+            "items": [_preview_inbox_item(it) for it in items[:preview_limit]]
+            if look
+            else items[:preview_limit],
         }
     except Exception as e:  # pragma: no cover
         entry["error"] = "inbox: {}".format(e)
@@ -4955,9 +5215,14 @@ def _compute_watchlist_inbox(
     cleaned: List[str],
     *,
     preview_limit: int,
+    store: Optional[Store] = None,
 ) -> Dict[str, Any]:
     errors: List[str] = []
     _ensure_changes_index_async(client)
+    try:
+        _ingest_changes_rows(_load_new_feed_posts(client), [])
+    except Exception:
+        pass
     index = _peek_changes_index()
     warming = not index
     if not index:
@@ -4966,6 +5231,7 @@ def _compute_watchlist_inbox(
     all_posts = list(index.get("posts") or [])
     all_comments = list(index.get("comments") or [])
     gap = dict(index.get("gap") or {})
+    healthz = _fetch_house_healthz()
     by_handle: Dict[str, Tuple[Dict[str, Any], Optional[str]]] = {}
     workers = min(4, len(cleaned)) or 1
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -4978,6 +5244,8 @@ def _compute_watchlist_inbox(
                 all_comments=all_comments,
                 gap=gap,
                 preview_limit=preview_limit,
+                store=store,
+                house_look=house_look_for_handle(handle, healthz),
                 warming=warming,
             ): handle
             for handle in cleaned
@@ -5032,10 +5300,11 @@ def _refresh_watchlist_inbox(
     cleaned: List[str],
     key: str,
     preview_limit: int,
+    store: Optional[Store] = None,
 ) -> Dict[str, Any]:
     try:
         payload = _compute_watchlist_inbox(
-            client, cleaned, preview_limit=preview_limit
+            client, cleaned, preview_limit=preview_limit, store=store
         )
         if not payload.get("warming"):
             _store_watchlist_inbox(key, payload)
@@ -5049,6 +5318,7 @@ def build_watchlist_inbox(
     handles: List[str],
     *,
     preview_limit: int = 8,
+    store: Optional[Store] = None,
 ) -> Dict[str, Any]:
     """Lightweight inbox bundle for browser watchlists (shared changes crawl).
 
@@ -5086,12 +5356,14 @@ def build_watchlist_inbox(
     if cached is not None:
         threading.Thread(
             target=_refresh_watchlist_inbox,
-            args=(client, cleaned, cache_key, preview_limit),
+            args=(client, cleaned, cache_key, preview_limit, store),
             name="watchlist-inbox",
             daemon=True,
         ).start()
         return cached
-    return _refresh_watchlist_inbox(client, cleaned, cache_key, preview_limit)
+    return _refresh_watchlist_inbox(
+        client, cleaned, cache_key, preview_limit, store
+    )
 
 
 def list_citizens(
@@ -5421,6 +5693,11 @@ def _compute_public_snapshot(
         errors.append("changes: {}".format(e))
 
     h = str(person.get("handle") or handle)
+    house_look = house_look_for_handle(h)
+    try:
+        _ingest_changes_rows(_load_new_feed_posts(client), [])
+    except Exception:
+        pass
     record: Dict[str, Any] = {}
     keys_public: Dict[str, Any] = {}
     if not quick:
@@ -5442,11 +5719,22 @@ def _compute_public_snapshot(
             continue
         if pid not in seen_posts:
             seen_posts[pid] = p
-    own_posts = [p for p in seen_posts.values() if p.get("author") == h]
+    own_posts = [
+        p
+        for p in seen_posts.values()
+        if str(p.get("author") or "").strip().lower() == h.lower()
+    ]
     # Honest Mine: include this citizen's rows omitted from /api/changes, tagged.
-    own_ids = {int(p["id"]) for p in own_posts if p.get("id") is not None}
+    own_ids: Set[int] = set()
+    for p in own_posts:
+        if p.get("id") is None:
+            continue
+        try:
+            own_ids.add(int(p["id"]))
+        except (TypeError, ValueError):
+            continue
     for p in gap.get("omitted_posts") or []:
-        if p.get("author") != h:
+        if str(p.get("author") or "").strip().lower() != h.lower():
             continue
         try:
             pid = int(p.get("id"))
@@ -5456,7 +5744,14 @@ def _compute_public_snapshot(
             continue
         own_posts.append(p)
         own_ids.add(pid)
-    own_comments = [c for c in (index.get("comments") or []) if c.get("author") == h]
+    _append_own_posts(
+        own_posts, own_ids, _recent_own_posts_from_new(client, h), h
+    )
+    own_comments = [
+        c
+        for c in (index.get("comments") or [])
+        if str(c.get("author") or "").strip().lower() == h.lower()
+    ]
     # Newest first for Mine tab.
     own_posts = sorted(own_posts, key=lambda p: int(p.get("created_at") or 0), reverse=True)
     own_comments = sorted(
@@ -5542,6 +5837,7 @@ def _compute_public_snapshot(
             )
     except Exception as e:  # pragma: no cover
         errors.append("inbox: {}".format(e))
+    inbox = merge_house_look_inbox(inbox, house_look)
 
     identity = {
         "handle": h,
@@ -6158,6 +6454,14 @@ def _front_post_count(snap: Optional[Dict[str, Any]]) -> int:
     return len(((snap.get("front") or {}).get("posts") or []))
 
 
+def _front_comment_count(snap: Optional[Dict[str, Any]]) -> int:
+    if not snap:
+        return 0
+    return len(snap.get("front_comments") or []) + len(
+        snap.get("front_comments_top") or []
+    )
+
+
 def _store_front_snapshot(
     snap: Dict[str, Any], *, filtered: bool, fkey: str
 ) -> None:
@@ -6176,6 +6480,14 @@ def _store_front_snapshot(
             else:
                 _FRONT_SNAP_CACHE["fetched_at"] = now
             return
+        if (
+            prev
+            and _front_comment_count(snap) == 0
+            and _front_comment_count(prev) > 0
+        ):
+            snap = dict(snap)
+            snap["front_comments"] = list(prev.get("front_comments") or [])
+            snap["front_comments_top"] = list(prev.get("front_comments_top") or [])
         if filtered:
             _FRONT_FILTER_CACHE[fkey] = {"fetched_at": now, "snap": snap}
         else:
@@ -6229,6 +6541,7 @@ def _compute_front_snapshot(
         ("tags", lambda: client.tags() or {}),
         ("events", lambda: client.events() or {}),
         ("stats", lambda: build_stats_snapshot(client)),
+        ("changes_tip", lambda: _fetch_changes_tip(client, max_pages=2)),
     )
     with ThreadPoolExecutor(max_workers=4) as pool:
         futs = [pool.submit(_fetch, label, fn) for label, fn in jobs]
@@ -6253,6 +6566,14 @@ def _compute_front_snapshot(
     for err in stats_snap.get("errors") or []:
         if err not in errors:
             errors.append(err)
+    tip_posts: List[Dict[str, Any]] = []
+    tip_comments: List[Dict[str, Any]] = []
+    tip = bucket.get("changes_tip")
+    if isinstance(tip, (tuple, list)) and len(tip) == 2:
+        tip_posts = list(tip[0] or [])
+        tip_comments = list(tip[1] or [])
+    if tip_posts or tip_comments:
+        _ingest_changes_rows(tip_posts, tip_comments)
 
     front_comments: List[Dict[str, Any]] = []
     front_comments_top: List[Dict[str, Any]] = []
@@ -6315,28 +6636,30 @@ def _compute_front_snapshot(
     front_comments_top = _enrich_rows_flags(
         front_comments_top, flags_index, target_type="comment"
     )
-    if not filtered:
-        _ensure_changes_index_async(client)
-        index = _peek_changes_index() or {}
-        source_comments = merge_rows_by_id(
-            list(index.get("comments") or []),
-            list(extra.get("comments_new") or []),
-        )
-        source_posts = merge_rows_by_id(
-            list(index.get("posts") or []), thread_posts
-        )
-        if source_comments:
-            try:
-                front_comments = _front_comments_feed(
-                    source_comments,
-                    source_posts,
-                    moderation,
-                    vote_map=vote_map,
-                )
-            except Exception as e:  # pragma: no cover
-                errors.append("front_comments: {}".format(e))
-        if not front_comments:
-            front_comments = list(extra.get("comments_new") or [])
+    _ensure_changes_index_async(client)
+    index = _peek_changes_index() or {}
+    source_comments = merge_rows_by_id(
+        merge_rows_by_id(list(index.get("comments") or []), tip_comments),
+        list(extra.get("comments_new") or []),
+    )
+    source_posts = merge_rows_by_id(
+        merge_rows_by_id(list(index.get("posts") or []), tip_posts),
+        thread_posts,
+    )
+    if source_comments:
+        try:
+            front_comments = _front_comments_feed(
+                source_comments,
+                source_posts,
+                moderation,
+                vote_map=vote_map,
+            )
+        except Exception as e:  # pragma: no cover
+            errors.append("front_comments: {}".format(e))
+    if not front_comments:
+        front_comments = list(extra.get("comments_new") or [])
+    if not front_comments:
+        front_comments = list(front_comments_top)
     front_comments = _enrich_rows_flags(
         front_comments, flags_index, target_type="comment"
     )
@@ -8827,7 +9150,7 @@ def make_handler(
                 raw_handles = (qs.get("handles") or [""])[0] or ""
                 handles = [h.strip() for h in raw_handles.split(",") if h.strip()]
                 try:
-                    payload = build_watchlist_inbox(client, handles)
+                    payload = build_watchlist_inbox(client, handles, store=store)
                     raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
                     self._send(200, raw, "application/json; charset=utf-8")
                 except Exception as e:  # pragma: no cover
