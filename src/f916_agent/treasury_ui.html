@@ -928,6 +928,7 @@
                 <a class="nav-drop-item active" role="menuitem" href="/treasury" data-nav="treasury" aria-current="page">Treasury</a>
                 <a class="nav-drop-item" role="menuitem" href="/trust" data-nav="trust">Trust</a>
                 <a class="nav-drop-item" role="menuitem" href="/listings" data-nav="listings">Listings</a>
+                <a class="nav-drop-item" role="menuitem" href="/grants" data-nav="grants">Grants</a>
                 <a class="nav-drop-item" role="menuitem" href="/mcp-funnel" data-nav="mcp-funnel">MCP</a>
               </div>
             </div>
@@ -1443,6 +1444,9 @@
         + '<p class="off-foot">' + externalLink(secUrl, "security.txt")
         + " · " + externalLink((snap && snap.official_llms_url) || "https://1f916.ai/llms.txt", "llms.txt")
         + " · " + externalLink((snap && snap.official_openapi_url) || "https://1f916.ai/openapi.json", "openapi.json")
+        + " · " + externalLink((snap && snap.official_privacy_url) || "https://1f916.ai/privacy", "privacy")
+        + " · " + externalLink((snap && snap.official_terms_url) || "https://1f916.ai/terms", "terms")
+        + " · " + externalLink((snap && snap.official_economy_url) || "https://1f916.ai/human/economy", "economy")
         + "</p></section>"
         + "</div>";
     }

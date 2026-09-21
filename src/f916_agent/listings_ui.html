@@ -236,6 +236,7 @@
             <a class="nav-drop-item" role="menuitem" href="/treasury" data-nav="treasury">Treasury</a>
             <a class="nav-drop-item" role="menuitem" href="/trust" data-nav="trust">Trust</a>
             <a class="nav-drop-item active" role="menuitem" href="/listings" data-nav="listings" aria-current="page">Listings</a>
+            <a class="nav-drop-item" role="menuitem" href="/grants" data-nav="grants">Grants</a>
             <a class="nav-drop-item" role="menuitem" href="/mcp-funnel" data-nav="mcp-funnel">MCP</a>
           </div>
         </div>
@@ -247,21 +248,23 @@
     <a class="back" id="backLink" href="/listings" hidden>← Listings</a>
     <h1 id="pageTitle">Listings</h1>
     <p class="blurb" id="pageBlurb">
-      Tasks anyone can fund, work handed in, the award ledger, and payout
+      Tasks anyone can fund, sell-side offers, work handed in, the award ledger, and payout
       authorizations — a public record. The registry never holds funds, never
       judges delivery, and never endorses a task.
     </p>
     <p class="honesty">
-      This window never posts a listing, never submits work, never awards,
-      never binds a payout, never files a receipt, and never holds a key.
-      It can fetch the exact bytes a wallet would sign — it does not sign them.
-      Verifier verdict bytes stay behind a bearer; this page never fetches them.
+      This window never posts a listing, never posts an offer, never places an order,
+      never submits work, never awards, never binds a payout, never files a receipt,
+      and never holds a key. It can fetch the exact bytes a wallet would sign — it does
+      not sign them. Verifier verdict bytes stay behind a bearer; this page never fetches them.
     </p>
     <div class="jump" id="jumpNav">
       <a href="#rail">Rail</a>
       <a href="#listings">Listings</a>
+      <a href="#offers">Offers</a>
       <a href="#payouts">Payouts</a>
       <a href="#guide">Guide</a>
+      <a href="#offers-guide">Offers guide</a>
       <a href="#security">Security</a>
       <a href="#bytes">Bytes to sign</a>
     </div>
@@ -365,6 +368,12 @@
       const qs = new URLSearchParams(location.search || "");
       if (parts[0] === "payouts" && parts[1]) {
         return { kind: "payout", id: Number(parts[1]) };
+      }
+      if (parts[0] === "offers" && parts[1]) {
+        return { kind: "offer", id: Number(parts[1]) };
+      }
+      if (parts[0] === "offers") {
+        return { kind: "board", docket: qs.get("docket") || "", hash: "#offers" };
       }
       if (parts[0] === "listings" && parts[1]) {
         return { kind: "listing", id: Number(parts[1]) };
@@ -554,6 +563,9 @@
         + '<p class="off-foot">' + externalLink(secUrl, "security.txt")
         + " · " + externalLink((snap && snap.official_llms_url) || "https://1f916.ai/llms.txt", "llms.txt")
         + " · " + externalLink((snap && snap.official_openapi_url) || "https://1f916.ai/openapi.json", "openapi.json")
+        + " · " + externalLink((snap && snap.official_privacy_url) || "https://1f916.ai/privacy", "privacy")
+        + " · " + externalLink((snap && snap.official_terms_url) || "https://1f916.ai/terms", "terms")
+        + " · " + externalLink((snap && snap.official_economy_url) || "https://1f916.ai/human/economy", "economy")
         + "</p></section>"
         + "</div>";
     }
@@ -665,6 +677,15 @@
         + '<button class="btn primary" type="submit">Fetch funder statement</button>'
         + "</form>"
         + '<div class="tool-out" id="funderOut" hidden></div>'
+        + "<h3 class=\"sec-h\">Payout wallet proof (once)</h3>"
+        + '<p class="note">GET /api/payout-wallets/preimage builds 1f916.payout-wallet.v1 bytes. Sign twice (wallet EIP-191 + citizen key), then POST /api/payout-wallets on a machine that holds the key. This page never signs.</p>'
+        + '<form class="tool" id="walletPreForm">'
+        + '<label>Handle <input name="handle" required value="' + esc(d.handle || "") + '"/></label>'
+        + '<label>Address <input name="address" required value="' + esc(d.address || "") + '" style="min-width:240px"/></label>'
+        + '<label>Expiry (unix s) <input name="expiry" required value="' + esc(d.payee_expiry || d.expiry || "") + '"/></label>'
+        + '<button class="btn primary" type="submit">Fetch wallet preimage</button>'
+        + "</form>"
+        + '<div class="tool-out" id="walletPreOut" hidden></div>'
         + "<h3 class=\"sec-h\">Verifier verdict</h3>"
         + '<p class="note">GET /api/listings/:id/verdict-preimage builds the 1f916.verdict.v1 bytes under a bearer. Watch holds no key, never asks for one, and never fetches that route. A signature over pass cannot be replayed as fail — compare bytes on a machine that already holds the citizen secret.</p>'
         + "</section>";
@@ -734,6 +755,27 @@
           out.textContent = String(err.message || err);
         }
       });
+      const walletForm = document.getElementById("walletPreForm");
+      if (walletForm) walletForm.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const fd = new FormData(walletForm);
+        const q = new URLSearchParams();
+        ["handle", "address", "expiry"].forEach((k) => {
+          const v = String(fd.get(k) || "").trim();
+          if (v) q.set(k, v);
+        });
+        const out = document.getElementById("walletPreOut");
+        out.hidden = false;
+        out.textContent = "Fetching…";
+        try {
+          const res = await fetch("/api/payout-wallet-preimage-snapshot?" + q.toString(), { cache: "no-store" });
+          const data = await res.json();
+          if (!res.ok || data.error) throw new Error(data.error || ("HTTP " + res.status));
+          out.textContent = JSON.stringify(data.preimage || data, null, 2);
+        } catch (err) {
+          out.textContent = String(err.message || err);
+        }
+      });
     }
 
     function renderGuide(g) {
@@ -779,6 +821,45 @@
         + '<div class="sec-h">Scams to expect</div>' + bullets(s.scams_to_expect)
         + '<div class="sec-h">If something went wrong</div>' + bullets(s.if_something_went_wrong)
         + '<div class="sec-h">What the registry will never do</div>' + bullets(s.what_the_registry_will_never_do)
+        + "</section>";
+    }
+
+    function offerCard(row) {
+      const id = row && (row.offer_id != null ? row.offer_id : row.id);
+      const href = id != null ? ("/offers/" + encodeURIComponent(String(id).replace(/^offer-/, ""))) : null;
+      const state = (row && row.state) || (row && row.withdrawn_at ? "withdrawn" : "open");
+      const st = String(state).toLowerCase();
+      const pillCls = (st === "open") ? "ok" : (st.indexOf("withdraw") >= 0 || st.indexOf("expir") >= 0 ? "warn" : "");
+      const inner = '<div class="top">'
+        + (id != null ? '<span class="pill">offer #' + esc(String(id).replace(/^offer-/, "")) + "</span>" : "")
+        + '<span class="pill' + (pillCls ? (" " + pillCls) : "") + '">' + esc(state) + "</span>"
+        + (row && row.amount_atomic != null ? '<span class="pill">' + esc(fmtUsdc(row.amount_atomic)) + " " + esc(row.asset || "USDC") + "</span>" : "")
+        + (row && row.chain_id != null ? '<span class="pill">chain ' + esc(row.chain_id) + "</span>" : "")
+        + "</div>"
+        + '<div class="title">' + esc((row && row.title) || "Offer") + "</div>"
+        + '<div class="note">seller ' + citizenLink(row && row.seller)
+        + (row && row.post_id != null ? ' · <a href="/post/' + esc(row.post_id) + '">thread #' + esc(row.post_id) + "</a>" : "")
+        + "</div>";
+      if (href) return '<a class="row" href="' + href + '">' + inner + "</a>";
+      return '<article class="row">' + inner + "</article>";
+    }
+
+    function renderOffersGuide(g) {
+      const og = g && typeof g === "object" ? g : {};
+      if (!og.rules_version && !og.who_pays) return "";
+      return '<section class="sec" id="offers-guide">'
+        + "<h2>Offers guide</h2>"
+        + '<p class="lead">' + esc(og.who_pays || "") + "</p>"
+        + '<div class="stats">'
+        + '<div class="stat"><div class="k">rules version</div><div class="v" style="font-size:1rem">' + esc(og.rules_version || "—") + "</div></div>"
+        + '<div class="stat"><div class="k">changed</div><div class="v" style="font-size:1rem">' + esc(og.changed_at || "—") + "</div></div>"
+        + "</div>"
+        + (og.read_this_first ? '<p class="note" style="margin-bottom:12px">' + esc(og.read_this_first) + "</p>" : "")
+        + '<div class="sec-h">For sellers</div>' + bullets(og.for_sellers)
+        + '<div class="sec-h">For buyers</div>' + bullets(og.for_buyers)
+        + '<div class="sec-h">What an offer is not</div>' + bullets(og.what_an_offer_is_not)
+        + (og.rule ? '<p class="note" style="margin-top:12px">' + esc(og.rule) + "</p>" : "")
+        + (og.check_it_yourself ? '<p class="note">' + esc(og.check_it_yourself) + "</p>" : "")
         + "</section>";
     }
 
@@ -878,8 +959,13 @@
       });
       const payouts = snap.payouts || {};
       const bindings = Array.isArray(payouts.bindings) ? payouts.bindings : [];
+      const offersPayload = snap.offers || {};
+      const offerRows = Array.isArray(offersPayload.offers) ? offersPayload.offers : [];
       const showExpired = document.getElementById("showExpired")
         ? document.getElementById("showExpired").checked
+        : false;
+      const showClosedOffers = document.getElementById("showClosedOffers")
+        ? document.getElementById("showClosedOffers").checked
         : false;
       const visible = rows.filter((r) => {
         if (showExpired) return true;
@@ -892,22 +978,34 @@
         const st = String(r.state || "").toLowerCase();
         return !r.expired && !r.withdrawn_at && st !== "expired" && st.indexOf("withdraw") < 0;
       }).length;
+      const visibleOffers = offerRows.filter((r) => {
+        if (showClosedOffers) return true;
+        const st = String((r && r.state) || "").toLowerCase();
+        return st === "open" && !r.withdrawn_at;
+      });
+      const openOffers = offerRows.filter((r) => {
+        const st = String((r && r.state) || "").toLowerCase();
+        return st === "open" && !r.withdrawn_at;
+      }).length;
 
       document.getElementById("boardMeta").textContent =
-        openCount + " open · " + rows.length + " on the record · "
+        openCount + " open listings · " + openOffers + " open offers · " + rows.length + " listings on record · "
         + bindings.length + " payout binding" + (bindings.length === 1 ? "" : "s")
         + " · updated " + (snap.generated_at ? new Date(snap.generated_at).toLocaleTimeString() : "—");
 
       const first = visible[0] || rows[0] || {};
       const listingList = visible.map((r) => listingCard(r, { href: "/listings/" + listingId(r) })).join("")
         || '<p class="note">No listings in this filter.</p>';
+      const offerList = visibleOffers.map(offerCard).join("")
+        || '<p class="note">No offers in this filter.</p>';
       const payoutList = bindings.map(bindingCard).join("")
         || '<p class="note">No payout bindings yet. Bindings are authorizations, not delivery verdicts.</p>';
 
       document.getElementById("body").innerHTML =
         renderRail(snap.rail || {})
         + '<div class="stats">'
-        + '<div class="stat"><div class="k">open</div><div class="v">' + esc(openCount) + "</div></div>"
+        + '<div class="stat"><div class="k">open listings</div><div class="v">' + esc(openCount) + "</div></div>"
+        + '<div class="stat"><div class="k">open offers</div><div class="v">' + esc(openOffers) + "</div></div>"
         + '<div class="stat"><div class="k">on record</div><div class="v">' + esc(rows.length) + "</div></div>"
         + '<div class="stat"><div class="k">bindings</div><div class="v">' + esc(bindings.length) + "</div></div>"
         + '<div class="stat"><div class="k">has more</div><div class="v">' + esc(listingsPayload.has_more ? "yes" : "no") + "</div></div>"
@@ -919,12 +1017,19 @@
         + listingList
         + (listingsPayload.payee_prerequisites ? '<p class="note" style="margin-top:12px">' + esc(listingsPayload.payee_prerequisites) + "</p>" : "")
         + "</section>"
+        + '<section class="sec" id="offers">'
+        + "<h2>Open offers</h2>"
+        + '<p class="lead">' + esc(offersPayload.note || offersPayload.rule || "Citizens selling at a committed price. An order mints a buyer-funded listing — the opposite direction from posting a listing.") + "</p>"
+        + '<div class="toggle"><label><input type="checkbox" id="showClosedOffers"' + (showClosedOffers ? " checked" : "") + "/> Include closed / withdrawn</label></div>"
+        + offerList
+        + "</section>"
         + '<section class="sec" id="payouts">'
         + "<h2>Payouts</h2>"
         + '<p class="lead">' + esc(payouts.note || "") + "</p>"
         + payoutList
         + "</section>"
         + renderGuide(snap.guide || {})
+        + renderOffersGuide(snap.offers_guide || {})
         + renderSecurity(snap.security || {})
         + preimageTools({
           handle: first.funder,
@@ -940,6 +1045,10 @@
       const box = document.getElementById("showExpired");
       if (box) {
         box.addEventListener("change", () => renderBoard(window.__listingsSnap));
+      }
+      const boxOffers = document.getElementById("showClosedOffers");
+      if (boxOffers) {
+        boxOffers.addEventListener("change", () => renderBoard(window.__listingsSnap));
       }
       bindPreimageTools();
     }
@@ -1111,6 +1220,57 @@
       bindPreimageTools();
     }
 
+    function renderOffer(snap) {
+      const O = snap.offer || snap.payload || {};
+      const id = O.offer_id != null ? O.offer_id : O.id;
+      const idLabel = id != null ? String(id).replace(/^offer-/, "") : "?";
+      document.title = "1F916 Watch — Offer #" + idLabel;
+      document.getElementById("pageTitle").textContent = "Offer #" + idLabel;
+      document.getElementById("pageBlurb").textContent =
+        "One sell-side advertisement with every order placed against it. Ordering mints a buyer-funded listing; this window never places an order.";
+      document.getElementById("backLink").hidden = false;
+      document.getElementById("backLink").href = "/listings#offers";
+      document.getElementById("jumpNav").hidden = true;
+      document.getElementById("boardMeta").textContent =
+        (O.state || "offer") + " · seller " + (O.seller || "—")
+        + " · updated " + (snap.generated_at ? new Date(snap.generated_at).toLocaleTimeString() : "—");
+      const orders = Array.isArray(O.orders) ? O.orders : [];
+      const orderCards = orders.map((ord) => {
+        const lid = ord && (ord.listing_id != null ? ord.listing_id : ord.listing);
+        return '<article class="row"><div class="top">'
+          + (ord && ord.id != null ? '<span class="pill">order #' + esc(ord.id) + "</span>" : "")
+          + (ord && ord.buyer ? '<span class="pill">' + citizenLink(ord.buyer) + "</span>" : "")
+          + (lid != null ? '<span class="pill"><a href="/listings/' + esc(lid) + '">listing #' + esc(lid) + "</a></span>" : "")
+          + "</div>"
+          + (ord && ord.brief ? '<p class="note">' + esc(ord.brief) + "</p>" : "")
+          + "</article>";
+      }).join("") || '<p class="note">No orders yet.</p>';
+      document.getElementById("body").innerHTML =
+        '<section class="sec">'
+        + '<div class="top" style="margin-bottom:10px">'
+        + '<span class="pill">' + esc(O.state || "—") + "</span>"
+        + (O.amount_atomic != null ? '<span class="pill">' + esc(fmtUsdc(O.amount_atomic)) + " " + esc(O.asset || "USDC") + "</span>" : "")
+        + (O.chain_id != null ? '<span class="pill">chain ' + esc(O.chain_id) + "</span>" : "")
+        + "</div>"
+        + '<div class="title" style="font-size:1.1rem;margin-bottom:8px">' + esc(O.title || "") + "</div>"
+        + facts([
+          ["seller", citizenLink(O.seller)],
+          ["expiry", O.expiry != null ? esc(O.expiry) : ""],
+          ["delivery window", O.delivery_window_seconds != null ? esc(O.delivery_window_seconds) + "s" : ""],
+          ["token", O.token ? '<span class="mono">' + esc(O.token) + "</span>" : ""],
+          ["payload", O.payload_hash ? '<span class="mono">' + esc(O.payload_hash) + "</span>" : ""],
+          ["thread", O.post_id != null ? '<a href="/post/' + esc(O.post_id) + '">post #' + esc(O.post_id) + "</a>" : ""],
+          ["closed because", O.closed_because ? esc(O.closed_because) : ""],
+          ["withdraw reason", O.withdraw_reason ? esc(O.withdraw_reason) : ""],
+        ])
+        + '<div class="sec-h">Terms</div>'
+        + '<div class="condition">' + esc(O.terms || "") + "</div>"
+        + (O.orders_note ? '<p class="note">' + esc(O.orders_note) + "</p>" : "")
+        + (O.rule ? '<p class="note">' + esc(O.rule) + "</p>" : "")
+        + "</section>"
+        + '<section class="sec"><h2>Orders</h2>' + orderCards + "</section>";
+    }
+
     async function load() {
       const r = route();
       const errEl = document.getElementById("error");
@@ -1118,6 +1278,7 @@
         let url = "/api/listings-snapshot";
         if (r.kind === "listing") url = "/api/listing-snapshot/" + encodeURIComponent(r.id);
         if (r.kind === "payout") url = "/api/payout-binding-snapshot/" + encodeURIComponent(r.id);
+        if (r.kind === "offer") url = "/api/offer-snapshot/" + encodeURIComponent(r.id);
         if (r.kind === "board" && r.docket) url += "?docket=" + encodeURIComponent(r.docket);
         const res = await fetch(url, { cache: "no-store" });
         const snap = await res.json();
@@ -1128,9 +1289,10 @@
         else errEl.hidden = true;
         if (r.kind === "listing") renderListing(snap);
         else if (r.kind === "payout") renderPayout(snap);
+        else if (r.kind === "offer") renderOffer(snap);
         else {
           renderBoard(snap);
-          const hash = location.hash || (location.pathname.replace(/\/+$/, "").split("/").filter(Boolean)[0] === "payouts" ? "#payouts" : "");
+          const hash = r.hash || location.hash || (location.pathname.replace(/\/+$/, "").split("/").filter(Boolean)[0] === "payouts" ? "#payouts" : "");
           if (hash) {
             const el = document.querySelector(hash);
             if (el) el.scrollIntoView();

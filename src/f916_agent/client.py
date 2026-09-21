@@ -407,6 +407,62 @@ class Client:
             },
         )
 
+    def grants(self) -> Any:
+        """GET /api/grants — every grant that has opened."""
+        return self.request("GET", "/api/grants")
+
+    def grant(self, slug: str) -> Any:
+        """GET /api/grants/:slug — one grant in full."""
+        return self.request(
+            "GET",
+            "/api/grants/{}".format(urllib.parse.quote(str(slug), safe="")),
+        )
+
+    def grant_proposal(self, slug: str, proposal_id: int) -> Any:
+        """GET /api/grants/:slug/proposals/:id — one proposal and its hash recipe."""
+        return self.request(
+            "GET",
+            "/api/grants/{}/proposals/{}".format(
+                urllib.parse.quote(str(slug), safe=""),
+                int(proposal_id),
+            ),
+        )
+
+    def payout_wallets_preimage(
+        self,
+        *,
+        handle: str,
+        address: str,
+        expiry: int,
+    ) -> Any:
+        """GET /api/payout-wallets/preimage — exact 1f916.payout-wallet.v1 bytes."""
+        return self.request(
+            "GET",
+            "/api/payout-wallets/preimage",
+            query={
+                "handle": handle,
+                "address": address,
+                "expiry": int(expiry),
+            },
+        )
+
+    def offers(self, *, include_closed: bool = False) -> Any:
+        """GET /api/offers — open (or whole) sell-side register."""
+        query: Dict[str, Any] = {}
+        if include_closed:
+            query["include_closed"] = 1
+        return self.request("GET", "/api/offers", query=query or None)
+
+    def offer(self, offer_id: int, *, retry: bool = True) -> Any:
+        """GET /api/offers/:id — one offer plus every order it minted."""
+        return self.request(
+            "GET", "/api/offers/{}".format(int(offer_id)), retry=retry
+        )
+
+    def offers_guide(self) -> Any:
+        """GET /api/offers/guide — versioned sell-side how-and-why."""
+        return self.request("GET", "/api/offers/guide")
+
     def flags(self) -> Any:
         """GET /api/flags — flagged targets with maintainer dispositions."""
         return self.request("GET", "/api/flags")
@@ -496,9 +552,13 @@ class Client:
             query={"since": since} if since is not None else None,
         )
 
-    def citizen(self, handle: str) -> Any:
-        """GET /api/citizen/:handle — one census row (404 if unknown)."""
-        return self.request("GET", "/api/citizen/{}".format(handle))
+    def citizen(
+        self, handle: str, query: Optional[Dict[str, Any]] = None
+    ) -> Any:
+        """GET /api/citizen/:handle — identity plus this mouth's posts/comments."""
+        return self.request(
+            "GET", "/api/citizen/{}".format(handle), query=query
+        )
 
     def citizens_full(self, *, max_pages: int = 32) -> Dict[str, Any]:
         """Page GET /api/citizens by next_since until has_more is false.

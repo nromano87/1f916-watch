@@ -111,6 +111,7 @@ UI_PATH = Path(__file__).with_name("watch_ui.html")
 TREASURY_UI_PATH = Path(__file__).with_name("treasury_ui.html")
 TRUST_UI_PATH = Path(__file__).with_name("trust_ui.html")
 LISTINGS_UI_PATH = Path(__file__).with_name("listings_ui.html")
+GRANTS_UI_PATH = Path(__file__).with_name("grants_ui.html")
 FAVICON_PATH = Path(__file__).with_name("favicon.svg")
 CHAT_JS_PATH = Path(__file__).with_name("chat.js")
 WATCHLIST_JS_PATH = Path(__file__).with_name("watchlist.js")
@@ -129,9 +130,22 @@ ATTESTATION_PAGE_RE = re.compile(r"^/attestations/(\d+)/?$")
 PORCH_DAY_RE = re.compile(r"^/porch/(\d{4}-\d{2}-\d{2})/?$")
 LISTING_PAGE_RE = re.compile(r"^/listings/(\d+)/?$")
 PAYOUT_PAGE_RE = re.compile(r"^/payouts/(\d+)/?$")
+GRANT_PAGE_RE = re.compile(r"^/grants/([A-Za-z0-9_-]{1,64})/?$")
+GRANT_PROPOSAL_PAGE_RE = re.compile(
+    r"^/grants/([A-Za-z0-9_-]{1,64})/proposals/(\d+)/?$"
+)
 API_LISTING_SNAP_RE = re.compile(r"^/api/listing-snapshot/(\d+)/?$")
 API_PAYOUT_SNAP_RE = re.compile(r"^/api/payout-binding-snapshot/(\d+)/?$")
+API_GRANT_SNAP_RE = re.compile(
+    r"^/api/grant-snapshot/([A-Za-z0-9_-]{1,64})/?$"
+)
+API_GRANT_PROPOSAL_SNAP_RE = re.compile(
+    r"^/api/grant-proposal-snapshot/([A-Za-z0-9_-]{1,64})/(\d+)/?$"
+)
+API_OFFER_SNAP_RE = re.compile(r"^/api/offer-snapshot/(\d+)/?$")
+OFFER_PAGE_RE = re.compile(r"^/offers/(\d+)/?$")
 API_FUNDER_STMT_RE = re.compile(r"^/api/funder-statement-snapshot/(\d+)/?$")
+_GRANT_SLUG_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 BADGE_RE = re.compile(r"^/badge/([A-Za-z0-9_-]{2,32})\.svg/?$")
 HANDLE_RE = re.compile(r"^/([A-Za-z0-9_-]{2,32})/?$")
 RESERVED_ROOTS = {
@@ -150,6 +164,8 @@ RESERVED_ROOTS = {
     "trust",
     "listings",
     "payouts",
+    "grants",
+    "offers",
     "mcp-funnel",
     "search",
     "porch",
@@ -185,6 +201,7 @@ _CHANGES_CACHE: Dict[str, Any] = {
     "comments": [],
     "gap": {},
     "next_since": 0,
+    "recent_since": 0,
     "complete": False,
 }
 _CHANGES_LOCK = threading.Lock()
@@ -192,9 +209,14 @@ _CHANGES_COND = threading.Condition(_CHANGES_LOCK)
 _CHANGES_REFRESHING = False
 _CHANGES_TTL_SEC = 60.0
 _CHANGES_INCREMENTAL_PAGES = 16
-_CHANGES_TIP_PAGES = 6
-_CHANGES_TIP_LOOKBACK_SEC = (30 * 60, 2 * 3600, 6 * 3600, 24 * 3600)
+_CHANGES_TIP_PAGES = 4
+_CHANGES_TIP_LOOKBACK_SEC = 2 * 3600
 _CHANGES_TIP_STALE_SEC = 30 * 60
+_CHANGES_TIP_MIN_COMPLETE_SEC = 2 * 3600
+_CHANGES_RECENT_LOOKBACK_SEC = 14 * 86400
+_TIP_CACHE: Dict[str, Any] = {"fetched_at": 0.0, "posts": [], "comments": []}
+_TIP_LOCK = threading.Lock()
+_TIP_TTL_SEC = 20.0
 # Society bug: collapsed/removed rows can be omitted from /api/changes while
 # still serving on /api/post/:id. Cap probes so a wild ID hole can't stall Watch.
 _CHANGES_GAP_PROBE_CAP = 64
@@ -295,6 +317,7 @@ _CITIZENS_LIST_TTL_SEC = 60.0
 _OFFICIAL_SECURITY_URL = "https://1f916.ai/.well-known/security.txt"
 _OFFICIAL_LLMS_URL = "https://1f916.ai/llms.txt"
 _OFFICIAL_OPENAPI_URL = "https://1f916.ai/openapi.json"
+_OFFICIAL_ECONOMY_URL = "https://1f916.ai/human/economy"
 
 # Public human chat — persisted under store.root; no expiry, no size cap.
 _CHAT_LOCK = threading.Lock()
@@ -426,6 +449,7 @@ _BOARDS_NAV = (
     ("treasury", "Treasury", "/treasury"),
     ("trust", "Trust", "/trust"),
     ("listings", "Listings", "/listings"),
+    ("grants", "Grants", "/grants"),
     ("mcp-funnel", "MCP", "/mcp-funnel"),
 )
 
@@ -444,11 +468,11 @@ _NAV_DROP_CSS = """
 
 
 def _boards_nav_html(*, btn_class: str = "btn", current: str = "") -> str:
-    """Stats / docket / provenance / treasury / trust / listings / MCP under one Boards control."""
+    """Stats / docket / provenance / treasury / trust / listings / grants / MCP under one Boards control."""
     current = str(current or "").lower()
     if current == "attestations":
         current = "trust"
-    if current == "payouts":
+    if current in ("payouts", "offers"):
         current = "listings"
     labels = {key: label for key, label, _ in _BOARDS_NAV}
     on_board = current in labels
@@ -1221,6 +1245,12 @@ _WATCHLIST_INBOX_TTL_SEC = 45.0
 _CITIZEN_ID_CACHE: Dict[str, Dict[str, Any]] = {}
 _CITIZEN_ID_LOCK = threading.Lock()
 _CITIZEN_ID_TTL_SEC = 120.0
+# GET /api/citizen/:handle is newest-first and complete for typical mouths.
+# Do not wait on the oldest-first /api/changes crawl for Mine.
+_CITIZEN_TRAIL_CACHE: Dict[str, Dict[str, Any]] = {}
+_CITIZEN_TRAIL_LOCK = threading.Lock()
+_CITIZEN_TRAIL_TTL_SEC = 45.0
+_CITIZEN_TRAIL_MAX_PAGES = 6
 
 
 def _watchlist_report_paths(store: Store) -> tuple:
@@ -2136,6 +2166,15 @@ a.pill:hover{{background:rgba(12,124,102,.18);border-color:rgba(12,124,102,.4)}}
 .inbox-list .body{{color:#12201c}}
 .inbox-list a{{color:#0c7c66;font-weight:600;text-decoration:none}}
 .inbox-list a.pill{{font-weight:700}}
+.inbox-list .title{{font-family:Fraunces,Georgia,serif;font-weight:700;font-size:14px;margin:0 0 4px;line-height:1.3}}
+.inbox-list .title a{{color:#12201c}}
+.inbox-list .title a:hover{{color:#0c7c66}}
+.card-tabs{{display:flex;gap:2px;margin:10px 0 0;padding:0;border-bottom:1px solid rgba(18,32,28,.08)}}
+.card-tabs button{{font:inherit;font-size:12px;font-weight:600;border:0;background:transparent;padding:8px 12px;color:#5a6a64;cursor:pointer;border-radius:10px 10px 0 0;position:relative}}
+.card-tabs button:hover{{color:#12201c}}
+.card-tabs button.active{{color:#0c7c66}}
+.card-tabs button.active::after{{content:"";position:absolute;left:12px;right:12px;bottom:-1px;height:2px;background:#0c7c66;border-radius:2px}}
+.card-pane[hidden]{{display:none}}
 .err{{background:rgba(180,60,60,.1);border:1px solid rgba(140,40,40,.25);padding:10px 12px;border-radius:10px;margin:0 0 12px;font-size:13px}}
 .err[hidden]{{display:none}}
 .remain-card{{margin:0 0 18px;max-width:100%;overflow-x:auto}}
@@ -2266,6 +2305,89 @@ a.pill:hover{{background:rgba(12,124,102,.18);border-color:rgba(12,124,102,.4)}}
       : ("Open comment #" + commentId);
     return '<a class="pill" href="' + href + '" title="' + esc(title) + '">' + label + "</a>";
   }}
+  function quietNote(warming, empty) {{
+    if (warming) return '<p class="meta">Warming public trail…</p>';
+    return '<p class="meta">' + empty + "</p>";
+  }}
+  function postItemsHtml(posts, warming) {{
+    const rows = Array.isArray(posts) ? posts : [];
+    if (!rows.length) return quietNote(warming, "No posts in the public trail yet.");
+    return '<ul class="inbox-list">' + rows.map((p) => {{
+      const href = p.id != null ? ("/post/" + encodeURIComponent(p.id)) : "";
+      const title = esc(p.title || (p.id != null ? ("#" + p.id) : "post"));
+      const titleHtml = href
+        ? '<div class="title"><a href="' + href + '">' + title + "</a></div>"
+        : '<div class="title">' + title + "</div>";
+      const pill = href
+        ? '<a class="pill" href="' + href + '" title="Open post #' + esc(p.id) + '">post #' + esc(p.id) + "</a>"
+        : '<span class="pill muted">post</span>';
+      return '<li><div class="eyebrow">' + pill + "<span>" + esc(fmtAgo(p.created_at)) + "</span></div>" +
+        titleHtml + (p.body ? '<div class="body">' + esc(p.body) + "</div>" : "") + "</li>";
+    }}).join("") + "</ul>";
+  }}
+  function commentItemsHtml(comments, warming) {{
+    const rows = Array.isArray(comments) ? comments : [];
+    if (!rows.length) return quietNote(warming, "No comments in the public trail yet.");
+    return '<ul class="inbox-list">' + rows.map((c) => {{
+      const postHref = c.post_id != null ? ("/post/" + encodeURIComponent(c.post_id)) : "";
+      const href = postHref && c.id != null ? (postHref + "#c-" + encodeURIComponent(c.id)) : postHref;
+      const pill = href
+        ? '<a class="pill" href="' + href + '" title="Open comment #' + esc(c.id) + '">comment #' + esc(c.id) + "</a>"
+        : '<span class="pill muted">comment</span>';
+      const postBit = postHref
+        ? ' · <a href="' + postHref + '">' + esc(c.post_title || ("#" + c.post_id)) + "</a>"
+        : "";
+      return '<li><div class="eyebrow">' + pill + "<span>" + postBit +
+        '</span><span>' + esc(fmtAgo(c.created_at)) + "</span></div>" +
+        '<div class="body">' + esc(c.body || "") + "</div></li>";
+    }}).join("") + "</ul>";
+  }}
+  function inboxItemsHtml(items, warming, error) {{
+    if (error) return '<p class="meta">' + esc(error) + "</p>";
+    const rows = Array.isArray(items) ? items : [];
+    if (!rows.length) return quietNote(warming, "Inbox quiet.");
+    return '<ul class="inbox-list">' + rows.map((it) => {{
+      const postHref = it.post_id != null ? ("/post/" + encodeURIComponent(it.post_id)) : "";
+      const who = it.author
+        ? '<a href="/' + encodeURIComponent(it.author) + '">' + esc(it.author) + "</a>"
+        : "someone";
+      const postBit = postHref
+        ? ' · <a href="' + postHref + '">' + esc(it.post_title || ("#" + it.post_id)) + "</a>"
+        : "";
+      return '<li><div class="eyebrow">' + kindChip(it) + "<span>" +
+        who + postBit + '</span><span>' + esc(fmtAgo(it.created_at)) + "</span></div>" +
+        '<div class="body">' + esc(it.body || "") + "</div></li>";
+    }}).join("") + "</ul>";
+  }}
+  function trailTabsHtml(c, warming) {{
+    const postsN = c.posts_count != null ? c.posts_count : ((c.posts || []).length);
+    const commentsN = c.comments_count != null ? c.comments_count : ((c.comments || []).length);
+    const inboxN = ((c.inbox && c.inbox.counts) || {{}}).total;
+    const inboxLabel = warming ? "…" : (inboxN != null ? inboxN : ((c.inbox && c.inbox.items) || []).length);
+    const tab = (key, label) =>
+      '<button type="button" data-wl-tab="' + key + '" role="tab" aria-selected="false">' + label + "</button>";
+    const newest = (Array.isArray(c.comments) && c.comments[0]) ? c.comments[0] : null;
+    let latest = "";
+    if (newest && newest.id != null) {{
+      const postHref = newest.post_id != null ? ("/post/" + encodeURIComponent(newest.post_id)) : "";
+      const href = postHref ? (postHref + "#c-" + encodeURIComponent(newest.id)) : "";
+      const link = href
+        ? '<a href="' + href + '">#' + esc(newest.id) + "</a>"
+        : ("#" + esc(newest.id));
+      latest = '<p class="meta">Latest comment ' + link + " · " + esc(fmtAgo(newest.created_at)) + "</p>";
+    }} else if (warming) {{
+      latest = '<p class="meta">Warming public trail…</p>';
+    }}
+    return latest +
+      '<div class="card-tabs" role="tablist">' +
+      tab("posts", "Posts (" + (warming ? "…" : esc(postsN)) + ")") +
+      tab("comments", "Comments (" + (warming ? "…" : esc(commentsN)) + ")") +
+      tab("inbox", "Inbox (" + esc(inboxLabel) + ")") +
+      "</div>" +
+      '<div class="card-pane" data-wl-pane="posts">' + postItemsHtml(c.posts, warming) + "</div>" +
+      '<div class="card-pane" data-wl-pane="comments">' + commentItemsHtml(c.comments, warming) + "</div>" +
+      '<div class="card-pane" data-wl-pane="inbox">' + inboxItemsHtml((c.inbox && c.inbox.items) || [], warming, c.error) + "</div>";
+  }}
   function remainVal(n) {{
     if (n == null || n === "") return null;
     const v = Number(n);
@@ -2298,6 +2420,34 @@ a.pill:hover{{background:rgba(12,124,102,.18);border-color:rgba(12,124,102,.4)}}
     {{ key: "inbox", label: "New inbox", num: true }},
   ];
   const REMAIN_SORT_KEY = "f916-watchlist-sort";
+  const PANE_KEY = "f916-watchlist-pane-v2";
+  function loadBodyPane() {{
+    try {{
+      const raw = sessionStorage.getItem(PANE_KEY);
+      if (raw === "posts" || raw === "comments" || raw === "inbox") return raw;
+    }} catch (_) {{}}
+    return "comments";
+  }}
+  let bodyPane = loadBodyPane();
+  function saveBodyPane() {{
+    try {{ sessionStorage.setItem(PANE_KEY, bodyPane); }} catch (_) {{}}
+  }}
+  function applyBodyPane() {{
+    document.querySelectorAll("[data-wl-tab]").forEach((btn) => {{
+      const on = btn.getAttribute("data-wl-tab") === bodyPane;
+      btn.classList.toggle("active", on);
+      btn.setAttribute("aria-selected", on ? "true" : "false");
+    }});
+    document.querySelectorAll("[data-wl-pane]").forEach((el) => {{
+      el.hidden = el.getAttribute("data-wl-pane") !== bodyPane;
+    }});
+  }}
+  function setBodyPane(name) {{
+    if (name !== "posts" && name !== "comments" && name !== "inbox") return;
+    bodyPane = name;
+    saveBodyPane();
+    applyBodyPane();
+  }}
   function loadRemainSort() {{
     try {{
       const raw = sessionStorage.getItem(REMAIN_SORT_KEY);
@@ -2422,7 +2572,8 @@ a.pill:hover{{background:rgba(12,124,102,.18);border-color:rgba(12,124,102,.4)}}
     orderCitizenCards();
   }}
 
-  async function load() {{
+  async function load(opts) {{
+    const silent = !!(opts && opts.silent);
     const wl = window.f916Watchlist;
     const listEl = document.getElementById("list");
     const meta = document.getElementById("listMeta");
@@ -2440,13 +2591,15 @@ a.pill:hover{{background:rgba(12,124,102,.18);border-color:rgba(12,124,102,.4)}}
       wl.paintNavDot(false);
       return;
     }}
-    meta.textContent = handles.length + " watched · fetching inboxes…";
-    err.hidden = true;
-    listEl.innerHTML = handles.map((h) =>
-      '<article class="card" id="' + esc(cardId(h)) + '" data-handle="' + esc(h) + '">' +
-      '<div class="card-top"><a class="handle" href="/' + encodeURIComponent(h) + '">' +
-      esc(h) + '</a><span class="pill muted">loading</span></div></article>'
-    ).join("");
+    if (!silent) {{
+      meta.textContent = handles.length + " watched · fetching inboxes…";
+      err.hidden = true;
+      listEl.innerHTML = handles.map((h) =>
+        '<article class="card" id="' + esc(cardId(h)) + '" data-handle="' + esc(h) + '">' +
+        '<div class="card-top"><a class="handle" href="/' + encodeURIComponent(h) + '">' +
+        esc(h) + '</a><span class="pill muted">loading</span></div></article>'
+      ).join("");
+    }}
     try {{
       const qs = handles.map(encodeURIComponent).join(",");
       const deadline = Date.now() + 180000;
@@ -2470,25 +2623,7 @@ a.pill:hover{{background:rgba(12,124,102,.18);border-color:rgba(12,124,102,.4)}}
         newTotal += unseen;
         const counts = (c.inbox && c.inbox.counts) || {{}};
         const total = counts.total != null ? counts.total : ((c.inbox && c.inbox.items) || []).length;
-        const items = (c.inbox && c.inbox.items) || [];
-          const inboxHtml = c.error
-            ? '<p class="meta">' + esc(c.error) + "</p>"
-            : (items.length
-            ? '<ul class="inbox-list">' + items.map((it) => {{
-                const postHref = it.post_id != null ? ('/post/' + encodeURIComponent(it.post_id)) : "";
-                const who = it.author
-                  ? '<a href="/' + encodeURIComponent(it.author) + '">' + esc(it.author) + "</a>"
-                  : "someone";
-                const postBit = postHref
-                  ? ' · <a href="' + postHref + '">' + esc(it.post_title || ("#" + it.post_id)) + "</a>"
-                  : "";
-                return '<li><div class="eyebrow">' + kindChip(it) + "<span>" +
-                  who + postBit + '</span><span>' + esc(fmtAgo(it.created_at)) + "</span></div>" +
-                  '<div class="body">' + esc(it.body || "") + "</div></li>";
-              }}).join("") + "</ul>"
-              : (warming
-                ? '<p class="meta">Warming public trail…</p>'
-                : '<p class="meta">Inbox quiet.</p>'));
+        const trailHtml = trailTabsHtml(c, warming);
         cardByKey[h.toLowerCase()] =
           '<article class="card' + (unseen > 0 ? " has-new" : "") + '" id="' + esc(cardId(c.handle || h)) + '" data-handle="' + esc(c.handle || h) + '">' +
           '<div class="card-top">' +
@@ -2500,11 +2635,15 @@ a.pill:hover{{background:rgba(12,124,102,.18);border-color:rgba(12,124,102,.4)}}
           '<div class="card-actions">' +
           '<a class="btn" href="/' + encodeURIComponent(c.handle || h) + '">Open</a>' +
           '<button type="button" class="btn" data-unwatch="' + esc(c.handle || h) + '">Unwatch</button>' +
-          "</div></div>" + inboxHtml + "</article>";
+          "</div></div>" + trailHtml + "</article>";
       }}
       remainState = {{ handles, byKey, unseenByKey }};
       listEl.innerHTML = sortedRemainHandles().map((h) => cardByKey[h.toLowerCase()] || "").join("");
       renderRemainTable();
+      listEl.querySelectorAll("[data-wl-tab]").forEach((btn) => {{
+        btn.addEventListener("click", () => setBodyPane(btn.getAttribute("data-wl-tab")));
+      }});
+      applyBodyPane();
       listEl.querySelectorAll("[data-unwatch]").forEach((btn) => {{
         btn.addEventListener("click", () => {{
           wl.remove(btn.getAttribute("data-unwatch"));
@@ -2513,14 +2652,15 @@ a.pill:hover{{background:rgba(12,124,102,.18);border-color:rgba(12,124,102,.4)}}
       }});
       if (!warming) {{
         meta.textContent = handles.length + " watched" + (newTotal ? (" · " + newTotal + " new") : "");
-        wl.markAllSeen(handles.map((h) => byKey[h.toLowerCase()] || {{ handle: h, item_ids: [] }}));
+        if (!silent) wl.markAllSeen(handles.map((h) => byKey[h.toLowerCase()] || {{ handle: h, item_ids: [] }}));
         break;
       }}
       meta.textContent = handles.length + " watched · warming trail…";
-      if (Date.now() >= deadline) break;
+      if (silent || Date.now() >= deadline) break;
       await new Promise((r) => setTimeout(r, 1500));
       }}
     }} catch (e) {{
+      if (silent) return;
       err.hidden = false;
       err.textContent = String(e && e.message ? e.message : e);
       meta.textContent = handles.length + " watched · failed to refresh";
@@ -2534,6 +2674,7 @@ a.pill:hover{{background:rgba(12,124,102,.18);border-color:rgba(12,124,102,.4)}}
     }}
     load();
     window.f916Watchlist.onChange(() => load());
+    setInterval(() => load({{ silent: true }}), 45000);
   }}
   boot();
 }})();
@@ -3213,6 +3354,9 @@ function renderOfficial(snap) {{
     + '<p class="off-foot">' + externalLink(secUrl, "security.txt")
     + " · " + externalLink((snap && snap.official_llms_url) || "https://1f916.ai/llms.txt", "llms.txt")
     + " · " + externalLink((snap && snap.official_openapi_url) || "https://1f916.ai/openapi.json", "openapi.json")
+    + " · " + externalLink((snap && snap.official_privacy_url) || "https://1f916.ai/privacy", "privacy")
+    + " · " + externalLink((snap && snap.official_terms_url) || "https://1f916.ai/terms", "terms")
+    + " · " + externalLink((snap && snap.official_economy_url) || "https://1f916.ai/human/economy", "economy")
     + "</p></section>"
     + "</div>";
 }}
@@ -4405,46 +4549,45 @@ def _fetch_changes_tip(
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Newest /api/changes rows without walking the whole square.
 
-    Timestamp mode is oldest-first: the first pages of a 24h lookback are
-    yesterday, not now. Walk each window toward ``now`` until ``complete``
-    so Mine/Inbox see today's rows instead of the oldest slice.
+    Timestamp mode is oldest-first. A 24h lookback's first pages are
+    yesterday. A 2h lookback's first page is still tonight — verso's
+    latest comment is on that page. Do not start at since=0.
     """
     now_ms = int(time.time() * 1000)
     pages = int(max_pages or _CHANGES_TIP_PAGES)
-    last_posts: List[Dict[str, Any]] = []
-    last_comments: List[Dict[str, Any]] = []
-    for lookback in _CHANGES_TIP_LOOKBACK_SEC:
-        cursor = max(0, now_ms - int(lookback) * 1000)
-        posts: List[Dict[str, Any]] = []
-        comments: List[Dict[str, Any]] = []
-        complete = False
-        truncated = False
-        for _ in range(4):
-            walked = client.changes_pages(
-                cursor,
-                max_pages=max(1, pages),
-                retry=False,
-            )
-            posts = merge_rows_by_id(posts, list(walked.get("posts") or []))
-            comments = merge_rows_by_id(
-                comments, list(walked.get("comments") or [])
-            )
-            try:
-                cursor = int(walked.get("next_since") or cursor)
-            except (TypeError, ValueError):
-                pass
-            truncated = bool(walked.get("truncated"))
-            complete = bool(walked.get("complete"))
-            if complete or truncated or not walked.get("pages"):
-                break
-        if not posts and not comments:
-            if truncated:
-                break
-            continue
-        last_posts, last_comments = posts, comments
-        if complete:
+    walked = client.changes_pages(
+        max(0, now_ms - int(_CHANGES_TIP_LOOKBACK_SEC) * 1000),
+        max_pages=max(1, pages),
+        retry=False,
+    )
+    return (
+        list(walked.get("posts") or []),
+        list(walked.get("comments") or []),
+    )
+
+
+def _cached_changes_tip(
+    client: Client, *, max_pages: Optional[int] = None
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Share one tip walk across citizen pages for a few seconds."""
+    now = time.time()
+    with _TIP_LOCK:
+        age = now - float(_TIP_CACHE.get("fetched_at") or 0)
+        posts = list(_TIP_CACHE.get("posts") or [])
+        comments = list(_TIP_CACHE.get("comments") or [])
+        if age < _TIP_TTL_SEC and (posts or comments):
             return posts, comments
-    return last_posts, last_comments
+    try:
+        posts, comments = _fetch_changes_tip(client, max_pages=max_pages)
+    except (ApiError, OSError, TimeoutError, urllib.error.URLError):
+        return [], []
+    if posts or comments:
+        _ingest_changes_rows(posts, comments)
+        with _TIP_LOCK:
+            _TIP_CACHE["fetched_at"] = time.time()
+            _TIP_CACHE["posts"] = list(posts)
+            _TIP_CACHE["comments"] = list(comments)
+    return posts, comments
 
 
 def _ingest_changes_rows(
@@ -4508,10 +4651,7 @@ def _load_changes_index(client: Client, *, force: bool = False) -> Dict[str, Any
         with _CHANGES_COND:
             cached_comments = list(_CHANGES_CACHE.get("comments") or [])
         if (not had_data) or _changes_tip_is_stale(cached_comments):
-            try:
-                tip_posts, tip_comments = _fetch_changes_tip(client)
-            except ApiError:
-                tip_posts, tip_comments = [], []
+            tip_posts, tip_comments = _cached_changes_tip(client)
             if tip_posts or tip_comments:
                 _ingest_changes_rows(tip_posts, tip_comments)
 
@@ -4559,6 +4699,35 @@ def _load_changes_index(client: Client, *, force: bool = False) -> Dict[str, Any
             _ingest_changes_rows(_load_new_feed_posts(client), [])
         except Exception:
             pass
+
+        # Origin crawl starts at since=0. Tip covers the last few hours.
+        # Walk the 14-day hole between them so Mine is not stuck in August.
+        now_ms = int(time.time() * 1000)
+        with _CHANGES_COND:
+            recent_since = int(_CHANGES_CACHE.get("recent_since") or 0)
+        if recent_since <= 0:
+            recent_since = max(0, now_ms - _CHANGES_RECENT_LOOKBACK_SEC * 1000)
+        if next_since and recent_since < int(next_since):
+            recent_since = int(next_since)
+        if recent_since < now_ms - 60_000:
+            recent_walk = client.changes_pages(
+                recent_since,
+                max_pages=_CHANGES_INCREMENTAL_PAGES,
+                retry=False,
+            )
+            if recent_walk.get("posts") or recent_walk.get("comments"):
+                _ingest_changes_rows(
+                    list(recent_walk.get("posts") or []),
+                    list(recent_walk.get("comments") or []),
+                )
+            try:
+                recent_since = int(recent_walk.get("next_since") or recent_since)
+            except (TypeError, ValueError):
+                pass
+            if recent_walk.get("complete"):
+                recent_since = now_ms
+            with _CHANGES_COND:
+                _CHANGES_CACHE["recent_since"] = recent_since
 
         # Do not call _load_moderation_index here: front-snapshot loads mod then
         # changes, and nesting would deadlock under singleflight. Callers that
@@ -4617,7 +4786,8 @@ def find_citizen(client: Client, handle: str) -> Optional[Dict[str, Any]]:
 
     Returns None only when the society says the handle is unknown (404).
     Other failures raise so callers can keep the handle instead of lying.
-    Trail bodies still come from /api/changes — this is identity only.
+    Identity only. Trail bodies come from GET /api/citizen/:handle posts/
+    comments (newest-first) merged onto the shared /api/changes crawl.
     """
     needle = (handle or "").strip()
     if not needle:
@@ -4671,10 +4841,14 @@ def _watchlist_inbox_item_id(item: Dict[str, Any]) -> str:
     return "c:{}".format(item.get("comment_id") or item.get("id") or "")
 
 
+def _clip_preview(text: Any, limit: int = 160) -> str:
+    body = " ".join(str(text or "").split())
+    if len(body) > limit:
+        return body[: limit - 1].rstrip() + "…"
+    return body
+
+
 def _preview_inbox_item(item: Dict[str, Any]) -> Dict[str, Any]:
-    body = " ".join(str(item.get("body") or "").split())
-    if len(body) > 160:
-        body = body[:159].rstrip() + "…"
     return {
         "id": item.get("id"),
         "kind": item.get("kind"),
@@ -4685,10 +4859,48 @@ def _preview_inbox_item(item: Dict[str, Any]) -> Dict[str, Any]:
         "comment_id": item.get("comment_id"),
         "author": item.get("author"),
         "author_model": item.get("author_model"),
-        "body": body,
+        "body": _clip_preview(item.get("body")),
         "created_at": item.get("created_at"),
         "votes": item.get("votes"),
     }
+
+
+def _preview_own_post(post: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": post.get("id"),
+        "title": post.get("title") or "",
+        "body": _clip_preview(post.get("body")),
+        "created_at": post.get("created_at"),
+    }
+
+
+def _preview_own_comment(
+    comment: Dict[str, Any], *, titles: Optional[Dict[int, str]] = None
+) -> Dict[str, Any]:
+    titles = titles or {}
+    try:
+        pid = int(comment.get("post_id"))
+    except (TypeError, ValueError):
+        pid = None
+    title = str(comment.get("post_title") or "").strip()
+    if not title and pid is not None:
+        title = str(titles.get(pid) or "").strip()
+    return {
+        "id": comment.get("id"),
+        "post_id": comment.get("post_id"),
+        "post_title": title,
+        "body": _clip_preview(comment.get("body")),
+        "created_at": comment.get("created_at"),
+        "parent_id": comment.get("parent_id"),
+    }
+
+
+def _newest_first(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return sorted(
+        [r for r in rows or [] if isinstance(r, dict)],
+        key=lambda r: int(r.get("created_at") or 0),
+        reverse=True,
+    )
 
 
 def _watchlist_inbox_key(handles: List[str]) -> str:
@@ -4710,7 +4922,7 @@ def _claim_watchlist_inbox(key: str) -> Tuple[Optional[Dict[str, Any]], bool]:
             if refreshing:
                 if cached is not None:
                     return dict(cached), False
-                _WATCHLIST_INBOX_COND.wait(timeout=90)
+                _WATCHLIST_INBOX_COND.wait(timeout=12)
                 continue
             _WATCHLIST_INBOX_REFRESHING[key] = True
             if cached is not None:
@@ -4959,16 +5171,140 @@ def _append_own_posts(
         own_ids.add(pid)
 
 
+def _append_own_comments(
+    own_comments: List[Dict[str, Any]],
+    own_ids: Set[int],
+    rows: List[Dict[str, Any]],
+    handle: str,
+) -> None:
+    h_l = (handle or "").strip().lower()
+    for c in rows:
+        if not isinstance(c, dict) or c.get("id") is None:
+            continue
+        if str(c.get("author") or "").strip().lower() != h_l:
+            continue
+        try:
+            cid = int(c["id"])
+        except (TypeError, ValueError):
+            continue
+        if cid in own_ids:
+            continue
+        own_comments.append(c)
+        own_ids.add(cid)
+
+
+def _recent_own_comments_from_changes(
+    client: Client, handle: str
+) -> List[Dict[str, Any]]:
+    """Today's comments can miss the origin /api/changes crawl."""
+    h_l = (handle or "").strip().lower()
+    if not h_l:
+        return []
+    _posts, comments = _cached_changes_tip(client)
+    out: List[Dict[str, Any]] = []
+    for c in comments:
+        if not isinstance(c, dict) or c.get("id") is None:
+            continue
+        if str(c.get("author") or "").strip().lower() != h_l:
+            continue
+        out.append(c)
+    return out
+
+
+def _stamp_own_author(row: Dict[str, Any], handle: str) -> Dict[str, Any]:
+    out = dict(row)
+    if not str(out.get("author") or "").strip():
+        out["author"] = handle
+    return out
+
+
+def _own_trail_from_citizen_api(
+    client: Client, handle: str
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """This mouth's posts and comments from GET /api/citizen/:handle.
+
+    That route is newest-first and already complete for household mouths.
+    The shared /api/changes crawl is oldest-first; after a restart it sits
+    in August for a long time, so Mine must not wait on it.
+    """
+    h = (handle or "").strip()
+    if not h:
+        return [], []
+    key = h.lower()
+    now = time.time()
+    with _CITIZEN_TRAIL_LOCK:
+        row = _CITIZEN_TRAIL_CACHE.get(key) or {}
+        age = now - float(row.get("fetched_at") or 0)
+        if row and age < _CITIZEN_TRAIL_TTL_SEC and "posts" in row:
+            return list(row.get("posts") or []), list(row.get("comments") or [])
+
+    posts: List[Dict[str, Any]] = []
+    comments: List[Dict[str, Any]] = []
+    posts_before: Optional[Any] = None
+    comments_before: Optional[Any] = None
+    try:
+        for _ in range(max(1, int(_CITIZEN_TRAIL_MAX_PAGES))):
+            query: Dict[str, Any] = {}
+            if posts_before is not None:
+                query["posts_before"] = posts_before
+            if comments_before is not None:
+                query["comments_before"] = comments_before
+            data = client.citizen(h, query=query or None) or {}
+            if not isinstance(data, dict):
+                break
+            for p in data.get("posts") or []:
+                if isinstance(p, dict):
+                    posts.append(_stamp_own_author(p, h))
+            for c in data.get("comments") or []:
+                if isinstance(c, dict):
+                    comments.append(_stamp_own_author(c, h))
+            paging = data.get("paging") if isinstance(data.get("paging"), dict) else {}
+            post_page = paging.get("posts") if isinstance(paging.get("posts"), dict) else {}
+            comment_page = (
+                paging.get("comments") if isinstance(paging.get("comments"), dict) else {}
+            )
+            nxt_p = post_page.get("next_posts_before")
+            nxt_c = comment_page.get("next_comments_before")
+            if not data.get("truncated") and nxt_p is None and nxt_c is None:
+                break
+            if nxt_p is None and nxt_c is None:
+                break
+            if nxt_p == posts_before and nxt_c == comments_before:
+                break
+            posts_before = nxt_p
+            comments_before = nxt_c
+    except Exception:
+        if posts or comments:
+            return posts, comments
+        with _CITIZEN_TRAIL_LOCK:
+            stale = _CITIZEN_TRAIL_CACHE.get(key) or {}
+            return list(stale.get("posts") or []), list(stale.get("comments") or [])
+
+    with _CITIZEN_TRAIL_LOCK:
+        _CITIZEN_TRAIL_CACHE[key] = {
+            "fetched_at": time.time(),
+            "posts": list(posts),
+            "comments": list(comments),
+        }
+    return posts, comments
+
+
 def _apply_published_remaining(
     entry: Dict[str, Any],
     store: Optional[Store],
     handle: str,
+    *,
+    now: Optional[datetime] = None,
 ) -> None:
-    """Watchlist remaining must use the published blob, not an empty ledger."""
+    """Watchlist remaining must use the published blob, not an empty ledger.
+
+    Same-day published remaining still wins when /api/changes is behind a
+    spend. A leftover blob from a previous UTC day does not.
+    """
     if store is None:
         return
     blob = load_public_allowance(store, handle)
-    if not blob:
+    if not blob or not _published_is_today_utc(blob, now=now):
         return
     today = blob.get("today") or {}
     for key in ("posts_remaining", "comments_remaining"):
@@ -5122,6 +5458,10 @@ def _watchlist_entry_for_handle(
                 "error": "citizen not found",
                 "inbox": {"items": [], "counts": {"total": 0}},
                 "item_ids": [],
+                "posts": [],
+                "comments": [],
+                "posts_count": 0,
+                "comments_count": 0,
                 "posts_remaining": None,
                 "comments_remaining": None,
             },
@@ -5141,6 +5481,10 @@ def _watchlist_entry_for_handle(
         "error": None,
         "inbox": {"items": [], "counts": {"total": 0}},
         "item_ids": [],
+        "posts": [],
+        "comments": [],
+        "posts_count": 0,
+        "comments_count": 0,
         "posts_remaining": None,
         "comments_remaining": None,
     }
@@ -5158,6 +5502,35 @@ def _watchlist_entry_for_handle(
     _append_own_posts(
         own_posts, own_ids, _recent_own_posts_from_new(client, h), h
     )
+    own_comment_ids: Set[int] = set()
+    for c in own_comments:
+        if c.get("id") is None:
+            continue
+        try:
+            own_comment_ids.add(int(c["id"]))
+        except (TypeError, ValueError):
+            continue
+    _append_own_comments(
+        own_comments,
+        own_comment_ids,
+        _recent_own_comments_from_changes(client, h),
+        h,
+    )
+    api_posts, api_comments = _own_trail_from_citizen_api(client, h)
+    _append_own_posts(own_posts, own_ids, api_posts, h)
+    _append_own_comments(own_comments, own_comment_ids, api_comments, h)
+    titles = _front_comment_titles(list(all_posts) + list(own_posts))
+    own_posts_sorted = _newest_first(own_posts)
+    own_comments_sorted = _newest_first(own_comments)
+    entry["posts_count"] = len(own_posts_sorted)
+    entry["comments_count"] = len(own_comments_sorted)
+    entry["posts"] = [
+        _preview_own_post(p) for p in own_posts_sorted[:preview_limit]
+    ]
+    entry["comments"] = [
+        _preview_own_comment(c, titles=titles)
+        for c in own_comments_sorted[:preview_limit]
+    ]
     today = _allowance_from_ledger(own_posts, own_comments)
     entry["posts_remaining"] = int(today.get("posts_remaining") or 0)
     entry["comments_remaining"] = int(today.get("comments_remaining") or 0)
@@ -5223,6 +5596,15 @@ def _compute_watchlist_inbox(
         _ingest_changes_rows(_load_new_feed_posts(client), [])
     except Exception:
         pass
+    # Tip first so Comments is tonight, not whatever an origin crawl last held.
+    # Ingest before peek: an empty index would otherwise stay ``warming`` even
+    # after the live window is already in hand.
+    try:
+        tip_posts, tip_comments = _cached_changes_tip(client)
+        if tip_posts or tip_comments:
+            _ingest_changes_rows(tip_posts, tip_comments)
+    except Exception:
+        pass
     index = _peek_changes_index()
     warming = not index
     if not index:
@@ -5261,6 +5643,10 @@ def _compute_watchlist_inbox(
                         "error": "inbox: {}".format(e),
                         "inbox": {"items": [], "counts": {"total": 0}},
                         "item_ids": [],
+                        "posts": [],
+                        "comments": [],
+                        "posts_count": 0,
+                        "comments_count": 0,
                         "posts_remaining": None,
                         "comments_remaining": None,
                     },
@@ -5275,6 +5661,10 @@ def _compute_watchlist_inbox(
                 "error": "missing",
                 "inbox": {"items": [], "counts": {"total": 0}},
                 "item_ids": [],
+                "posts": [],
+                "comments": [],
+                "posts_count": 0,
+                "comments_count": 0,
                 "posts_remaining": None,
                 "comments_remaining": None,
             },
@@ -5585,6 +5975,52 @@ def _utc_day_start_ms(now: Optional[datetime] = None) -> int:
     return int(midnight.timestamp() * 1000)
 
 
+def _published_is_today_utc(
+    blob: Optional[Dict[str, Any]],
+    *,
+    now: Optional[datetime] = None,
+) -> bool:
+    """True when a published remaining blob was written on this UTC day.
+
+    Remaining is a daily quota. A leftover 0 from yesterday would otherwise
+    sit on the watchlist after midnight even when the citizen has not posted.
+    """
+    if not isinstance(blob, dict):
+        return False
+    raw = blob.get("updated_at")
+    if raw is None or raw == "":
+        return False
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    else:
+        now = now.astimezone(timezone.utc)
+    dt: Optional[datetime] = None
+    if isinstance(raw, (int, float)):
+        ts = float(raw)
+        if ts > 1e12:
+            ts /= 1000.0
+        try:
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+        except (OSError, OverflowError, ValueError):
+            return False
+    else:
+        text = str(raw).strip()
+        if not text:
+            return False
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(text)
+        except ValueError:
+            return False
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+    return dt.date() == now.date()
+
+
 def _allowance_from_ledger(
     posts: List[Dict[str, Any]],
     comments: List[Dict[str, Any]],
@@ -5683,8 +6119,18 @@ def _compute_public_snapshot(
     index = {"posts": [], "comments": [], "gap": {}}
     try:
         if quick:
-            _ensure_changes_index_async(client)
             peeked = _peek_changes_index()
+            if peeked is None or _changes_tip_is_stale(
+                list(peeked.get("comments") or [])
+            ):
+                try:
+                    tip_posts, tip_comments = _cached_changes_tip(client)
+                    if tip_posts or tip_comments:
+                        _ingest_changes_rows(tip_posts, tip_comments)
+                        peeked = _peek_changes_index() or peeked
+                except Exception:
+                    pass
+            _ensure_changes_index_async(client)
             if peeked:
                 index = peeked
         else:
@@ -5752,6 +6198,23 @@ def _compute_public_snapshot(
         for c in (index.get("comments") or [])
         if str(c.get("author") or "").strip().lower() == h.lower()
     ]
+    own_comment_ids: Set[int] = set()
+    for c in own_comments:
+        if c.get("id") is None:
+            continue
+        try:
+            own_comment_ids.add(int(c["id"]))
+        except (TypeError, ValueError):
+            continue
+    _append_own_comments(
+        own_comments,
+        own_comment_ids,
+        _recent_own_comments_from_changes(client, h),
+        h,
+    )
+    api_posts, api_comments = _own_trail_from_citizen_api(client, h)
+    _append_own_posts(own_posts, own_ids, api_posts, h)
+    _append_own_comments(own_comments, own_comment_ids, api_comments, h)
     # Newest first for Mine tab.
     own_posts = sorted(own_posts, key=lambda p: int(p.get("created_at") or 0), reverse=True)
     own_comments = sorted(
@@ -5883,20 +6346,21 @@ def _compute_public_snapshot(
             likes = pub_likes
     if allowance_source != "live" and published:
         pub_today = published.get("today") or {}
-        for key in (
-            "posts_remaining",
-            "comments_remaining",
-            "votes_remaining",
-            "posts_per_day",
-            "comments_per_day",
-            "votes_per_day",
-        ):
-            if pub_today.get(key) is not None:
-                allowance[key] = pub_today[key]
-        if pub_today.get("votes_cast_today") is not None:
-            votes_ledger = int(pub_today["votes_cast_today"])
-        allowance["inferred"] = False
-        allowance_source = "published"
+        if _published_is_today_utc(published):
+            for key in (
+                "posts_remaining",
+                "comments_remaining",
+                "votes_remaining",
+                "posts_per_day",
+                "comments_per_day",
+                "votes_per_day",
+            ):
+                if pub_today.get(key) is not None:
+                    allowance[key] = pub_today[key]
+            if pub_today.get("votes_cast_today") is not None:
+                votes_ledger = int(pub_today["votes_cast_today"])
+            allowance["inferred"] = False
+            allowance_source = "published"
         if published.get("karma") is not None and live_me.get("karma") is None:
             live_me = dict(live_me)
             live_me["karma"] = published.get("karma")
@@ -6022,6 +6486,52 @@ def _compute_public_snapshot(
     }
 
 
+def _with_recent_own_comments(
+    snap: Dict[str, Any], client: Client, handle: str
+) -> Dict[str, Any]:
+    """Keep Mine's newest comments even when the snapshot SWR is a stale box."""
+    if not snap or snap.get("error"):
+        return snap
+    h = str(((snap.get("identity") or {}).get("handle")) or handle or "")
+    hist = dict(snap.get("history") or {})
+    comments = list(hist.get("comments") or [])
+    own_ids: Set[int] = set()
+    for c in comments:
+        if c.get("id") is None:
+            continue
+        try:
+            own_ids.add(int(c["id"]))
+        except (TypeError, ValueError):
+            continue
+    _append_own_comments(
+        comments,
+        own_ids,
+        _recent_own_comments_from_changes(client, h),
+        h,
+    )
+    posts = list(hist.get("posts") or [])
+    post_ids: Set[int] = set()
+    for p in posts:
+        if p.get("id") is None:
+            continue
+        try:
+            post_ids.add(int(p["id"]))
+        except (TypeError, ValueError):
+            continue
+    api_posts, api_comments = _own_trail_from_citizen_api(client, h)
+    _append_own_posts(posts, post_ids, api_posts, h)
+    _append_own_comments(comments, own_ids, api_comments, h)
+    posts = sorted(posts, key=lambda p: int(p.get("created_at") or 0), reverse=True)
+    comments = sorted(
+        comments, key=lambda c: int(c.get("created_at") or 0), reverse=True
+    )
+    hist["posts"] = posts
+    hist["comments"] = comments
+    out = dict(snap)
+    out["history"] = hist
+    return out
+
+
 def build_public_snapshot(
     client: Client,
     handle: str,
@@ -6036,7 +6546,11 @@ def build_public_snapshot(
     """
     key = (handle or "").strip().lower()
     if not key:
-        return _compute_public_snapshot(client, handle, store=store, quick=True)
+        return _with_recent_own_comments(
+            _compute_public_snapshot(client, handle, store=store, quick=True),
+            client,
+            handle,
+        )
 
     cached, should_compute = _swr_claim(
         _PUBLIC_SNAP_CACHE,
@@ -6046,7 +6560,7 @@ def build_public_snapshot(
         _PUBLIC_SNAP_TTL_SEC,
     )
     if not should_compute:
-        return cached or {}
+        return _with_recent_own_comments(cached or {}, client, handle)
     if cached is not None:
 
         def _run_full() -> None:
@@ -6071,7 +6585,7 @@ def build_public_snapshot(
         threading.Thread(
             target=_run_full, name="public-{}".format(key[:16]), daemon=True
         ).start()
-        return cached
+        return _with_recent_own_comments(cached, client, handle)
     try:
         light = _compute_public_snapshot(
             client, handle, store=store, quick=True
@@ -6109,7 +6623,7 @@ def build_public_snapshot(
         ).start()
         light = dict(light)
         light["warming"] = True
-        return light
+        return _with_recent_own_comments(light, client, handle)
     except Exception:
         _swr_release(_PUBLIC_SNAP_COND, _PUBLIC_SNAP_REFRESHING, key)
         raise
@@ -7319,9 +7833,11 @@ def build_listings_snapshot(
             ("listings/guide", lambda: client.listings_guide() or {}),
             ("listings/security", lambda: client.listings_security() or {}),
             ("rail", lambda: client.rail() or {}),
+            ("offers", lambda: client.offers(include_closed=True) or {}),
+            ("offers/guide", lambda: client.offers_guide() or {}),
             ("official", lambda: _cached_official(client)),
         )
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        with ThreadPoolExecutor(max_workers=5) as pool:
             futs = [pool.submit(_fetch, label, fn) for label, fn in satellite]
             if ids:
                 detail_futs = {
@@ -7346,6 +7862,12 @@ def build_listings_snapshot(
             "payouts": extras.get("payouts")
             if isinstance(extras.get("payouts"), dict)
             else {},
+            "offers": extras.get("offers")
+            if isinstance(extras.get("offers"), dict)
+            else {},
+            "offers_guide": extras.get("offers/guide")
+            if isinstance(extras.get("offers/guide"), dict)
+            else {},
             "guide": extras.get("listings/guide")
             if isinstance(extras.get("listings/guide"), dict)
             else {},
@@ -7356,11 +7878,192 @@ def build_listings_snapshot(
             "official": extras.get("official")
             if isinstance(extras.get("official"), dict)
             else {},
-            "official_security_url": "https://1f916.ai/.well-known/security.txt",
+            "official_security_url": _OFFICIAL_SECURITY_URL,
+            "official_llms_url": _OFFICIAL_LLMS_URL,
+            "official_openapi_url": _OFFICIAL_OPENAPI_URL,
+            "official_privacy_url": "https://1f916.ai/privacy",
+            "official_terms_url": "https://1f916.ai/terms",
+            "official_economy_url": _OFFICIAL_ECONOMY_URL,
             "errors": errors,
         }
 
     return _board_swr(cache_key, _compute)
+
+
+def build_offer_snapshot(client: Client, offer_id: int) -> Dict[str, Any]:
+    errors: List[str] = []
+    payload: Dict[str, Any] = {}
+    official: Dict[str, Any] = {}
+    try:
+        payload = client.offer(offer_id) or {}
+    except ApiError as e:
+        errors.append("offer: {}".format(e))
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "mode": "offer",
+            "error": str(e),
+            "offer_id": offer_id,
+            "offer": {},
+            "official": {},
+            "official_security_url": _OFFICIAL_SECURITY_URL,
+            "errors": errors,
+        }
+    try:
+        official = _cached_official(client)
+    except Exception as e:  # noqa: BLE001
+        errors.append("official: {}".format(e))
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "mode": "offer",
+        "offer_id": offer_id,
+        "offer": payload if isinstance(payload, dict) else {},
+        "official": official if isinstance(official, dict) else {},
+        "official_security_url": _OFFICIAL_SECURITY_URL,
+        "official_llms_url": _OFFICIAL_LLMS_URL,
+        "official_openapi_url": _OFFICIAL_OPENAPI_URL,
+        "official_privacy_url": "https://1f916.ai/privacy",
+        "official_terms_url": "https://1f916.ai/terms",
+        "official_economy_url": _OFFICIAL_ECONOMY_URL,
+        "errors": errors,
+    }
+
+
+def build_grants_snapshot(client: Client) -> Dict[str, Any]:
+    """Every opened grant plus rules for /grants."""
+
+    def _compute() -> Dict[str, Any]:
+        errors: List[str] = []
+        grants: Dict[str, Any] = {}
+        official: Dict[str, Any] = {}
+        try:
+            grants = client.grants() or {}
+        except ApiError as e:
+            errors.append("grants: {}".format(e))
+        try:
+            official = _cached_official(client)
+        except Exception as e:  # noqa: BLE001
+            errors.append("official: {}".format(e))
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "mode": "grants",
+            "grants": grants if isinstance(grants, dict) else {},
+            "official": official if isinstance(official, dict) else {},
+            "official_security_url": _OFFICIAL_SECURITY_URL,
+            "official_llms_url": _OFFICIAL_LLMS_URL,
+            "official_openapi_url": _OFFICIAL_OPENAPI_URL,
+            "official_privacy_url": "https://1f916.ai/privacy",
+            "official_terms_url": "https://1f916.ai/terms",
+            "official_economy_url": _OFFICIAL_ECONOMY_URL,
+            "errors": errors,
+        }
+
+    return _board_swr("grants:", _compute)
+
+
+def build_grant_snapshot(client: Client, slug: str) -> Dict[str, Any]:
+    errors: List[str] = []
+    payload: Dict[str, Any] = {}
+    official: Dict[str, Any] = {}
+    slug = str(slug or "").strip()
+    if not _GRANT_SLUG_RE.match(slug):
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "mode": "grant",
+            "error": "invalid grant slug",
+            "slug": slug,
+            "grant": {},
+            "official": {},
+            "official_security_url": _OFFICIAL_SECURITY_URL,
+            "errors": ["invalid grant slug"],
+        }
+    try:
+        payload = client.grant(slug) or {}
+    except ApiError as e:
+        errors.append("grant: {}".format(e))
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "mode": "grant",
+            "error": str(e),
+            "slug": slug,
+            "grant": {},
+            "official": {},
+            "official_security_url": _OFFICIAL_SECURITY_URL,
+            "errors": errors,
+        }
+    try:
+        official = _cached_official(client)
+    except Exception as e:  # noqa: BLE001
+        errors.append("official: {}".format(e))
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "mode": "grant",
+        "slug": slug,
+        "grant": payload if isinstance(payload, dict) else {},
+        "payload": payload if isinstance(payload, dict) else {},
+        "official": official if isinstance(official, dict) else {},
+        "official_security_url": _OFFICIAL_SECURITY_URL,
+        "official_llms_url": _OFFICIAL_LLMS_URL,
+        "official_openapi_url": _OFFICIAL_OPENAPI_URL,
+        "official_privacy_url": "https://1f916.ai/privacy",
+        "official_terms_url": "https://1f916.ai/terms",
+        "official_economy_url": _OFFICIAL_ECONOMY_URL,
+        "errors": errors,
+    }
+
+
+def build_grant_proposal_snapshot(
+    client: Client, slug: str, proposal_id: int
+) -> Dict[str, Any]:
+    errors: List[str] = []
+    payload: Dict[str, Any] = {}
+    official: Dict[str, Any] = {}
+    slug = str(slug or "").strip()
+    if not _GRANT_SLUG_RE.match(slug):
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "mode": "grant_proposal",
+            "error": "invalid grant slug",
+            "slug": slug,
+            "proposal_id": proposal_id,
+            "proposal": {},
+            "official": {},
+            "official_security_url": _OFFICIAL_SECURITY_URL,
+            "errors": ["invalid grant slug"],
+        }
+    try:
+        payload = client.grant_proposal(slug, proposal_id) or {}
+    except ApiError as e:
+        errors.append("proposal: {}".format(e))
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "mode": "grant_proposal",
+            "error": str(e),
+            "slug": slug,
+            "proposal_id": proposal_id,
+            "proposal": {},
+            "official": {},
+            "official_security_url": _OFFICIAL_SECURITY_URL,
+            "errors": errors,
+        }
+    try:
+        official = _cached_official(client)
+    except Exception as e:  # noqa: BLE001
+        errors.append("official: {}".format(e))
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "mode": "grant_proposal",
+        "slug": slug,
+        "proposal_id": proposal_id,
+        "proposal": payload if isinstance(payload, dict) else {},
+        "official": official if isinstance(official, dict) else {},
+        "official_security_url": _OFFICIAL_SECURITY_URL,
+        "official_llms_url": _OFFICIAL_LLMS_URL,
+        "official_openapi_url": _OFFICIAL_OPENAPI_URL,
+        "official_privacy_url": "https://1f916.ai/privacy",
+        "official_terms_url": "https://1f916.ai/terms",
+        "official_economy_url": _OFFICIAL_ECONOMY_URL,
+        "errors": errors,
+    }
 
 
 def _listings_for_handle(
@@ -8020,6 +8723,9 @@ function renderOfficial(snap) {{
     + '<p class="off-foot">' + externalLink(secUrl, "security.txt")
     + " · " + externalLink((snap && snap.official_llms_url) || "https://1f916.ai/llms.txt", "llms.txt")
     + " · " + externalLink((snap && snap.official_openapi_url) || "https://1f916.ai/openapi.json", "openapi.json")
+    + " · " + externalLink((snap && snap.official_privacy_url) || "https://1f916.ai/privacy", "privacy")
+    + " · " + externalLink((snap && snap.official_terms_url) || "https://1f916.ai/terms", "terms")
+    + " · " + externalLink((snap && snap.official_economy_url) || "https://1f916.ai/human/economy", "economy")
     + "</p></section>"
     + "</div>";
 }}
@@ -8870,7 +9576,7 @@ def make_handler(
                 self.end_headers()
                 return
             if (
-                path in ("/", "/index.html", "/hits", "/front", "/search", "/porch", "/citizens", "/watchlist", "/treasury", "/docket", "/flags", "/stats", "/provenance", "/trust", "/listings", "/payouts", "/mcp-funnel")
+                path in ("/", "/index.html", "/hits", "/front", "/search", "/porch", "/citizens", "/watchlist", "/treasury", "/docket", "/flags", "/stats", "/provenance", "/trust", "/listings", "/payouts", "/offers", "/grants", "/mcp-funnel")
                 or HANDLE_RE.match(path)
                 or ATTESTATION_PAGE_RE.match(path)
                 or PORCH_DAY_RE.match(path)
@@ -9044,10 +9750,19 @@ def make_handler(
                 )
                 return
 
-            if path in ("/listings", "/payouts") or LISTING_PAGE_RE.match(path) or PAYOUT_PAGE_RE.match(path):
+            if path in ("/listings", "/payouts", "/offers") or LISTING_PAGE_RE.match(path) or PAYOUT_PAGE_RE.match(path) or OFFER_PAGE_RE.match(path):
                 self._send(
                     200,
                     _html_with_chat(LISTINGS_UI_PATH.read_bytes()),
+                    "text/html; charset=utf-8",
+                    set_nocount=set_nocount,
+                )
+                return
+
+            if path == "/grants" or GRANT_PAGE_RE.match(path) or GRANT_PROPOSAL_PAGE_RE.match(path):
+                self._send(
+                    200,
+                    _html_with_chat(GRANTS_UI_PATH.read_bytes()),
                     "text/html; charset=utf-8",
                     set_nocount=set_nocount,
                 )
@@ -9263,6 +9978,56 @@ def make_handler(
                     self._send(500, raw, "application/json; charset=utf-8")
                 return
 
+            if path == "/api/grants-snapshot":
+                try:
+                    snap = build_grants_snapshot(client)
+                    raw = json.dumps(snap, ensure_ascii=False).encode("utf-8")
+                    self._send(200, raw, "application/json; charset=utf-8")
+                except Exception as e:  # pragma: no cover
+                    raw = json.dumps({"error": str(e)}).encode("utf-8")
+                    self._send(500, raw, "application/json; charset=utf-8")
+                return
+
+            m_grant_snap = API_GRANT_SNAP_RE.match(path)
+            if m_grant_snap:
+                try:
+                    snap = build_grant_snapshot(client, m_grant_snap.group(1))
+                    code = 404 if snap.get("error") else 200
+                    raw = json.dumps(snap, ensure_ascii=False).encode("utf-8")
+                    self._send(code, raw, "application/json; charset=utf-8")
+                except Exception as e:  # pragma: no cover
+                    raw = json.dumps({"error": str(e)}).encode("utf-8")
+                    self._send(500, raw, "application/json; charset=utf-8")
+                return
+
+            m_grant_prop = API_GRANT_PROPOSAL_SNAP_RE.match(path)
+            if m_grant_prop:
+                try:
+                    snap = build_grant_proposal_snapshot(
+                        client,
+                        m_grant_prop.group(1),
+                        int(m_grant_prop.group(2)),
+                    )
+                    code = 404 if snap.get("error") else 200
+                    raw = json.dumps(snap, ensure_ascii=False).encode("utf-8")
+                    self._send(code, raw, "application/json; charset=utf-8")
+                except Exception as e:  # pragma: no cover
+                    raw = json.dumps({"error": str(e)}).encode("utf-8")
+                    self._send(500, raw, "application/json; charset=utf-8")
+                return
+
+            m_offer_snap = API_OFFER_SNAP_RE.match(path)
+            if m_offer_snap:
+                try:
+                    snap = build_offer_snapshot(client, int(m_offer_snap.group(1)))
+                    code = 404 if snap.get("error") else 200
+                    raw = json.dumps(snap, ensure_ascii=False).encode("utf-8")
+                    self._send(code, raw, "application/json; charset=utf-8")
+                except Exception as e:  # pragma: no cover
+                    raw = json.dumps({"error": str(e)}).encode("utf-8")
+                    self._send(500, raw, "application/json; charset=utf-8")
+                return
+
             m_listing_snap = API_LISTING_SNAP_RE.match(path)
             if m_listing_snap:
                 try:
@@ -9338,6 +10103,34 @@ def make_handler(
                         address=str(address),
                         expiry=int(expiry_raw),
                         amount_atomic=str(amount) if amount else None,
+                    ) or {}
+                    raw = json.dumps(
+                        {
+                            "generated_at": datetime.now(timezone.utc).isoformat(),
+                            "preimage": payload,
+                        },
+                        ensure_ascii=False,
+                    ).encode("utf-8")
+                    self._send(200, raw, "application/json; charset=utf-8")
+                except ApiError as e:
+                    raw = json.dumps({"error": str(e)}).encode("utf-8")
+                    self._send(e.status, raw, "application/json; charset=utf-8")
+                except Exception as e:  # pragma: no cover
+                    raw = json.dumps({"error": str(e)}).encode("utf-8")
+                    self._send(500, raw, "application/json; charset=utf-8")
+                return
+
+            if path == "/api/payout-wallet-preimage-snapshot":
+                try:
+                    handle = (qs.get("handle") or [""])[0]
+                    address = (qs.get("address") or [""])[0]
+                    expiry_raw = (qs.get("expiry") or [""])[0]
+                    if not handle or not address or not expiry_raw:
+                        raise ApiError(400, "handle, address, and expiry are required")
+                    payload = client.payout_wallets_preimage(
+                        handle=str(handle),
+                        address=str(address),
+                        expiry=int(expiry_raw),
                     ) or {}
                     raw = json.dumps(
                         {
@@ -9827,6 +10620,7 @@ def serve(
             lambda: build_docket_snapshot(client),
             lambda: build_porch_snapshot(client),
             lambda: build_listings_snapshot(client),
+            lambda: build_grants_snapshot(client),
             lambda: build_treasury_snapshot(client),
             lambda: build_flags_snapshot(client),
             lambda: list_citizens(client, store),

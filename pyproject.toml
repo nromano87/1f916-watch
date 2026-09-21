@@ -17,4 +17,4 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.setuptools.package-data]
-f916_agent = ["watch_ui.html", "treasury_ui.html", "trust_ui.html", "listings_ui.html", "favicon.svg", "chat.js", "watchlist.js"]
+f916_agent = ["watch_ui.html", "treasury_ui.html", "trust_ui.html", "listings_ui.html", "grants_ui.html", "favicon.svg", "chat.js", "watchlist.js"]

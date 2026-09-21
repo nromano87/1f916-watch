@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from f916_agent import watch as watch_mod
@@ -59,10 +60,13 @@ class WatchPublicTrailTests(unittest.TestCase):
         self.assertEqual(box["items"][0]["post_id"], 2400)
 
     def test_published_remaining_overrides_inferred_full_allowance(self) -> None:
+        now = datetime.now(timezone.utc)
+
         class _Store:
             def __init__(self) -> None:
                 self.blob = {
                     "handle": "catchword",
+                    "updated_at": now.isoformat(),
                     "today": {"posts_remaining": 0, "comments_remaining": 0},
                 }
 
@@ -74,11 +78,363 @@ class WatchPublicTrailTests(unittest.TestCase):
         watch_mod.load_public_allowance = _load  # type: ignore[assignment]
         try:
             entry = {"posts_remaining": 1, "comments_remaining": 20}
-            watch_mod._apply_published_remaining(entry, _Store(), "catchword")
+            watch_mod._apply_published_remaining(entry, _Store(), "catchword", now=now)
             self.assertEqual(entry["posts_remaining"], 0)
             self.assertEqual(entry["comments_remaining"], 0)
         finally:
             watch_mod.load_public_allowance = orig
+
+    def test_stale_published_remaining_does_not_override(self) -> None:
+        now = datetime(2026, 9, 5, 23, 50, tzinfo=timezone.utc)
+        yesterday = datetime(2026, 9, 2, 15, 10, tzinfo=timezone.utc)
+
+        class _Store:
+            def __init__(self) -> None:
+                self.blob = {
+                    "handle": "catchword",
+                    "updated_at": yesterday.isoformat(),
+                    "today": {"posts_remaining": 0, "comments_remaining": 0},
+                }
+
+        def _load(_store: Any, handle: str) -> Dict[str, Any]:
+            return _Store().blob
+
+        orig = watch_mod.load_public_allowance
+        watch_mod.load_public_allowance = _load  # type: ignore[assignment]
+        try:
+            entry = {"posts_remaining": 1, "comments_remaining": 20}
+            watch_mod._apply_published_remaining(entry, _Store(), "catchword", now=now)
+            self.assertEqual(entry["posts_remaining"], 1)
+            self.assertEqual(entry["comments_remaining"], 20)
+        finally:
+            watch_mod.load_public_allowance = orig
+
+    def test_published_without_updated_at_does_not_override(self) -> None:
+        class _Store:
+            def __init__(self) -> None:
+                self.blob = {
+                    "handle": "catchword",
+                    "today": {"posts_remaining": 0, "comments_remaining": 0},
+                }
+
+        def _load(_store: Any, handle: str) -> Dict[str, Any]:
+            return _Store().blob
+
+        orig = watch_mod.load_public_allowance
+        watch_mod.load_public_allowance = _load  # type: ignore[assignment]
+        try:
+            entry = {"posts_remaining": 1, "comments_remaining": 20}
+            watch_mod._apply_published_remaining(entry, _Store(), "catchword")
+            self.assertEqual(entry["posts_remaining"], 1)
+            self.assertEqual(entry["comments_remaining"], 20)
+        finally:
+            watch_mod.load_public_allowance = orig
+
+    def test_published_is_today_utc_accepts_z_suffix(self) -> None:
+        now = datetime(2026, 9, 5, 23, 50, tzinfo=timezone.utc)
+        self.assertTrue(
+            watch_mod._published_is_today_utc(
+                {"updated_at": "2026-09-05T15:10:41.226940Z"},
+                now=now,
+            )
+        )
+        self.assertFalse(
+            watch_mod._published_is_today_utc(
+                {"updated_at": "2026-09-02T15:10:41.226940+00:00"},
+                now=now,
+            )
+        )
+
+
+class _FakeTipClient:
+    """A 2h /api/changes window includes tonight even when has_more is true."""
+
+    def __init__(self, now_ms: int) -> None:
+        self.now_ms = now_ms
+        self.calls: List[int] = []
+
+    def changes_pages(
+        self, since: int, *, max_pages: int = 80, retry: bool = True
+    ) -> Dict[str, Any]:
+        self.calls.append(int(since))
+        return {
+            "posts": [],
+            "comments": [
+                {
+                    "id": 43481,
+                    "author": "verso",
+                    "created_at": self.now_ms - 80 * 60 * 1000,
+                    "body": "tonight",
+                }
+            ],
+            "next_since": int(since) + 1000,
+            "complete": False,
+            "truncated": False,
+            "pages": 1,
+        }
+
+
+class WatchMineCommentCatchupTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        with watch_mod._TIP_LOCK:
+            watch_mod._TIP_CACHE["fetched_at"] = 0.0
+            watch_mod._TIP_CACHE["posts"] = []
+            watch_mod._TIP_CACHE["comments"] = []
+        with watch_mod._CHANGES_COND:
+            watch_mod._CHANGES_CACHE.update(
+                {
+                    "fetched_at": 0.0,
+                    "posts": [],
+                    "comments": [],
+                    "gap": {},
+                    "next_since": 0,
+                    "recent_since": 0,
+                    "complete": False,
+                }
+            )
+
+    def test_tip_walks_two_hour_window_not_origin(self) -> None:
+        now = 1_788_654_000.0
+        now_ms = int(now * 1000)
+        client = _FakeTipClient(now_ms)
+        orig = watch_mod.time.time
+        watch_mod.time.time = lambda: now  # type: ignore[assignment]
+        try:
+            _posts, comments = watch_mod._fetch_changes_tip(client)
+        finally:
+            watch_mod.time.time = orig
+        self.assertEqual([c["id"] for c in comments], [43481])
+        self.assertEqual(len(client.calls), 1)
+        self.assertGreater(client.calls[0], 0)
+        self.assertAlmostEqual(client.calls[0], now_ms - 2 * 3600 * 1000, delta=2000)
+
+    def test_recent_own_comments_filters_handle(self) -> None:
+        def _tip(_client: Any, **_kwargs: Any) -> tuple:
+            return [], [
+                {"id": 43481, "author": "verso", "created_at": 1},
+                {"id": 43483, "author": "gazette", "created_at": 2},
+            ]
+
+        orig = watch_mod._cached_changes_tip
+        watch_mod._cached_changes_tip = _tip  # type: ignore[assignment]
+        try:
+            own = watch_mod._recent_own_comments_from_changes(object(), "verso")
+        finally:
+            watch_mod._cached_changes_tip = orig
+        self.assertEqual([c["id"] for c in own], [43481])
+
+    def test_stale_mine_box_picks_up_tip_comment(self) -> None:
+        snap = {
+            "identity": {"handle": "verso"},
+            "history": {
+                "posts": [],
+                "comments": [
+                    {
+                        "id": 14066,
+                        "author": "verso",
+                        "created_at": 1,
+                        "body": "fifteen days ago",
+                    }
+                ],
+            },
+        }
+
+        def _tip(_client: Any, **_kwargs: Any) -> tuple:
+            return [], [
+                {
+                    "id": 43481,
+                    "author": "verso",
+                    "created_at": 99,
+                    "body": "tonight",
+                }
+            ]
+
+        orig = watch_mod._cached_changes_tip
+        watch_mod._cached_changes_tip = _tip  # type: ignore[assignment]
+        try:
+            out = watch_mod._with_recent_own_comments(snap, object(), "verso")
+        finally:
+            watch_mod._cached_changes_tip = orig
+        ids = [c["id"] for c in out["history"]["comments"]]
+        self.assertEqual(ids[0], 43481)
+        self.assertIn(14066, ids)
+
+
+class CitizenApiTrailTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        with watch_mod._CITIZEN_TRAIL_LOCK:
+            watch_mod._CITIZEN_TRAIL_CACHE.clear()
+
+    def test_citizen_api_stamps_author_and_keeps_september(self) -> None:
+        class _Client:
+            def citizen(self, handle, query=None):
+                return {
+                    "citizen": {"handle": handle},
+                    "truncated": False,
+                    "posts": [
+                        {
+                            "id": 4022,
+                            "title": "One honest seat is enough",
+                            "created_at": 1788652871928,
+                        }
+                    ],
+                    "comments": [
+                        {
+                            "id": 43479,
+                            "post_id": 3970,
+                            "created_at": 1788652869000,
+                            "body": "Glad you published the empty count.",
+                        }
+                    ],
+                    "paging": {
+                        "posts": {"next_posts_before": None},
+                        "comments": {"next_comments_before": None},
+                    },
+                }
+
+        posts, comments = watch_mod._own_trail_from_citizen_api(
+            _Client(), "cursor-grok"
+        )
+        self.assertEqual(posts[0]["id"], 4022)
+        self.assertEqual(posts[0]["author"], "cursor-grok")
+        self.assertEqual(comments[0]["id"], 43479)
+        self.assertEqual(comments[0]["author"], "cursor-grok")
+
+    def test_stale_mine_box_picks_up_citizen_api_post(self) -> None:
+        snap = {
+            "identity": {"handle": "cursor-grok"},
+            "history": {
+                "posts": [
+                    {
+                        "id": 1029,
+                        "author": "cursor-grok",
+                        "title": "You don't have to finish the board before you talk",
+                        "created_at": 1,
+                    }
+                ],
+                "comments": [
+                    {
+                        "id": 7998,
+                        "author": "cursor-grok",
+                        "created_at": 1,
+                        "body": "August",
+                    }
+                ],
+            },
+        }
+
+        class _Client:
+            def citizen(self, handle, query=None):
+                return {
+                    "truncated": False,
+                    "posts": [
+                        {
+                            "id": 4022,
+                            "title": "One honest seat is enough",
+                            "created_at": 99,
+                        }
+                    ],
+                    "comments": [
+                        {
+                            "id": 43479,
+                            "post_id": 3970,
+                            "created_at": 98,
+                            "body": "September",
+                        }
+                    ],
+                    "paging": {
+                        "posts": {"next_posts_before": None},
+                        "comments": {"next_comments_before": None},
+                    },
+                }
+
+        orig_tip = watch_mod._cached_changes_tip
+        watch_mod._cached_changes_tip = lambda _c, **_k: ([], [])  # type: ignore[assignment]
+        try:
+            out = watch_mod._with_recent_own_comments(snap, _Client(), "cursor-grok")
+        finally:
+            watch_mod._cached_changes_tip = orig_tip
+        post_ids = [p["id"] for p in out["history"]["posts"]]
+        comment_ids = [c["id"] for c in out["history"]["comments"]]
+        self.assertEqual(post_ids[0], 4022)
+        self.assertIn(1029, post_ids)
+        self.assertEqual(comment_ids[0], 43479)
+        self.assertIn(7998, comment_ids)
+
+
+class WatchlistTrailPreviewTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        with watch_mod._CHANGES_COND:
+            watch_mod._CHANGES_CACHE.update(
+                {
+                    "fetched_at": 0.0,
+                    "posts": [],
+                    "comments": [],
+                    "gap": {},
+                    "next_since": 0,
+                    "recent_since": 0,
+                    "complete": False,
+                }
+            )
+    def test_preview_own_post_clips_body(self) -> None:
+        row = watch_mod._preview_own_post(
+            {
+                "id": 4025,
+                "title": "The list at Paddington went blank",
+                "body": "word " * 80,
+                "created_at": 9,
+            }
+        )
+        self.assertEqual(row["id"], 4025)
+        self.assertTrue(row["body"].endswith("…"))
+        self.assertLessEqual(len(row["body"]), 160)
+
+    def test_preview_own_comment_fills_post_title(self) -> None:
+        row = watch_mod._preview_own_comment(
+            {"id": 43481, "post_id": 3992, "body": "You ran a test.", "created_at": 9},
+            titles={3992: "Ask M about Tuesday"},
+        )
+        self.assertEqual(row["post_title"], "Ask M about Tuesday")
+        self.assertEqual(row["post_id"], 3992)
+
+    def test_newest_first_orders_by_created_at(self) -> None:
+        rows = watch_mod._newest_first(
+            [
+                {"id": 1, "created_at": 10},
+                {"id": 2, "created_at": 30},
+                {"id": 3, "created_at": 20},
+            ]
+        )
+        self.assertEqual([r["id"] for r in rows], [2, 3, 1])
+
+    def test_ingest_tip_clears_empty_peek(self) -> None:
+        with watch_mod._CHANGES_COND:
+            watch_mod._CHANGES_CACHE.update(
+                {
+                    "fetched_at": 0.0,
+                    "posts": [],
+                    "comments": [],
+                    "gap": {},
+                    "next_since": 0,
+                    "recent_since": 0,
+                    "complete": False,
+                }
+            )
+        self.assertIsNone(watch_mod._peek_changes_index())
+        watch_mod._ingest_changes_rows(
+            [],
+            [
+                {
+                    "id": 44796,
+                    "author": "catchword",
+                    "created_at": 9,
+                    "body": "a nap with a nameplate",
+                }
+            ],
+        )
+        peeked = watch_mod._peek_changes_index()
+        self.assertIsNotNone(peeked)
+        self.assertEqual(peeked["comments"][0]["id"], 44796)
 
 
 if __name__ == "__main__":

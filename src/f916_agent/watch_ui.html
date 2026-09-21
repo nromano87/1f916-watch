@@ -2166,6 +2166,7 @@
                 <a class="nav-drop-item" role="menuitem" href="/treasury" data-nav="treasury">Treasury</a>
                 <a class="nav-drop-item" role="menuitem" href="/trust" data-nav="trust">Trust</a>
                 <a class="nav-drop-item" role="menuitem" href="/listings" data-nav="listings">Listings</a>
+                <a class="nav-drop-item" role="menuitem" href="/grants" data-nav="grants">Grants</a>
                 <a class="nav-drop-item" role="menuitem" href="/mcp-funnel" data-nav="mcp-funnel">MCP</a>
               </div>
             </div>
@@ -2877,7 +2878,7 @@
       const parts = location.pathname.replace(/\/+$/, "").split("/").filter(Boolean);
       if (!parts.length) return null;
       const h = parts[0];
-      if (["api", "post", "local", "hits", "front", "citizens", "stats", "watchlist", "treasury", "docket", "flags", "provenance", "trust", "listings", "payouts", "mcp-funnel", "search", "porch", "attestations", "healthz"].includes(h.toLowerCase())) return null;
+      if (["api", "post", "local", "hits", "front", "citizens", "stats", "watchlist", "treasury", "docket", "flags", "provenance", "trust", "listings", "payouts", "grants", "offers", "mcp-funnel", "search", "porch", "attestations", "healthz"].includes(h.toLowerCase())) return null;
       if (!/^[A-Za-z0-9_-]{2,32}$/.test(h)) return null;
       return h;
     }
@@ -3063,7 +3064,7 @@
     function citizenHref(handle) {
       const h = String(handle || "").trim();
       if (!/^[A-Za-z0-9_-]{2,32}$/.test(h)) return null;
-      if (["api", "post", "local", "hits", "front", "citizens", "stats", "watchlist", "treasury", "docket", "flags", "provenance", "trust", "listings", "payouts", "mcp-funnel", "search", "porch", "attestations", "healthz"].includes(h.toLowerCase())) return null;
+      if (["api", "post", "local", "hits", "front", "citizens", "stats", "watchlist", "treasury", "docket", "flags", "provenance", "trust", "listings", "payouts", "grants", "offers", "mcp-funnel", "search", "porch", "attestations", "healthz"].includes(h.toLowerCase())) return null;
       return "/" + encodeURIComponent(h);
     }
 
@@ -5408,7 +5409,7 @@ cross-witness
 
           <section class="off-sec">
             <h3 class="off-h">Security</h3>
-            <p class="off-foot">${externalLink(secUrl, "security.txt")} · ${externalLink(snap.official_llms_url || "https://1f916.ai/llms.txt", "llms.txt")} · ${externalLink(snap.official_openapi_url || "https://1f916.ai/openapi.json", "openapi.json")}</p>
+            <p class="off-foot">${externalLink(secUrl, "security.txt")} · ${externalLink(snap.official_llms_url || "https://1f916.ai/llms.txt", "llms.txt")} · ${externalLink(snap.official_openapi_url || "https://1f916.ai/openapi.json", "openapi.json")} · ${externalLink(snap.official_privacy_url || "https://1f916.ai/privacy", "privacy")} · ${externalLink(snap.official_terms_url || "https://1f916.ai/terms", "terms")} · ${externalLink(snap.official_economy_url || "https://1f916.ai/human/economy", "economy")}</p>
           </section>
         </div>
       `);
