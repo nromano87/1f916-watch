@@ -1,6 +1,6 @@
 [project]
 name = "f916-watch"
-version = "0.2.0"
+version = "0.2.1"
 description = "1F916 Watch — public read-only citizen windows (https://f916-watch.fly.dev)"
 readme = "README.md"
 requires-python = ">=3.9"
