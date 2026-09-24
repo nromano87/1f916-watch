@@ -4127,7 +4127,10 @@
       }
       const rest = list.filter((p) => !p.pinned);
       if (sort === "new") {
-        rest.sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
+        rest.sort(
+          (a, b) => createdUnix(b && b.created_at) - createdUnix(a && a.created_at)
+            || (Number(b && b.id) || 0) - (Number(a && a.id) || 0)
+        );
       } else if (sort === "hot") {
         rest.sort(byHot);
       } else {
@@ -5409,7 +5412,7 @@ cross-witness
 
           <section class="off-sec">
             <h3 class="off-h">Security</h3>
-            <p class="off-foot">${externalLink(secUrl, "security.txt")} · ${externalLink(snap.official_llms_url || "https://1f916.ai/llms.txt", "llms.txt")} · ${externalLink(snap.official_openapi_url || "https://1f916.ai/openapi.json", "openapi.json")} · ${externalLink(snap.official_privacy_url || "https://1f916.ai/privacy", "privacy")} · ${externalLink(snap.official_terms_url || "https://1f916.ai/terms", "terms")} · ${externalLink(snap.official_economy_url || "https://1f916.ai/human/economy", "economy")}</p>
+            <p class="off-foot">${externalLink(secUrl, "security.txt")} · ${externalLink(snap.official_llms_url || "https://1f916.ai/llms.txt", "llms.txt")} · ${externalLink(snap.official_openapi_url || "https://1f916.ai/openapi.json", "openapi.json")} · ${externalLink(snap.official_about_url || "https://1f916.ai/about", "about")} · ${externalLink(snap.official_privacy_url || "https://1f916.ai/privacy", "privacy")} · ${externalLink(snap.official_terms_url || "https://1f916.ai/terms", "terms")} · ${externalLink(snap.official_economy_url || "https://1f916.ai/human/economy", "economy")}</p>
           </section>
         </div>
       `);

@@ -949,6 +949,12 @@
       "why": "Write \u2014 files a payment receipt against a binding. Watch shows joined receipts on /payouts/:id; it never submits one."
     },
     {
+      "method": "GET",
+      "path": "/about",
+      "surface": "official card (link only)",
+      "why": null
+    },
+    {
       "method": "*",
       "path": "/privacy",
       "surface": "official card (link only)",

@@ -283,8 +283,20 @@ _FRONT_SNAP_LOCK = threading.Lock()
 _FRONT_SNAP_COND = threading.Condition(_FRONT_SNAP_LOCK)
 _FRONT_SNAP_REFRESHING = False
 _FRONT_FILTER_REFRESHING: Dict[str, bool] = {}
+# A hung refresh must not freeze Newest on the last good page. After this
+# long, a newer build may start; the old one no longer writes the cache.
+# The flag covers the feed fetch only — thread enrichment must not hold it.
+_FRONT_SNAP_REFRESH_BUDGET_SEC = 90.0
+_FRONT_SNAP_GEN = 0
+_FRONT_FILTER_GEN: Dict[str, int] = {}
+_FRONT_SNAP_REFRESH_STARTED = 0.0
+_FRONT_FILTER_REFRESH_STARTED: Dict[str, float] = {}
 _FRONT_SNAP_TTL_SEC = 45.0
 _FRONT_FILTER_TTL_SEC = 45.0
+# Both feeds empty: retry soon. A full TTL here is how a blip stays on screen.
+_FRONT_SNAP_FAIL_BACKOFF_SEC = 15.0
+_FRONT_ENRICH_LOCK = threading.Lock()
+_FRONT_ENRICH_RUNNING = False
 _HIT_LOCK = threading.Lock()
 
 # Docket + provenance boards — light public reads.
@@ -318,6 +330,7 @@ _OFFICIAL_SECURITY_URL = "https://1f916.ai/.well-known/security.txt"
 _OFFICIAL_LLMS_URL = "https://1f916.ai/llms.txt"
 _OFFICIAL_OPENAPI_URL = "https://1f916.ai/openapi.json"
 _OFFICIAL_ECONOMY_URL = "https://1f916.ai/human/economy"
+_OFFICIAL_ABOUT_URL = "https://1f916.ai/about"
 
 # Public human chat — persisted under store.root; no expiry, no size cap.
 _CHAT_LOCK = threading.Lock()
@@ -3354,6 +3367,7 @@ function renderOfficial(snap) {{
     + '<p class="off-foot">' + externalLink(secUrl, "security.txt")
     + " · " + externalLink((snap && snap.official_llms_url) || "https://1f916.ai/llms.txt", "llms.txt")
     + " · " + externalLink((snap && snap.official_openapi_url) || "https://1f916.ai/openapi.json", "openapi.json")
+    + " · " + externalLink((snap && snap.official_about_url) || "https://1f916.ai/about", "about")
     + " · " + externalLink((snap && snap.official_privacy_url) || "https://1f916.ai/privacy", "privacy")
     + " · " + externalLink((snap && snap.official_terms_url) || "https://1f916.ai/terms", "terms")
     + " · " + externalLink((snap && snap.official_economy_url) || "https://1f916.ai/human/economy", "economy")
@@ -6926,13 +6940,15 @@ def _enrich_front_blob_tags(
 
 def _claim_front_snapshot(
     *, filtered: bool, fkey: str
-) -> Tuple[Optional[Dict[str, Any]], bool]:
+) -> Tuple[Optional[Dict[str, Any]], bool, int]:
     """Cache claim for the front snapshot.
 
-    Returns ``(snap, should_compute)``. A stale snap with ``should_compute``
-    means the caller should refresh in the background and return stale now.
+    Returns ``(snap, should_compute, gen)``. A stale snap with
+    ``should_compute`` means the caller should refresh in the background and
+    return stale now. ``gen`` is the build id that may write the cache;
+    a newer claim supersedes a refresh that has already run past the budget.
     """
-    global _FRONT_SNAP_REFRESHING
+    global _FRONT_SNAP_REFRESHING, _FRONT_SNAP_GEN, _FRONT_SNAP_REFRESH_STARTED
     ttl = _FRONT_FILTER_TTL_SEC if filtered else _FRONT_SNAP_TTL_SEC
     with _FRONT_SNAP_COND:
         while True:
@@ -6942,30 +6958,54 @@ def _claim_front_snapshot(
                 cached = entry.get("snap")
                 age = now - float(entry.get("fetched_at") or 0)
                 refreshing = bool(_FRONT_FILTER_REFRESHING.get(fkey))
+                started = float(_FRONT_FILTER_REFRESH_STARTED.get(fkey) or 0)
             else:
                 cached = _FRONT_SNAP_CACHE.get("snap")
                 age = now - float(_FRONT_SNAP_CACHE.get("fetched_at") or 0)
                 refreshing = bool(_FRONT_SNAP_REFRESHING)
+                started = float(_FRONT_SNAP_REFRESH_STARTED or 0)
             if cached is not None and age < ttl:
-                return dict(cached), False
-            if refreshing:
+                return dict(cached), False, 0
+            stuck = (
+                refreshing
+                and started > 0
+                and (now - started) >= _FRONT_SNAP_REFRESH_BUDGET_SEC
+            )
+            if refreshing and not stuck:
                 if cached is not None:
-                    return dict(cached), False
+                    return dict(cached), False, 0
                 _FRONT_SNAP_COND.wait(timeout=90)
                 continue
             if filtered:
+                gen = int(_FRONT_FILTER_GEN.get(fkey) or 0) + 1
+                _FRONT_FILTER_GEN[fkey] = gen
                 _FRONT_FILTER_REFRESHING[fkey] = True
+                _FRONT_FILTER_REFRESH_STARTED[fkey] = now
             else:
+                _FRONT_SNAP_GEN += 1
+                gen = _FRONT_SNAP_GEN
                 _FRONT_SNAP_REFRESHING = True
+                _FRONT_SNAP_REFRESH_STARTED = now
             if cached is not None:
-                return dict(cached), True
-            return None, True
+                return dict(cached), True, gen
+            return None, True, gen
+
+
+def _front_feed_posts(snap: Optional[Dict[str, Any]], key: str) -> List[Dict[str, Any]]:
+    if not snap:
+        return []
+    blob = snap.get(key)
+    if not isinstance(blob, dict):
+        return []
+    return [p for p in (blob.get("posts") or []) if isinstance(p, dict)]
 
 
 def _front_post_count(snap: Optional[Dict[str, Any]]) -> int:
     if not snap:
         return 0
-    return len(((snap.get("front") or {}).get("posts") or []))
+    return len(_front_feed_posts(snap, "front")) + len(
+        _front_feed_posts(snap, "front_new")
+    )
 
 
 def _front_comment_count(snap: Optional[Dict[str, Any]]) -> int:
@@ -6976,32 +7016,72 @@ def _front_comment_count(snap: Optional[Dict[str, Any]]) -> int:
     )
 
 
+def _front_snap_gen_current(*, filtered: bool, fkey: str) -> int:
+    if filtered:
+        return int(_FRONT_FILTER_GEN.get(fkey) or 0)
+    return int(_FRONT_SNAP_GEN)
+
+
 def _store_front_snapshot(
-    snap: Dict[str, Any], *, filtered: bool, fkey: str
+    snap: Dict[str, Any], *, filtered: bool, fkey: str, gen: int = 0
 ) -> None:
     now = datetime.now(timezone.utc).timestamp()
     with _FRONT_SNAP_COND:
+        if gen and gen != _front_snap_gen_current(filtered=filtered, fkey=fkey):
+            return
         if filtered:
             prev = (_FRONT_FILTER_CACHE.get(fkey) or {}).get("snap")
         else:
             prev = _FRONT_SNAP_CACHE.get("snap")
-        # A 429/blip refresh must not blank a window people are already reading.
-        if _front_post_count(snap) == 0 and _front_post_count(prev) > 0:
+        # A 429/blip that returns neither feed must not blank a window people
+        # are already reading, or reset "updated" on unchanged posts.
+        incoming_front = _front_feed_posts(snap, "front")
+        incoming_new = _front_feed_posts(snap, "front_new")
+        if (
+            not incoming_front
+            and not incoming_new
+            and _front_post_count(prev) > 0
+        ):
+            # Leave the snapshot, but do not treat the miss as a fresh fill.
+            ttl = _FRONT_FILTER_TTL_SEC if filtered else _FRONT_SNAP_TTL_SEC
+            stamp = now - ttl + _FRONT_SNAP_FAIL_BACKOFF_SEC
             if filtered:
                 entry = _FRONT_FILTER_CACHE.get(fkey) or {}
-                entry["fetched_at"] = now
+                entry["fetched_at"] = stamp
                 _FRONT_FILTER_CACHE[fkey] = entry
             else:
-                _FRONT_SNAP_CACHE["fetched_at"] = now
+                _FRONT_SNAP_CACHE["fetched_at"] = stamp
             return
+        # Hot (/api/front) and newest (/api/new) fail independently — keep
+        # whichever feed still has rows so Newest is not stuck on the hot list.
+        snap = dict(snap)
+        if prev:
+            if not incoming_front and _front_feed_posts(prev, "front"):
+                snap["front"] = prev.get("front")
+            if not incoming_new and _front_feed_posts(prev, "front_new"):
+                snap["front_new"] = prev.get("front_new")
         if (
             prev
             and _front_comment_count(snap) == 0
             and _front_comment_count(prev) > 0
         ):
-            snap = dict(snap)
             snap["front_comments"] = list(prev.get("front_comments") or [])
             snap["front_comments_top"] = list(prev.get("front_comments_top") or [])
+        if prev:
+            for key in (
+                "moderation",
+                "flags",
+                "stats",
+                "official",
+                "official_security_url",
+                "official_about_url",
+                "identity_events",
+                "tags",
+                "post_tags",
+                "filters_applied",
+            ):
+                if key not in snap and prev.get(key) is not None:
+                    snap[key] = prev.get(key)
         if filtered:
             _FRONT_FILTER_CACHE[fkey] = {"fetched_at": now, "snap": snap}
         else:
@@ -7009,9 +7089,13 @@ def _store_front_snapshot(
             _FRONT_SNAP_CACHE["snap"] = snap
 
 
-def _release_front_snapshot(*, filtered: bool, fkey: str) -> None:
+def _release_front_snapshot(
+    *, filtered: bool, fkey: str, gen: int = 0
+) -> None:
     global _FRONT_SNAP_REFRESHING
     with _FRONT_SNAP_COND:
+        if gen and gen != _front_snap_gen_current(filtered=filtered, fkey=fkey):
+            return
         if filtered:
             _FRONT_FILTER_REFRESHING[fkey] = False
         else:
@@ -7025,8 +7109,13 @@ def _compute_front_snapshot(
     exclude_q: Optional[str],
     *,
     filtered: bool,
+    publish_posts: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Fetch society front sources. Tags come from /api/post, not per-label probes."""
+    """Fetch society front sources. Tags come from /api/post, not per-label probes.
+
+    ``publish_posts`` runs as soon as /api/front and /api/new have settled,
+    before flags, threads, and the changes walk. Newest must not wait on those.
+    """
     errors: List[str] = []
     bucket: Dict[str, Any] = {}
 
@@ -7057,10 +7146,32 @@ def _compute_front_snapshot(
         ("stats", lambda: build_stats_snapshot(client)),
         ("changes_tip", lambda: _fetch_changes_tip(client, max_pages=2)),
     )
+    published = False
     with ThreadPoolExecutor(max_workers=4) as pool:
-        futs = [pool.submit(_fetch, label, fn) for label, fn in jobs]
-        for fut in futs:
+        futs = {pool.submit(_fetch, label, fn): label for label, fn in jobs}
+        done_labels: Set[str] = set()
+        for fut in as_completed(futs):
             fut.result()
+            done_labels.add(futs[fut])
+            if (
+                publish_posts
+                and not published
+                and "front" in done_labels
+                and "front_new" in done_labels
+            ):
+                published = True
+                early_front = bucket.get("front")
+                early_new = bucket.get("front_new")
+                publish_posts(
+                    {
+                        "generated_at": datetime.now(timezone.utc).isoformat(),
+                        "mode": "front",
+                        "front": early_front if isinstance(early_front, dict) else {},
+                        "front_new": early_new if isinstance(early_new, dict) else {},
+                        "filters": {"tag": tag_q, "exclude": exclude_q},
+                        "errors": list(errors),
+                    }
+                )
 
     front = bucket.get("front") if isinstance(bucket.get("front"), dict) else {}
     front_new = (
@@ -7203,9 +7314,166 @@ def _compute_front_snapshot(
         "stats": society_stats,
         "official": official,
         "official_security_url": "https://1f916.ai/.well-known/security.txt",
+        "official_about_url": _OFFICIAL_ABOUT_URL,
         "identity_events": identity_events,
         "errors": errors,
     }
+
+
+def _fetch_front_feeds(
+    client: Client,
+    tag_q: Optional[str],
+    exclude_q: Optional[str],
+) -> Tuple[Dict[str, Any], Dict[str, Any], List[str]]:
+    """GET /api/front and /api/new only. Nothing else may share this wait."""
+    errors: List[str] = []
+    bucket: Dict[str, Any] = {}
+
+    def _fetch(label: str, fn: Any) -> None:
+        try:
+            bucket[label] = fn()
+        except ApiError as e:
+            errors.append("{}: {}".format(label, e))
+        except Exception as e:  # pragma: no cover
+            errors.append("{}: {}".format(label, e))
+
+    jobs = (
+        (
+            "front",
+            lambda: client.front("top", limit=100, tag=tag_q, exclude=exclude_q)
+            or {},
+        ),
+        (
+            "front_new",
+            lambda: client.front("new", limit=100, tag=tag_q, exclude=exclude_q)
+            or {},
+        ),
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futs = [pool.submit(_fetch, label, fn) for label, fn in jobs]
+        for fut in futs:
+            fut.result()
+    front = bucket.get("front") if isinstance(bucket.get("front"), dict) else {}
+    front_new = (
+        bucket.get("front_new") if isinstance(bucket.get("front_new"), dict) else {}
+    )
+    return front, front_new, errors
+
+
+def _overlay_feed_posts(
+    prev_blob: Any, incoming_blob: Any
+) -> Any:
+    """Keep the published post list; copy tags and flags onto matching ids."""
+    if not isinstance(prev_blob, dict):
+        return prev_blob
+    incoming_posts = []
+    if isinstance(incoming_blob, dict):
+        incoming_posts = [
+            p for p in (incoming_blob.get("posts") or []) if isinstance(p, dict)
+        ]
+    by_id: Dict[int, Dict[str, Any]] = {}
+    for row in incoming_posts:
+        try:
+            by_id[int(row.get("id"))] = row
+        except (TypeError, ValueError):
+            continue
+    posts: List[Dict[str, Any]] = []
+    for row in list(prev_blob.get("posts") or []):
+        if not isinstance(row, dict):
+            continue
+        merged = dict(row)
+        try:
+            src = by_id.get(int(merged.get("id")))
+        except (TypeError, ValueError):
+            src = None
+        if src:
+            if src.get("tags") and not merged.get("tags"):
+                merged["tags"] = list(src.get("tags") or [])
+            if src.get("flags") not in (None, "", 0) and not merged.get("flags"):
+                merged["flags"] = src.get("flags")
+        posts.append(merged)
+    out = dict(prev_blob)
+    out["posts"] = posts
+    return out
+
+
+def _merge_front_enrichment(
+    snap: Dict[str, Any], *, filtered: bool, fkey: str
+) -> None:
+    """Fold comments and chips onto the current page without touching its TTL.
+
+    A newer feed publish wins the post list. Enrichment that finishes late
+    must not put the previous hour's posts back, or reset ``fetched_at``.
+    """
+    side_keys = (
+        "front_comments",
+        "front_comments_top",
+        "moderation",
+        "flags",
+        "stats",
+        "official",
+        "official_security_url",
+        "official_about_url",
+        "identity_events",
+        "tags",
+        "post_tags",
+        "filters_applied",
+    )
+    with _FRONT_SNAP_COND:
+        if filtered:
+            entry = dict(_FRONT_FILTER_CACHE.get(fkey) or {})
+            prev = entry.get("snap")
+        else:
+            prev = _FRONT_SNAP_CACHE.get("snap")
+        if not isinstance(prev, dict):
+            return
+        merged = dict(prev)
+        for key in side_keys:
+            val = snap.get(key)
+            if val:
+                merged[key] = val
+        if snap.get("errors"):
+            merged["errors"] = list(snap.get("errors") or [])
+        merged["front"] = _overlay_feed_posts(prev.get("front"), snap.get("front"))
+        merged["front_new"] = _overlay_feed_posts(
+            prev.get("front_new"), snap.get("front_new")
+        )
+        if filtered:
+            entry["snap"] = merged
+            _FRONT_FILTER_CACHE[fkey] = entry
+        else:
+            _FRONT_SNAP_CACHE["snap"] = merged
+
+
+def _start_front_enrichment(
+    client: Client,
+    tag_q: Optional[str],
+    exclude_q: Optional[str],
+    *,
+    filtered: bool,
+    fkey: str,
+) -> None:
+    """One background pass for threads, flags, and comments. Not the feed lock."""
+    global _FRONT_ENRICH_RUNNING
+    with _FRONT_ENRICH_LOCK:
+        if _FRONT_ENRICH_RUNNING:
+            return
+        _FRONT_ENRICH_RUNNING = True
+
+    def _run() -> None:
+        global _FRONT_ENRICH_RUNNING
+        try:
+            snap = _compute_front_snapshot(
+                client, tag_q, exclude_q, filtered=filtered
+            )
+            _merge_front_enrichment(snap, filtered=filtered, fkey=fkey)
+        except Exception:
+            pass
+        finally:
+            with _FRONT_ENRICH_LOCK:
+                _FRONT_ENRICH_RUNNING = False
+
+    threading.Thread(target=_run, name="front-enrich", daemon=True).start()
 
 
 def _refresh_front_snapshot(
@@ -7215,15 +7483,42 @@ def _refresh_front_snapshot(
     *,
     filtered: bool,
     fkey: str,
+    gen: int = 0,
 ) -> Dict[str, Any]:
+    """Publish /api/front and /api/new, release the lock, then enrich.
+
+    Callers waiting on a cold cache return as soon as the two feeds land.
+    Thread crawls must not keep ``_FRONT_SNAP_REFRESHING`` set — that is how
+    the front page used to sit on one snapshot for hours.
+    """
+    partial: Dict[str, Any] = {}
     try:
-        snap = _compute_front_snapshot(
-            client, tag_q, exclude_q, filtered=filtered
-        )
-        _store_front_snapshot(snap, filtered=filtered, fkey=fkey)
-        return dict(snap)
+        front, front_new, errors = _fetch_front_feeds(client, tag_q, exclude_q)
+        partial = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "mode": "front",
+            "front": front,
+            "front_new": front_new,
+            "filters": {"tag": tag_q, "exclude": exclude_q},
+            "errors": list(errors),
+        }
+        _store_front_snapshot(partial, filtered=filtered, fkey=fkey, gen=gen)
     finally:
-        _release_front_snapshot(filtered=filtered, fkey=fkey)
+        _release_front_snapshot(filtered=filtered, fkey=fkey, gen=gen)
+    if _front_post_count(partial):
+        _start_front_enrichment(
+            client,
+            tag_q,
+            exclude_q,
+            filtered=filtered,
+            fkey=fkey,
+        )
+    with _FRONT_SNAP_COND:
+        if filtered:
+            stored = (_FRONT_FILTER_CACHE.get(fkey) or {}).get("snap")
+        else:
+            stored = _FRONT_SNAP_CACHE.get("snap")
+    return dict(stored or partial)
 
 
 def build_front_snapshot(
@@ -7246,20 +7541,22 @@ def build_front_snapshot(
     filtered = bool(tag_q or exclude_q)
     fkey = _front_filter_key(tag_q, exclude_q)
 
-    cached, should_compute = _claim_front_snapshot(filtered=filtered, fkey=fkey)
+    cached, should_compute, gen = _claim_front_snapshot(
+        filtered=filtered, fkey=fkey
+    )
     if not should_compute:
         return cached or {}
     if cached is not None:
         threading.Thread(
             target=_refresh_front_snapshot,
             args=(client, tag_q, exclude_q),
-            kwargs={"filtered": filtered, "fkey": fkey},
+            kwargs={"filtered": filtered, "fkey": fkey, "gen": gen},
             name="front-snap",
             daemon=True,
         ).start()
         return cached
     return _refresh_front_snapshot(
-        client, tag_q, exclude_q, filtered=filtered, fkey=fkey
+        client, tag_q, exclude_q, filtered=filtered, fkey=fkey, gen=gen
     )
 
 
@@ -7883,6 +8180,7 @@ def build_listings_snapshot(
             "official_openapi_url": _OFFICIAL_OPENAPI_URL,
             "official_privacy_url": "https://1f916.ai/privacy",
             "official_terms_url": "https://1f916.ai/terms",
+            "official_about_url": _OFFICIAL_ABOUT_URL,
             "official_economy_url": _OFFICIAL_ECONOMY_URL,
             "errors": errors,
         }
@@ -7923,6 +8221,7 @@ def build_offer_snapshot(client: Client, offer_id: int) -> Dict[str, Any]:
         "official_openapi_url": _OFFICIAL_OPENAPI_URL,
         "official_privacy_url": "https://1f916.ai/privacy",
         "official_terms_url": "https://1f916.ai/terms",
+        "official_about_url": _OFFICIAL_ABOUT_URL,
         "official_economy_url": _OFFICIAL_ECONOMY_URL,
         "errors": errors,
     }
@@ -7953,6 +8252,7 @@ def build_grants_snapshot(client: Client) -> Dict[str, Any]:
             "official_openapi_url": _OFFICIAL_OPENAPI_URL,
             "official_privacy_url": "https://1f916.ai/privacy",
             "official_terms_url": "https://1f916.ai/terms",
+            "official_about_url": _OFFICIAL_ABOUT_URL,
             "official_economy_url": _OFFICIAL_ECONOMY_URL,
             "errors": errors,
         }
@@ -8006,6 +8306,7 @@ def build_grant_snapshot(client: Client, slug: str) -> Dict[str, Any]:
         "official_openapi_url": _OFFICIAL_OPENAPI_URL,
         "official_privacy_url": "https://1f916.ai/privacy",
         "official_terms_url": "https://1f916.ai/terms",
+        "official_about_url": _OFFICIAL_ABOUT_URL,
         "official_economy_url": _OFFICIAL_ECONOMY_URL,
         "errors": errors,
     }
@@ -8061,6 +8362,7 @@ def build_grant_proposal_snapshot(
         "official_openapi_url": _OFFICIAL_OPENAPI_URL,
         "official_privacy_url": "https://1f916.ai/privacy",
         "official_terms_url": "https://1f916.ai/terms",
+        "official_about_url": _OFFICIAL_ABOUT_URL,
         "official_economy_url": _OFFICIAL_ECONOMY_URL,
         "errors": errors,
     }
@@ -8723,6 +9025,7 @@ function renderOfficial(snap) {{
     + '<p class="off-foot">' + externalLink(secUrl, "security.txt")
     + " · " + externalLink((snap && snap.official_llms_url) || "https://1f916.ai/llms.txt", "llms.txt")
     + " · " + externalLink((snap && snap.official_openapi_url) || "https://1f916.ai/openapi.json", "openapi.json")
+    + " · " + externalLink((snap && snap.official_about_url) || "https://1f916.ai/about", "about")
     + " · " + externalLink((snap && snap.official_privacy_url) || "https://1f916.ai/privacy", "privacy")
     + " · " + externalLink((snap && snap.official_terms_url) || "https://1f916.ai/terms", "terms")
     + " · " + externalLink((snap && snap.official_economy_url) || "https://1f916.ai/human/economy", "economy")

@@ -437,5 +437,215 @@ class WatchlistTrailPreviewTests(unittest.TestCase):
         self.assertEqual(peeked["comments"][0]["id"], 44796)
 
 
+class FrontSnapshotFreshnessTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._cache = dict(watch_mod._FRONT_SNAP_CACHE)
+        self._refreshing = watch_mod._FRONT_SNAP_REFRESHING
+        self._gen = watch_mod._FRONT_SNAP_GEN
+        self._started = watch_mod._FRONT_SNAP_REFRESH_STARTED
+        watch_mod._FRONT_SNAP_CACHE.clear()
+        watch_mod._FRONT_SNAP_CACHE.update({"fetched_at": 0.0, "snap": None})
+        watch_mod._FRONT_SNAP_REFRESHING = False
+        watch_mod._FRONT_SNAP_GEN = 0
+        watch_mod._FRONT_SNAP_REFRESH_STARTED = 0.0
+        self._enriching = watch_mod._FRONT_ENRICH_RUNNING
+        watch_mod._FRONT_ENRICH_RUNNING = False
+
+    def tearDown(self) -> None:
+        watch_mod._FRONT_SNAP_CACHE.clear()
+        watch_mod._FRONT_SNAP_CACHE.update(self._cache)
+        watch_mod._FRONT_SNAP_REFRESHING = self._refreshing
+        watch_mod._FRONT_SNAP_GEN = self._gen
+        watch_mod._FRONT_SNAP_REFRESH_STARTED = self._started
+        watch_mod._FRONT_ENRICH_RUNNING = self._enriching
+
+    def test_failed_hot_feed_keeps_newest_posts(self) -> None:
+        old = {
+            "generated_at": "2026-09-22T23:28:00+00:00",
+            "front": {"posts": [{"id": 6394, "created_at": 1, "title": "old hot"}]},
+            "front_new": {"posts": [{"id": 6394, "created_at": 1, "title": "old new"}]},
+            "moderation": {"count": 3},
+        }
+        watch_mod._FRONT_SNAP_CACHE["snap"] = old
+        watch_mod._FRONT_SNAP_CACHE["fetched_at"] = 1.0
+        watch_mod._store_front_snapshot(
+            {
+                "generated_at": "2026-09-23T01:30:00+00:00",
+                "front": {},
+                "front_new": {
+                    "posts": [{"id": 6425, "created_at": 9, "title": "just now"}]
+                },
+            },
+            filtered=False,
+            fkey="",
+            gen=0,
+        )
+        stored = watch_mod._FRONT_SNAP_CACHE["snap"]
+        self.assertEqual(stored["front_new"]["posts"][0]["id"], 6425)
+        self.assertEqual(stored["front"]["posts"][0]["id"], 6394)
+        self.assertEqual(stored["moderation"]["count"], 3)
+        self.assertEqual(stored["generated_at"], "2026-09-23T01:30:00+00:00")
+
+    def test_blank_refresh_does_not_reset_updated_at(self) -> None:
+        old = {
+            "generated_at": "2026-09-22T23:28:00+00:00",
+            "front": {"posts": [{"id": 6394, "created_at": 1}]},
+            "front_new": {"posts": [{"id": 6394, "created_at": 1}]},
+        }
+        watch_mod._FRONT_SNAP_CACHE["snap"] = old
+        watch_mod._store_front_snapshot(
+            {"generated_at": "2026-09-23T01:30:00+00:00", "front": {}, "front_new": {}},
+            filtered=False,
+            fkey="",
+        )
+        stored = watch_mod._FRONT_SNAP_CACHE["snap"]
+        self.assertEqual(stored["generated_at"], "2026-09-22T23:28:00+00:00")
+        self.assertEqual(stored["front_new"]["posts"][0]["id"], 6394)
+
+    def test_stuck_refresh_can_be_superseded(self) -> None:
+        watch_mod._FRONT_SNAP_CACHE["snap"] = {
+            "generated_at": "2026-09-22T23:28:00+00:00",
+            "front": {"posts": [{"id": 6394}]},
+        }
+        watch_mod._FRONT_SNAP_CACHE["fetched_at"] = 0.0
+        watch_mod._FRONT_SNAP_REFRESHING = True
+        watch_mod._FRONT_SNAP_GEN = 4
+        watch_mod._FRONT_SNAP_REFRESH_STARTED = (
+            datetime.now(timezone.utc).timestamp()
+            - watch_mod._FRONT_SNAP_REFRESH_BUDGET_SEC
+            - 5
+        )
+        cached, should_compute, gen = watch_mod._claim_front_snapshot(
+            filtered=False, fkey=""
+        )
+        self.assertTrue(should_compute)
+        self.assertEqual(gen, 5)
+        self.assertEqual(cached["front"]["posts"][0]["id"], 6394)
+        watch_mod._store_front_snapshot(
+            {
+                "generated_at": "stale-build",
+                "front_new": {"posts": [{"id": 1, "title": "from the hung build"}]},
+            },
+            filtered=False,
+            fkey="",
+            gen=4,
+        )
+        self.assertEqual(
+            watch_mod._FRONT_SNAP_CACHE["snap"]["front"]["posts"][0]["id"], 6394
+        )
+        watch_mod._store_front_snapshot(
+            {
+                "generated_at": "fresh",
+                "front_new": {"posts": [{"id": 6425, "title": "just now"}]},
+            },
+            filtered=False,
+            fkey="",
+            gen=5,
+        )
+        self.assertEqual(
+            watch_mod._FRONT_SNAP_CACHE["snap"]["front_new"]["posts"][0]["id"], 6425
+        )
+        watch_mod._release_front_snapshot(filtered=False, fkey="", gen=4)
+        self.assertTrue(watch_mod._FRONT_SNAP_REFRESHING)
+        watch_mod._release_front_snapshot(filtered=False, fkey="", gen=5)
+        self.assertFalse(watch_mod._FRONT_SNAP_REFRESHING)
+
+    def test_newest_posts_publish_before_slow_enrichment(self) -> None:
+        import threading
+
+        gate = threading.Event()
+
+        class _Client:
+            def front(self, order: str = "top", *, limit: Optional[int] = None, tag: Optional[str] = None, exclude: Optional[str] = None) -> Dict[str, Any]:
+                if order == "new":
+                    return {"posts": [{"id": 6425, "created_at": 1790127129737, "title": "just now"}]}
+                return {"posts": [{"id": 6400, "created_at": 1, "title": "hot"}]}
+
+            def tags(self) -> Dict[str, Any]:
+                gate.wait(timeout=5)
+                return {}
+
+        published: Dict[str, Any] = {}
+        ready = threading.Event()
+
+        def _publish(partial: Dict[str, Any]) -> None:
+            published.update(partial)
+            ready.set()
+
+        def _run() -> None:
+            watch_mod._compute_front_snapshot(
+                _Client(),
+                None,
+                None,
+                filtered=False,
+                publish_posts=_publish,
+            )
+
+        worker = threading.Thread(target=_run)
+        worker.start()
+        self.assertTrue(ready.wait(timeout=3), "newest posts waited on the slow fetch")
+        self.assertEqual(published["front_new"]["posts"][0]["id"], 6425)
+        self.assertTrue(worker.is_alive())
+        gate.set()
+        worker.join(timeout=5)
+        self.assertFalse(worker.is_alive())
+
+    def test_blank_refresh_retries_soon(self) -> None:
+        watch_mod._FRONT_SNAP_CACHE["snap"] = {
+            "generated_at": "old",
+            "front": {"posts": [{"id": 1}]},
+            "front_new": {"posts": [{"id": 1}]},
+        }
+        watch_mod._FRONT_SNAP_CACHE["fetched_at"] = 1.0
+        before = datetime.now(timezone.utc).timestamp()
+        watch_mod._store_front_snapshot(
+            {"generated_at": "miss", "front": {}, "front_new": {}},
+            filtered=False,
+            fkey="",
+        )
+        stamp = float(watch_mod._FRONT_SNAP_CACHE["fetched_at"])
+        ttl = watch_mod._FRONT_SNAP_TTL_SEC
+        backoff = watch_mod._FRONT_SNAP_FAIL_BACKOFF_SEC
+        self.assertGreater(stamp, before - ttl)
+        self.assertLess(stamp, before - ttl + backoff + 2)
+        self.assertEqual(
+            watch_mod._FRONT_SNAP_CACHE["snap"]["generated_at"], "old"
+        )
+
+    def test_feed_refresh_returns_before_enrichment(self) -> None:
+        import threading
+
+        gate = threading.Event()
+        started = threading.Event()
+
+        class _Client:
+            def front(self, order: str = "top", *, limit: Optional[int] = None, tag: Optional[str] = None, exclude: Optional[str] = None) -> Dict[str, Any]:
+                if order == "new":
+                    return {"posts": [{"id": 6509, "title": "just now"}]}
+                return {"posts": [{"id": 6509, "title": "just now"}]}
+
+            def tags(self) -> Dict[str, Any]:
+                started.set()
+                gate.wait(timeout=5)
+                return {}
+
+        watch_mod._FRONT_SNAP_REFRESHING = True
+        snap = watch_mod._refresh_front_snapshot(
+            _Client(), None, None, filtered=False, fkey="", gen=0
+        )
+        self.assertEqual(snap["front"]["posts"][0]["id"], 6509)
+        self.assertFalse(watch_mod._FRONT_SNAP_REFRESHING)
+        self.assertTrue(started.wait(timeout=3), "enrichment never started")
+        self.assertTrue(watch_mod._FRONT_ENRICH_RUNNING)
+        watch_mod._FRONT_SNAP_CACHE["fetched_at"] = 0.0
+        cached, should_compute, gen = watch_mod._claim_front_snapshot(
+            filtered=False, fkey=""
+        )
+        self.assertTrue(should_compute)
+        self.assertEqual(cached["front"]["posts"][0]["id"], 6509)
+        watch_mod._release_front_snapshot(filtered=False, fkey="", gen=gen)
+        gate.set()
+
+
 if __name__ == "__main__":
     unittest.main()
