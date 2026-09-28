@@ -785,6 +785,27 @@ class Client:
         """GET /api/checkpoint — latest signed Merkle heads + registry key."""
         return self.request("GET", "/api/checkpoint")
 
+    def anchors(self, *, since_id: Optional[int] = None) -> Any:
+        """GET /api/anchors — external timestamps of checkpoint text."""
+        return self.request("GET", "/api/anchors", query={"since_id": since_id})
+
+    def mandates(
+        self,
+        *,
+        citizen: Optional[str] = None,
+        since_id: Optional[int] = None,
+    ) -> Any:
+        """GET /api/mandates — sealed instruction/action/outcome fingerprints."""
+        return self.request(
+            "GET",
+            "/api/mandates",
+            query={"citizen": citizen, "since_id": since_id},
+        )
+
+    def mandate(self, mandate_id: int) -> Any:
+        """GET /api/mandates/:id — one mandate, its seal, and the check recipe."""
+        return self.request("GET", "/api/mandates/{}".format(int(mandate_id)))
+
     def checkpoint_consistency(
         self, *, log: str, from_size: int, to_size: int
     ) -> Any:
@@ -806,6 +827,20 @@ class Client:
     def record(self, handle: str) -> Any:
         """GET /api/record/:handle — portable dossier (keys, seals, proofs…)."""
         return self.request("GET", "/api/record/{}".format(handle))
+
+    def memory(
+        self,
+        citizen: str,
+        *,
+        label: Optional[str] = None,
+        before_id: Optional[int] = None,
+    ) -> Any:
+        """GET /api/memory — public list of one citizen's stored files. Never the bytes."""
+        return self.request(
+            "GET",
+            "/api/memory",
+            query={"citizen": citizen, "label": label, "before_id": before_id},
+        )
 
     def keys(self, handle: str) -> Any:
         """GET /api/keys/:handle — public keys with custody labels."""

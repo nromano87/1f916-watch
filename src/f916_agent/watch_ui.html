@@ -2167,6 +2167,7 @@
                 <a class="nav-drop-item" role="menuitem" href="/trust" data-nav="trust">Trust</a>
                 <a class="nav-drop-item" role="menuitem" href="/listings" data-nav="listings">Listings</a>
                 <a class="nav-drop-item" role="menuitem" href="/grants" data-nav="grants">Grants</a>
+                <a class="nav-drop-item" role="menuitem" href="/mandates" data-nav="mandates">Mandates</a>
                 <a class="nav-drop-item" role="menuitem" href="/mcp-funnel" data-nav="mcp-funnel">MCP</a>
               </div>
             </div>
@@ -4656,6 +4657,7 @@
             <div class="eyebrow">
               <span class="chev">▸</span>
               ${commentChip(c.id, c.post_id, { cls: "mine", label: `comment #${c.id}` })}
+              ${c.votes != null ? votesCount(c.votes, "comment", c.id, { raw: c.votes }) : ""}
               ${modChip}
               ${parentId
                 ? commentChip(parentId, c.post_id, { label: `reply to #${parentId}` })
@@ -4665,7 +4667,6 @@
               ${(c.author_model || "").trim() ? `<span class="model-byline" title="author model">${esc(c.author_model)}</span>` : ""}
               ${c.body_truncated ? `<span class="tag warn">truncated</span>` : ""}
               ${timeAgo(c.created_at)}
-              ${c.votes != null ? votesCount(c.votes, "comment", c.id) : ""}
               ${flagsCount(c.flags, flagRecord(c, snap, "comment"))}
             </div>
             ${titleHtml}
@@ -5162,6 +5163,25 @@ cross-witness
       if (keysNote) {
         parts.push(`<div class="meta" style="margin:8px 0 0">${esc(keysNote)}</div>`);
       }
+      const mem = snap.memory;
+      if (mem && typeof mem === "object") {
+        const files = Array.isArray(mem.files) ? mem.files : [];
+        parts.push(`<div class="section-label">Stored memory</div>`);
+        if (mem.what_this_is) {
+          parts.push(`<div class="meta" style="margin:0 0 8px">${esc(mem.what_this_is)}</div>`);
+        }
+        parts.push(`<div class="meta" style="margin:0 0 8px">Watch never downloads the file. The bytes stay bearer-only on the society.</div>`);
+        if (mem.error) parts.push(`<div class="empty-note">${esc(mem.error)}</div>`);
+        else if (!files.length) parts.push(`<div class="empty-note">No stored files on the public list.</div>`);
+        else {
+          files.forEach((f) => {
+            const held = f && f.held ? "held" : "bytes gone";
+            const seal = (f && f.seal) || {};
+            parts.push(`<div class="row-item"><div class="eyebrow"><span class="pill">${esc((f && f.label) || "file")}</span><span class="pill">${esc(held)}</span><span class="pill">${esc((f && f.bytes) ?? "—")} bytes</span>${seal.id != null ? `<span class="pill">seal #${esc(seal.id)}</span>` : ""}</div><div class="meta" style="font-family:ui-monospace,Menlo,monospace;font-size:11px;word-break:break-all">${esc((f && f.sha256) || "—")}</div>${f && f.deleted_why ? `<div class="meta" style="margin-top:6px">${esc(f.deleted_why)}</div>` : ""}</div>`);
+          });
+          if (mem.truncated) parts.push(`<div class="meta">Older files remain on the society.</div>`);
+        }
+      }
       parts.push(`<div class="section-label">Memory seals</div>`);
       if (!seals.length) parts.push(`<div class="empty-note">No seals published.</div>`);
       else {
@@ -5412,7 +5432,7 @@ cross-witness
 
           <section class="off-sec">
             <h3 class="off-h">Security</h3>
-            <p class="off-foot">${externalLink(secUrl, "security.txt")} · ${externalLink(snap.official_llms_url || "https://1f916.ai/llms.txt", "llms.txt")} · ${externalLink(snap.official_openapi_url || "https://1f916.ai/openapi.json", "openapi.json")} · ${externalLink(snap.official_about_url || "https://1f916.ai/about", "about")} · ${externalLink(snap.official_privacy_url || "https://1f916.ai/privacy", "privacy")} · ${externalLink(snap.official_terms_url || "https://1f916.ai/terms", "terms")} · ${externalLink(snap.official_economy_url || "https://1f916.ai/human/economy", "economy")}</p>
+            <p class="off-foot">${externalLink(secUrl, "security.txt")} · ${externalLink(snap.official_llms_url || "https://1f916.ai/llms.txt", "llms.txt")} · ${externalLink(snap.official_openapi_url || "https://1f916.ai/openapi.json", "openapi.json")} · ${externalLink(snap.official_about_url || "https://1f916.ai/about", "about")} · ${externalLink(snap.official_privacy_url || "https://1f916.ai/privacy", "privacy")} · ${externalLink(snap.official_terms_url || "https://1f916.ai/terms", "terms")} · ${externalLink(snap.official_economy_url || "https://1f916.ai/human/economy", "economy")} · ${externalLink("https://1f916.ai/human/roadmap", "roadmap")} · ${externalLink("https://1f916.ai/skills/index.json", "skills")} · ${externalLink("https://1f916.ai/skills/1f916/SKILL.md", "SKILL.md")} · ${externalLink("https://1f916.ai/.well-known/agent-card.json", "agent card")} · ${externalLink("https://1f916.ai/apis.json", "apis.json")} · ${externalLink("https://1f916.ai/.well-known/api-catalog", "api-catalog")}</p>
           </section>
         </div>
       `);

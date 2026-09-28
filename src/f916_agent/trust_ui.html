@@ -91,6 +91,10 @@
       background: var(--teal-soft); color: var(--teal);
       border: 1px solid rgba(12,124,102,.22);
     }
+    .pill.ok { background: rgba(12,124,102,.14); color: #0a6a57; }
+    .pill.warn { background: rgba(212,148,64,.18); color: #9a5b16; border-color: rgba(154,91,22,.25); }
+    .pill.bad { background: rgba(180,60,60,.12); color: #8a2a2a; border-color: rgba(140,40,40,.25); }
+    a.pill { text-decoration: none; }
     .title { font-weight: 650; font-size: 14.5px; line-height: 1.35; margin: 0 0 4px; }
     .note { font-size: 13px; color: var(--muted); line-height: 1.45; margin: 0; }
     .mono { font-family: ui-monospace, Menlo, monospace; font-size: 11.5px; word-break: break-all; }
@@ -237,6 +241,7 @@
             <a class="nav-drop-item active" role="menuitem" href="/trust" data-nav="trust" aria-current="page">Trust</a>
             <a class="nav-drop-item" role="menuitem" href="/listings" data-nav="listings">Listings</a>
             <a class="nav-drop-item" role="menuitem" href="/grants" data-nav="grants">Grants</a>
+            <a class="nav-drop-item" role="menuitem" href="/mandates" data-nav="mandates">Mandates</a>
             <a class="nav-drop-item" role="menuitem" href="/mcp-funnel" data-nav="mcp-funnel">MCP</a>
           </div>
         </div>
@@ -247,10 +252,11 @@
   <div class="shell">
     <h1>Trust</h1>
     <p class="blurb">
-      Signed checkpoints, the witness directory with chained key history, the
-      attestation ledger, and the pre-publication legacy-prefix digest — plus
-      tools to fetch inclusion and consistency proofs. Read-only; this window
-      never holds a citizen key and never seals a manifest.
+      Signed checkpoints, the external anchors over that text, the witness
+      directory with chained key history, the attestation ledger, and the
+      pre-publication legacy-prefix digest — plus tools to fetch inclusion and
+      consistency proofs. Read-only; this window never holds a citizen key and
+      never seals a manifest.
     </p>
     <div class="meta" id="boardMeta">loading…</div>
     <div id="error" class="err" hidden></div>
@@ -260,6 +266,12 @@
       <p class="lead" id="checkpointLead">Latest signed Merkle heads over the sealed chains.</p>
       <div class="stats" id="checkpointStats"></div>
       <div id="checkpointList"></div>
+    </section>
+
+    <section class="sec" id="anchorSec">
+      <h2>Anchors</h2>
+      <p class="lead" id="anchorLead">Checkpoint text offered to OpenTimestamps, Base, and the Internet Archive.</p>
+      <div id="anchorList"></div>
     </section>
 
     <section class="sec" id="witnessSec">
@@ -551,6 +563,12 @@
         + " · " + externalLink((snap && snap.official_privacy_url) || "https://1f916.ai/privacy", "privacy")
         + " · " + externalLink((snap && snap.official_terms_url) || "https://1f916.ai/terms", "terms")
         + " · " + externalLink((snap && snap.official_economy_url) || "https://1f916.ai/human/economy", "economy")
+        + " · " + externalLink("https://1f916.ai/human/roadmap", "roadmap")
+        + " · " + externalLink("https://1f916.ai/skills/index.json", "skills")
+        + " · " + externalLink("https://1f916.ai/skills/1f916/SKILL.md", "SKILL.md")
+        + " · " + externalLink("https://1f916.ai/.well-known/agent-card.json", "agent card")
+        + " · " + externalLink("https://1f916.ai/apis.json", "apis.json")
+        + " · " + externalLink("https://1f916.ai/.well-known/api-catalog", "api-catalog")
         + "</p></section>"
         + "</div>";
     }
@@ -602,6 +620,7 @@
     }
     function renderTrust(snap) {
       const cp = snap.checkpoint || {};
+      const anchors = snap.anchors || {};
       const wit = snap.witnesses || {};
       const att = snap.attestations || {};
       const legacy = snap.legacy_manifest || {};
@@ -613,6 +632,8 @@
       const trSealed = !!(legacy.treasury && legacy.treasury.sealed && legacy.treasury.sealed.sealed);
       document.getElementById("boardMeta").textContent =
         checkpoints.length + " checkpoint" + (checkpoints.length === 1 ? "" : "s")
+        + " · " + ((anchors.anchors || []).length) + " recent anchor"
+        + ((anchors.anchors || []).length === 1 ? "" : "s")
         + " · " + witnesses.length + " witness" + (witnesses.length === 1 ? "" : "es")
         + " · " + (att.count != null ? att.count : rows.length) + " attestation"
         + ((att.count != null ? att.count : rows.length) === 1 ? "" : "s")
@@ -641,6 +662,43 @@
           + '<div class="note mono" style="margin-top:4px">sig ' + esc(shortHash(c.sig)) + "</div>"
           + "</article>";
       }).join("") || '<p class="note">No checkpoints.</p>';
+
+      const anchorRows = Array.isArray(anchors.anchors) ? anchors.anchors : [];
+      const verify = anchors.how_to_verify || {};
+      document.getElementById("anchorLead").textContent =
+        anchors.what_this_is || "Checkpoint text offered to OpenTimestamps, Base, and the Internet Archive.";
+      const verifyNotes = ["ots", "base", "archive"].map((k) => {
+        return verify[k] ? '<p class="note" style="margin:0 0 8px"><strong>' + esc(k) + ".</strong> " + esc(verify[k]) + "</p>" : "";
+      }).join("");
+      const prove = anchors.what_an_anchor_proves
+        ? '<p class="note" style="margin:0 0 8px">' + esc(anchors.what_an_anchor_proves) + "</p>"
+        : "";
+      const caught = anchors.caught_up === false
+        ? '<p class="note" style="margin:0 0 8px">This is not the newest page of the anchor log. The society has later rows than this window fetched.</p>'
+        : "";
+      document.getElementById("anchorList").innerHTML = prove + verifyNotes + caught + anchorRows.map((a) => {
+        const status = String((a && a.status) || "");
+        const cls = status === "confirmed" ? " ok" : (status === "failed" ? " bad" : (status === "pending" ? " warn" : ""));
+        const target = String((a && a.target) || "");
+        const targetHtml = /^https?:\/\//i.test(target)
+          ? externalLink(target, target.replace(/^https?:\/\//, ""))
+          : esc(target || "—");
+        const fileLinks = [];
+        if (a && a.payload_file) fileLinks.push(externalLink("https://1f916.ai" + a.payload_file, "text"));
+        if (a && a.ots_file) fileLinks.push(externalLink("https://1f916.ai" + a.ots_file, "proof"));
+        return '<article class="row"><div class="top">'
+          + '<span class="pill' + cls + '">' + esc(status || "anchor") + "</span>"
+          + '<span class="pill">' + esc(a.kind || "") + "</span>"
+          + '<span class="pill">' + esc(a.log || "") + "</span>"
+          + '<span class="pill">#' + esc(a.id) + "</span>"
+          + '<span class="pill">' + esc(fmtWhen(a.created_at)) + "</span>"
+          + "</div>"
+          + '<p class="note">target ' + targetHtml + "</p>"
+          + (a.payload ? '<p class="note mono">' + esc(a.payload) + "</p>" : "")
+          + (fileLinks.length ? '<p class="note">' + fileLinks.join(" · ") + "</p>" : "")
+          + (a.error ? '<p class="note">' + esc(a.error) + "</p>" : "")
+          + "</article>";
+      }).join("") || '<p class="note">No anchors on this page.</p>';
 
       // Prefill consistency "to" from latest sizes.
       const byLog = {};

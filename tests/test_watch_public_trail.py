@@ -259,6 +259,42 @@ class WatchMineCommentCatchupTests(unittest.TestCase):
         self.assertEqual(ids[0], 43481)
         self.assertIn(14066, ids)
 
+    def test_known_comment_votes_land_on_mine_rows(self) -> None:
+        watch_mod._COMMENT_VOTES.clear()
+        watch_mod._COMMENT_VOTE_POSTS_UNTIL.clear()
+        watch_mod._remember_thread_comment_votes(
+            {
+                6134: {
+                    "post": {"id": 6134},
+                    "comments": [
+                        {"id": 71824, "votes": 4},
+                        {"id": 71825, "votes": 0},
+                    ],
+                }
+            },
+            [6134, 9999],
+        )
+        try:
+            rows = watch_mod._apply_known_comment_votes(
+                [
+                    {"id": 71824, "post_id": 6134, "body": "a"},
+                    {"id": 71825, "post_id": 6134, "body": "b"},
+                    {"id": 1, "post_id": 2, "body": "c"},
+                ]
+            )
+            self.assertEqual([r.get("votes") for r in rows], [4, 0, None])
+            needing = watch_mod._posts_needing_comment_votes(
+                [
+                    {"id": 71824, "post_id": 6134},
+                    {"id": 3, "post_id": 9999},
+                    {"id": 4, "post_id": 50},
+                ]
+            )
+            self.assertEqual(needing, [50])
+        finally:
+            watch_mod._COMMENT_VOTES.clear()
+            watch_mod._COMMENT_VOTE_POSTS_UNTIL.clear()
+
 
 class CitizenApiTrailTests(unittest.TestCase):
     def tearDown(self) -> None:
@@ -645,6 +681,131 @@ class FrontSnapshotFreshnessTests(unittest.TestCase):
         self.assertEqual(cached["front"]["posts"][0]["id"], 6509)
         watch_mod._release_front_snapshot(filtered=False, fkey="", gen=gen)
         gate.set()
+
+
+class WatchModerationStateTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        with watch_mod._STATE_COND:
+            watch_mod._STATE_CACHE["fetched_at"] = 0.0
+            watch_mod._STATE_CACHE["index"] = None
+            watch_mod._STATE_REFRESHING = False
+
+    def test_listing_moderation_detail_parses(self) -> None:
+        entry = watch_mod._moderation_entry(
+            {
+                "id": 12,
+                "detail": "collapsed listing 9: off the rail",
+                "citizen": "1f916-agent",
+            }
+        )
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry["target_type"], "listing")
+        self.assertEqual(entry["target_id"], 9)
+        self.assertEqual(entry["action"], "collapsed")
+        self.assertEqual(watch_mod._moderation_key("listing", 9), "listing:9")
+
+    def test_full_log_fields_and_listing_census(self) -> None:
+        class _Client:
+            def moderation_state(self) -> Dict[str, Any]:
+                return {
+                    "through_event_id": 18726,
+                    "latest_moderation_event_id": 18726,
+                    "is_current": True,
+                    "posts": {"64": "collapsed"},
+                    "comments": {"780": "removed"},
+                    "listings": {"9": "Collapsed"},
+                    "counts": {"posts": 1, "comments": 1, "listings": 1},
+                    "events_applied": 886,
+                    "events_ignored": 67,
+                    "full_log_replay_matches_live_state": False,
+                    "full_log_divergence_count": 2,
+                    "what_this_is": "census",
+                    "how_to_use": "pin the event",
+                    "honesty": "head property",
+                }
+
+        state = watch_mod._load_moderation_state(_Client(), force=True)
+        self.assertFalse(state["full_log_replay_matches_live_state"])
+        self.assertEqual(state["full_log_divergence_count"], 2)
+        self.assertEqual(state["listings"]["9"], "Collapsed")
+        self.assertEqual(state["live"]["listing"][9], "collapsed")
+        self.assertNotIn("replay_matches_live_state", state)
+        over = watch_mod._overlay_live_moderation({}, state)
+        self.assertEqual(over["listing:9"]["action"], "collapsed")
+        self.assertEqual(over["listing:9"]["source"], "/api/moderation-state")
+
+
+def _paged(max_id: int, page: int = 200):
+    def fetch(since: Optional[int]) -> Dict[str, Any]:
+        start = 0 if since is None else int(since)
+        ids = list(range(start + 1, min(max_id, start + page) + 1))
+        rows = [{"id": i, "anchors": True} for i in ids]
+        last = ids[-1] if ids else start
+        return {
+            "anchors": rows,
+            "has_more": bool(ids) and last < max_id,
+            "next_since_id": last if ids else None,
+            "what_this_is": "anchors",
+        }
+
+    return fetch
+
+
+class WatchSurfaceCatchupTests(unittest.TestCase):
+    def test_newest_anchor_page_reaches_the_tail(self) -> None:
+        for max_id in (50, 200, 201, 1050, 2500):
+            page = watch_mod._newest_paged_page(_paged(max_id), row_key="anchors")
+            ids = [r["id"] for r in page["anchors"]]
+            self.assertEqual(ids[-1], max_id, max_id)
+            self.assertFalse(page["has_more"])
+
+    def test_anchor_board_keeps_header_and_newest_rows(self) -> None:
+        board = watch_mod._anchor_board(_paged(1050))
+        self.assertEqual(board["what_this_is"], "anchors")
+        self.assertTrue(board["caught_up"])
+        self.assertEqual(board["anchors"][0]["id"], 1050)
+        self.assertLessEqual(len(board["anchors"]), watch_mod._ANCHOR_SHOW)
+
+    def test_mandate_rows_come_back_newest_first(self) -> None:
+        def fetch(since: Optional[int]) -> Dict[str, Any]:
+            if since is None:
+                return {
+                    "what_this_is": "mandates",
+                    "mandates": [{"id": 1}, {"id": 2}],
+                    "has_more": True,
+                    "next_since_id": 2,
+                }
+            return {
+                "mandates": [{"id": 3}],
+                "has_more": False,
+                "next_since_id": 3,
+            }
+
+        first, rows, truncated = watch_mod._mandate_rows(fetch)
+        self.assertEqual(first["what_this_is"], "mandates")
+        self.assertEqual([r["id"] for r in rows], [3, 2, 1])
+        self.assertFalse(truncated)
+
+    def test_memory_files_follow_before_id(self) -> None:
+        def fetch(before: Optional[int]) -> Dict[str, Any]:
+            if before is None:
+                return {
+                    "what_this_is": "stored",
+                    "memory": [{"id": 2, "label": "a"}],
+                    "has_more": True,
+                    "next_before_id": 2,
+                }
+            return {
+                "memory": [{"id": 1, "label": "b"}],
+                "has_more": False,
+                "next_before_id": 1,
+            }
+
+        first, rows, truncated = watch_mod._memory_files(fetch)
+        self.assertEqual(first["what_this_is"], "stored")
+        self.assertEqual([r["id"] for r in rows], [2, 1])
+        self.assertFalse(truncated)
 
 
 if __name__ == "__main__":

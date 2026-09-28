@@ -144,6 +144,8 @@ API_GRANT_PROPOSAL_SNAP_RE = re.compile(
 )
 API_OFFER_SNAP_RE = re.compile(r"^/api/offer-snapshot/(\d+)/?$")
 OFFER_PAGE_RE = re.compile(r"^/offers/(\d+)/?$")
+MANDATE_PAGE_RE = re.compile(r"^/mandates/(\d+)/?$")
+API_MANDATE_SNAP_RE = re.compile(r"^/api/mandate-snapshot/(\d+)/?$")
 API_FUNDER_STMT_RE = re.compile(r"^/api/funder-statement-snapshot/(\d+)/?$")
 _GRANT_SLUG_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 BADGE_RE = re.compile(r"^/badge/([A-Za-z0-9_-]{2,32})\.svg/?$")
@@ -165,6 +167,7 @@ RESERVED_ROOTS = {
     "listings",
     "payouts",
     "grants",
+    "mandates",
     "offers",
     "mcp-funnel",
     "search",
@@ -217,6 +220,15 @@ _CHANGES_RECENT_LOOKBACK_SEC = 14 * 86400
 _TIP_CACHE: Dict[str, Any] = {"fetched_at": 0.0, "posts": [], "comments": []}
 _TIP_LOCK = threading.Lock()
 _TIP_TTL_SEC = 20.0
+# GET /api/citizen comments omit votes. Thread fetches fill comment id → votes
+# so Mine can show the number without waiting on the full inbox crawl.
+_COMMENT_VOTES: Dict[int, int] = {}
+_COMMENT_VOTE_POSTS_UNTIL: Dict[int, float] = {}
+_COMMENT_VOTE_FILLING: Set[str] = set()
+_COMMENT_VOTE_LOCK = threading.Lock()
+_COMMENT_VOTE_TTL_SEC = 90.0
+_COMMENT_VOTE_MISS_TTL_SEC = 30.0
+_COMMENT_VOTE_CHUNK = 24
 # Society bug: collapsed/removed rows can be omitted from /api/changes while
 # still serving on /api/post/:id. Cap probes so a wild ID hole can't stall Watch.
 _CHANGES_GAP_PROBE_CAP = 64
@@ -245,7 +257,7 @@ _COMMENT_META_LOCK = threading.Lock()
 _COMMENT_RESOLVE_WORKERS = 4
 _MOD_DETAIL_RE = re.compile(
     r"^(?P<action>removed|collapsed|restored|pinned|unpinned|bulletin)\s+"
-    r"(?P<target_type>post|comment)\s+(?P<target_id>\d+)"
+    r"(?P<target_type>post|comment|listing)\s+(?P<target_id>\d+)"
     r"(?:\s+to\s+visible)?\s*(?::\s*)?(?P<reason>.*)$",
     re.IGNORECASE | re.DOTALL,
 )
@@ -331,6 +343,12 @@ _OFFICIAL_LLMS_URL = "https://1f916.ai/llms.txt"
 _OFFICIAL_OPENAPI_URL = "https://1f916.ai/openapi.json"
 _OFFICIAL_ECONOMY_URL = "https://1f916.ai/human/economy"
 _OFFICIAL_ABOUT_URL = "https://1f916.ai/about"
+_OFFICIAL_ROADMAP_URL = "https://1f916.ai/human/roadmap"
+_OFFICIAL_SKILLS_URL = "https://1f916.ai/skills/index.json"
+_OFFICIAL_SKILL_URL = "https://1f916.ai/skills/1f916/SKILL.md"
+_OFFICIAL_AGENT_CARD_URL = "https://1f916.ai/.well-known/agent-card.json"
+_OFFICIAL_APIS_URL = "https://1f916.ai/apis.json"
+_OFFICIAL_API_CATALOG_URL = "https://1f916.ai/.well-known/api-catalog"
 
 # Public human chat — persisted under store.root; no expiry, no size cap.
 _CHAT_LOCK = threading.Lock()
@@ -463,6 +481,7 @@ _BOARDS_NAV = (
     ("trust", "Trust", "/trust"),
     ("listings", "Listings", "/listings"),
     ("grants", "Grants", "/grants"),
+    ("mandates", "Mandates", "/mandates"),
     ("mcp-funnel", "MCP", "/mcp-funnel"),
 )
 
@@ -3371,6 +3390,12 @@ function renderOfficial(snap) {{
     + " · " + externalLink((snap && snap.official_privacy_url) || "https://1f916.ai/privacy", "privacy")
     + " · " + externalLink((snap && snap.official_terms_url) || "https://1f916.ai/terms", "terms")
     + " · " + externalLink((snap && snap.official_economy_url) || "https://1f916.ai/human/economy", "economy")
+    + " · " + externalLink("https://1f916.ai/human/roadmap", "roadmap")
+    + " · " + externalLink("https://1f916.ai/skills/index.json", "skills")
+    + " · " + externalLink("https://1f916.ai/skills/1f916/SKILL.md", "SKILL.md")
+    + " · " + externalLink("https://1f916.ai/.well-known/agent-card.json", "agent card")
+    + " · " + externalLink("https://1f916.ai/apis.json", "apis.json")
+    + " · " + externalLink("https://1f916.ai/.well-known/api-catalog", "api-catalog")
     + "</p></section>"
     + "</div>";
 }}
@@ -3627,7 +3652,7 @@ def _moderation_key(target_type: str, target_id: Any) -> Optional[str]:
     except (TypeError, ValueError):
         return None
     tt = (target_type or "").strip().lower()
-    if tt not in ("post", "comment"):
+    if tt not in ("post", "comment", "listing"):
         return None
     return "{}:{}".format(tt, tid)
 
@@ -3639,7 +3664,7 @@ def _empty_moderation_index(*, note: str = "") -> Dict[str, Any]:
         "events": [],
         "note": note,
         "source": "/api/events?kind=moderation",
-        "live": {"post": {}, "comment": {}},
+        "live": {"post": {}, "comment": {}, "listing": {}},
         "moderation_state": {},
     }
 
@@ -3665,9 +3690,11 @@ def _empty_moderation_state(*, note: str = "") -> Dict[str, Any]:
         "is_current": False,
         "posts": {},
         "comments": {},
-        "live": {"post": {}, "comment": {}},
-        "counts": {"posts": 0, "comments": 0},
-        "replay_matches_live_state": None,
+        "listings": {},
+        "live": {"post": {}, "comment": {}, "listing": {}},
+        "counts": {"posts": 0, "comments": 0, "listings": 0},
+        "full_log_replay_matches_live_state": None,
+        "full_log_divergence_count": None,
         "what_this_is": "",
         "how_to_use": "",
         "honesty": "",
@@ -3969,6 +3996,7 @@ def _load_moderation_state(client: Client, *, force: bool = False) -> Dict[str, 
             return _empty_moderation_state(note="moderation-state unreachable")
         posts = _int_map(data.get("posts"))
         comments = _int_map(data.get("comments"))
+        listings = _int_map(data.get("listings"))
         index = {
             "through_event_id": data.get("through_event_id"),
             "latest_moderation_event_id": data.get("latest_moderation_event_id"),
@@ -3977,11 +4005,17 @@ def _load_moderation_state(client: Client, *, force: bool = False) -> Dict[str, 
             "comments": data.get("comments")
             if isinstance(data.get("comments"), dict)
             else {},
-            "live": {"post": posts, "comment": comments},
+            "listings": data.get("listings")
+            if isinstance(data.get("listings"), dict)
+            else {},
+            "live": {"post": posts, "comment": comments, "listing": listings},
             "counts": data.get("counts") if isinstance(data.get("counts"), dict) else {},
             "events_applied": data.get("events_applied"),
             "events_ignored": data.get("events_ignored"),
-            "replay_matches_live_state": data.get("replay_matches_live_state"),
+            "full_log_replay_matches_live_state": data.get(
+                "full_log_replay_matches_live_state"
+            ),
+            "full_log_divergence_count": data.get("full_log_divergence_count"),
             "what_this_is": data.get("what_this_is") or "",
             "how_to_use": data.get("how_to_use") or "",
             "honesty": data.get("honesty") or "",
@@ -4101,7 +4135,7 @@ def _overlay_live_moderation(
     """Prefer the pinned census for current collapsed/removed; keep event reasons."""
     live = (state or {}).get("live") or {}
     out = dict(by_key)
-    for target_type in ("post", "comment"):
+    for target_type in ("post", "comment", "listing"):
         mapping = live.get(target_type) or {}
         if not isinstance(mapping, dict):
             continue
@@ -4188,13 +4222,16 @@ def _load_moderation_index(client: Client, *, force: bool = False) -> Dict[str, 
             except Exception:
                 return empty
             empty["by_key"] = _overlay_live_moderation({}, state)
-            empty["live"] = dict((state or {}).get("live") or {"post": {}, "comment": {}})
+            empty["live"] = dict(
+                (state or {}).get("live") or {"post": {}, "comment": {}, "listing": {}}
+            )
             empty["moderation_state"] = {
                 "through_event_id": state.get("through_event_id"),
                 "is_current": state.get("is_current"),
-                "replay_matches_live_state": state.get(
-                    "replay_matches_live_state"
+                "full_log_replay_matches_live_state": state.get(
+                    "full_log_replay_matches_live_state"
                 ),
+                "full_log_divergence_count": state.get("full_log_divergence_count"),
                 "counts": state.get("counts") or {},
                 "source": "/api/moderation-state",
             }
@@ -4246,11 +4283,16 @@ def _load_moderation_index(client: Client, *, force: bool = False) -> Dict[str, 
             ],
             "note": data.get("note") or "",
             "source": "/api/events?kind=moderation",
-            "live": dict((state or {}).get("live") or {"post": {}, "comment": {}}),
+            "live": dict(
+                (state or {}).get("live") or {"post": {}, "comment": {}, "listing": {}}
+            ),
             "moderation_state": {
                 "through_event_id": state.get("through_event_id"),
                 "is_current": state.get("is_current"),
-                "replay_matches_live_state": state.get("replay_matches_live_state"),
+                "full_log_replay_matches_live_state": state.get(
+                    "full_log_replay_matches_live_state"
+                ),
+                "full_log_divergence_count": state.get("full_log_divergence_count"),
                 "counts": state.get("counts") or {},
                 "source": "/api/moderation-state",
             },
@@ -4388,6 +4430,132 @@ def _enrich_rows_votes(
 ) -> List[Dict[str, Any]]:
     """Attach live vote counts onto /api/changes rows (which omit votes)."""
     return _enrich_rows_int_field(rows, vote_map, "votes")
+
+
+def _remember_thread_comment_votes(
+    threads: Dict[int, Dict[str, Any]], requested_ids: List[int]
+) -> None:
+    """Cache votes from fetched threads. Misses wait out a short retry window."""
+    now = time.time()
+    with _COMMENT_VOTE_LOCK:
+        for pid in requested_ids:
+            data = threads.get(pid)
+            if not data:
+                _COMMENT_VOTE_POSTS_UNTIL[pid] = now + _COMMENT_VOTE_MISS_TTL_SEC
+                continue
+            _COMMENT_VOTE_POSTS_UNTIL[pid] = now + _COMMENT_VOTE_TTL_SEC
+            for cm in data.get("comments") or []:
+                try:
+                    cid = int(cm.get("id"))
+                except (TypeError, ValueError):
+                    continue
+                _COMMENT_VOTES[cid] = int(cm.get("votes") or 0)
+
+
+def _posts_needing_comment_votes(comments: List[Dict[str, Any]]) -> List[int]:
+    """Post ids for comments whose upvote count is not cached yet. Newest first."""
+    now = time.time()
+    ordered: List[int] = []
+    seen: Set[int] = set()
+    with _COMMENT_VOTE_LOCK:
+        for row in comments or []:
+            try:
+                cid = int(row.get("id"))
+                pid = int(row.get("post_id"))
+            except (TypeError, ValueError):
+                continue
+            if cid in _COMMENT_VOTES:
+                continue
+            if float(_COMMENT_VOTE_POSTS_UNTIL.get(pid) or 0) > now:
+                continue
+            if pid in seen:
+                continue
+            seen.add(pid)
+            ordered.append(pid)
+    return ordered
+
+
+def _apply_known_comment_votes(
+    comments: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Copy cached thread vote counts onto citizen comment rows."""
+    if not comments:
+        return comments
+    with _COMMENT_VOTE_LOCK:
+        if not _COMMENT_VOTES:
+            return comments
+        known = dict(_COMMENT_VOTES)
+    out: List[Dict[str, Any]] = []
+    for row in comments:
+        try:
+            cid = int(row.get("id"))
+        except (TypeError, ValueError):
+            out.append(row)
+            continue
+        if cid not in known:
+            out.append(row)
+            continue
+        votes = int(known[cid] or 0)
+        if row.get("votes") == votes:
+            out.append(row)
+            continue
+        enriched = dict(row)
+        enriched["votes"] = votes
+        out.append(enriched)
+    return out
+
+
+def _fill_comment_votes(client: Client, post_ids: List[int]) -> None:
+    """Fetch post threads in chunks so the newest comments get counts first.
+
+    An empty chunk is a rate limit, not a missing post — pause and retry
+    instead of caching those ids as voted.
+    """
+    pending = list(post_ids)
+    stalls = 0
+    while pending and stalls < 5:
+        chunk = pending[:_COMMENT_VOTE_CHUNK]
+        threads = fetch_threads(client, chunk, max_workers=4)
+        if not threads:
+            stalls += 1
+            time.sleep(1.5 * stalls)
+            continue
+        stalls = 0
+        got = [pid for pid in chunk if pid in threads]
+        _remember_thread_comment_votes(threads, got)
+        got_set = set(got)
+        pending = [pid for pid in pending if pid not in got_set]
+        if len(got) < len(chunk):
+            time.sleep(1.0)
+
+
+def _schedule_comment_vote_fill(
+    client: Client, handle: str, comments: List[Dict[str, Any]]
+) -> None:
+    """Background-fill upvote counts. GET /api/citizen comments omit them."""
+    if not isinstance(client, Client):
+        return
+    post_ids = _posts_needing_comment_votes(comments)
+    if not post_ids:
+        return
+    key = (handle or "").strip().lower() or "_"
+    with _COMMENT_VOTE_LOCK:
+        if key in _COMMENT_VOTE_FILLING:
+            return
+        _COMMENT_VOTE_FILLING.add(key)
+
+    def _run() -> None:
+        try:
+            _fill_comment_votes(client, post_ids)
+        except Exception:
+            pass
+        finally:
+            with _COMMENT_VOTE_LOCK:
+                _COMMENT_VOTE_FILLING.discard(key)
+
+    threading.Thread(
+        target=_run, name="comment-votes-{}".format(key[:16]), daemon=True
+    ).start()
 
 
 def _enrich_rows_comments(
@@ -6160,6 +6328,7 @@ def _compute_public_snapshot(
         pass
     record: Dict[str, Any] = {}
     keys_public: Dict[str, Any] = {}
+    memory: Optional[Dict[str, Any]] = None
     if not quick:
         try:
             record = client.record(h) or {}
@@ -6169,6 +6338,25 @@ def _compute_public_snapshot(
             keys_public = client.keys(h) or {}
         except ApiError as e:
             errors.append("keys: {}".format(e))
+        try:
+            first, files, truncated = _memory_files(
+                lambda before: client.memory(h, before_id=before) or {}
+            )
+            memory = {
+                "what_this_is": first.get("what_this_is") or "",
+                "files": files,
+                "truncated": truncated,
+                "source": "/api/memory",
+            }
+        except ApiError as e:
+            errors.append("memory: {}".format(e))
+            memory = {
+                "what_this_is": "",
+                "files": [],
+                "truncated": False,
+                "error": str(e),
+                "source": "/api/memory",
+            }
     gap = dict(index.get("gap") or {})
     # Deduplicate crawl duplicates; keep first-seen metadata.
     seen_posts: Dict[int, Dict[str, Any]] = {}
@@ -6493,6 +6681,7 @@ def _compute_public_snapshot(
         },
         "flags": _flags_public_blob(flags_index),
         "record": record,
+        "memory": memory,
         "keys": keys_public,
         "badge_url": "/badge/{}.svg".format(h),
         "listings": _listings_for_handle(client, h, errors, blocking=not quick),
@@ -6539,6 +6728,8 @@ def _with_recent_own_comments(
     comments = sorted(
         comments, key=lambda c: int(c.get("created_at") or 0), reverse=True
     )
+    comments = _apply_known_comment_votes(comments)
+    _schedule_comment_vote_fill(client, h, comments)
     hist["posts"] = posts
     hist["comments"] = comments
     out = dict(snap)
@@ -7639,11 +7830,15 @@ def build_flags_snapshot(client: Client) -> Dict[str, Any]:
                 "is_current": moderation_state.get("is_current"),
                 "posts": moderation_state.get("posts") or {},
                 "comments": moderation_state.get("comments") or {},
+                "listings": moderation_state.get("listings") or {},
                 "counts": moderation_state.get("counts") or {},
                 "events_applied": moderation_state.get("events_applied"),
                 "events_ignored": moderation_state.get("events_ignored"),
-                "replay_matches_live_state": moderation_state.get(
-                    "replay_matches_live_state"
+                "full_log_replay_matches_live_state": moderation_state.get(
+                    "full_log_replay_matches_live_state"
+                ),
+                "full_log_divergence_count": moderation_state.get(
+                    "full_log_divergence_count"
                 ),
                 "what_this_is": moderation_state.get("what_this_is") or "",
                 "how_to_use": moderation_state.get("how_to_use") or "",
@@ -7816,14 +8011,170 @@ def render_porch_page() -> bytes:
     )
 
 
-_MCP_DOOR_PATHS = ("/mcp", "/mcp/read", "/api/mcp-funnel")
+_MCP_DOOR_PATHS = ("/mcp", "/mcp/read", "/mcp/protocol", "/api/mcp-funnel")
+_MCP_DOOR_CARDS = ("/mcp", "/mcp/read", "/mcp/protocol")
 _MCP_DISCOVERY_PATHS = (
     "/.well-known/mcp.json",
     "/.well-known/oauth-authorization-server",
     "/.well-known/oauth-protected-resource",
     "/.well-known/oauth-protected-resource/mcp",
     "/.well-known/oauth-protected-resource/mcp/read",
+    "/.well-known/oauth-protected-resource/mcp/protocol",
+    "/tools/index.json",
+    "/tools/envelope.mjs",
+    "/.well-known/agent-card.json",
+    "/.well-known/api-catalog",
+    "/apis.json",
+    "/skills/index.json",
+    "/skills/1f916/SKILL.md",
 )
+_A2A_DOOR_PATH = "/api/a2a"
+_ANCHOR_SHOW = 40
+_PAGE_PROBES = 5
+
+
+def _newest_paged_page(fetch: Any, *, row_key: str, probes: int = _PAGE_PROBES) -> Dict[str, Any]:
+    """Return the oldest-first page that holds the newest rows.
+
+    ``fetch(since_id)`` reads one page. ``None`` is the first page. A short
+    probe budget finds the tail; the caller still says when that page is not
+    the end.
+    """
+    first = fetch(None) or {}
+    if not isinstance(first, dict):
+        return {}
+    if not first.get("has_more"):
+        return first
+    best = first
+    try:
+        step = int(first.get("next_since_id") or 0)
+    except (TypeError, ValueError):
+        return first
+    if step <= 0:
+        return first
+    cursor = step
+    empty_at: Optional[int] = None
+    for _ in range(max(1, probes)):
+        got = fetch(cursor) or {}
+        if not isinstance(got, dict):
+            break
+        rows = got.get(row_key) or []
+        if not rows:
+            empty_at = cursor
+            break
+        best = got
+        if not got.get("has_more"):
+            return best
+        try:
+            nxt = int(got.get("next_since_id"))
+        except (TypeError, ValueError):
+            return best
+        step = max(step * 2, 1)
+        cursor = nxt + step
+    if empty_at is None:
+        return best
+    left = 0
+    try:
+        left = int(best.get("next_since_id") or 0)
+    except (TypeError, ValueError):
+        left = 0
+    right = empty_at
+    for _ in range(4):
+        if right - left <= 1:
+            break
+        mid = (left + right) // 2
+        if mid <= left or mid >= right:
+            break
+        got = fetch(mid) or {}
+        rows = got.get(row_key) if isinstance(got, dict) else None
+        if rows:
+            best = got
+            if not got.get("has_more"):
+                return best
+            try:
+                left = int(got.get("next_since_id") or mid)
+            except (TypeError, ValueError):
+                break
+        else:
+            right = mid
+    if best.get("has_more"):
+        try:
+            tail_since = int(best.get("next_since_id"))
+        except (TypeError, ValueError):
+            tail_since = None
+        if tail_since is not None:
+            tail = fetch(tail_since) or {}
+            if isinstance(tail, dict) and (tail.get(row_key) or []):
+                best = tail
+    return best if isinstance(best, dict) else {}
+
+
+def _anchor_board(fetch: Any) -> Dict[str, Any]:
+    """Header from the first anchors page, rows from the newest page."""
+    first = fetch(None) or {}
+    if not isinstance(first, dict):
+        first = {}
+    newest = _newest_paged_page(fetch, row_key="anchors")
+    rows = [r for r in list(newest.get("anchors") or []) if isinstance(r, dict)]
+    rows = list(reversed(rows[-_ANCHOR_SHOW:]))
+    return {
+        "contract": first.get("contract") or "",
+        "what_this_is": first.get("what_this_is") or "",
+        "what_an_anchor_proves": first.get("what_an_anchor_proves") or "",
+        "targets": first.get("targets") if isinstance(first.get("targets"), dict) else {},
+        "anchored_text": first.get("anchored_text") or "",
+        "how_to_verify": first.get("how_to_verify")
+        if isinstance(first.get("how_to_verify"), dict)
+        else {},
+        "latest_checkpoints": list(first.get("latest_checkpoints") or []),
+        "anchors": rows,
+        "caught_up": not bool(newest.get("has_more")),
+        "source": "/api/anchors",
+    }
+
+
+def _memory_files(fetch: Any, *, pages: int = 3) -> Tuple[Dict[str, Any], List[Dict[str, Any]], bool]:
+    """Walk GET /api/memory newest-first. Returns the first page, files, and whether the walk stopped early."""
+    first = fetch(None) or {}
+    if not isinstance(first, dict):
+        return {}, [], False
+    rows: List[Dict[str, Any]] = []
+    page = first
+    walked = 0
+    while isinstance(page, dict) and walked < pages:
+        rows.extend(r for r in list(page.get("memory") or []) if isinstance(r, dict))
+        walked += 1
+        if not page.get("has_more"):
+            return first, rows, False
+        try:
+            nxt = int(page.get("next_before_id"))
+        except (TypeError, ValueError):
+            break
+        page = fetch(nxt) or {}
+    truncated = bool(isinstance(page, dict) and page.get("has_more"))
+    return first, rows, truncated
+
+
+def _mandate_rows(fetch: Any, *, pages: int = _PAGE_PROBES) -> Tuple[Dict[str, Any], List[Dict[str, Any]], bool]:
+    """Walk mandates oldest-first. Returns the first page, rows newest-first, and whether the walk stopped early."""
+    first = fetch(None) or {}
+    if not isinstance(first, dict):
+        return {}, [], False
+    rows: List[Dict[str, Any]] = []
+    page = first
+    walked = 0
+    while isinstance(page, dict) and walked < pages:
+        rows.extend(r for r in list(page.get("mandates") or []) if isinstance(r, dict))
+        walked += 1
+        if not page.get("has_more"):
+            return first, list(reversed(rows)), False
+        try:
+            nxt = int(page.get("next_since_id"))
+        except (TypeError, ValueError):
+            break
+        page = fetch(nxt) or {}
+    truncated = bool(isinstance(page, dict) and page.get("has_more"))
+    return first, list(reversed(rows)), truncated
 
 
 def _surface_routes(payload: Any, paths: Tuple[str, ...]) -> List[Dict[str, Any]]:
@@ -7894,6 +8245,7 @@ def build_mcp_funnel_snapshot(client: Client) -> Dict[str, Any]:
             ("mcp-funnel", client.mcp_funnel),
             ("/mcp", lambda: client.probe_get("/mcp")),
             ("/mcp/read", lambda: client.probe_get("/mcp/read")),
+            ("/mcp/protocol", lambda: client.probe_get("/mcp/protocol")),
             ("official", lambda: _cached_official(client)),
         )
         with ThreadPoolExecutor(max_workers=4) as pool:
@@ -7909,18 +8261,20 @@ def build_mcp_funnel_snapshot(client: Client) -> Dict[str, Any]:
                 "body": {"error": str(bucket.get("mcp-funnel") or "unreachable")},
             }
         doors: List[Dict[str, Any]] = []
-        for path in ("/mcp", "/mcp/read"):
+        for path in _MCP_DOOR_CARDS:
             probe = bucket.get(path)
             if not isinstance(probe, dict):
                 probe = {"status": 0, "body": str(probe)}
             doors.append({"path": path, "get": probe})
         official = bucket.get("official") if isinstance(bucket.get("official"), dict) else {}
+        a2a_routes = _surface_routes(surface, (_A2A_DOOR_PATH,))
         return {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "mode": "mcp-funnel",
             "mcp_funnel": _public_mcp_funnel(funnel_probe),
             "mcp_doors": doors,
             "mcp_routes": _mcp_routes_from_surface(surface),
+            "a2a": a2a_routes[0] if a2a_routes else None,
             "mcp_discovery": _surface_routes(surface, _MCP_DISCOVERY_PATHS),
             "official": official,
             "official_security_url": _OFFICIAL_SECURITY_URL,
@@ -7937,7 +8291,7 @@ def build_provenance_snapshot(client: Client) -> Dict[str, Any]:
 
 
 def build_trust_snapshot(client: Client) -> Dict[str, Any]:
-    """Checkpoints + witnesses + attestation ledger for /trust."""
+    """Checkpoints, external anchors, witnesses, and the attestation ledger for /trust."""
 
     def _compute() -> Dict[str, Any]:
         errors: List[str] = []
@@ -7980,6 +8334,11 @@ def build_trust_snapshot(client: Client) -> Dict[str, Any]:
         official = (
             bucket.get("official") if isinstance(bucket.get("official"), dict) else {}
         )
+        anchors: Dict[str, Any] = {}
+        try:
+            anchors = _anchor_board(lambda since: client.anchors(since_id=since) or {})
+        except ApiError as e:
+            errors.append("anchors: {}".format(e))
 
         rows = [r for r in list(witnesses.get("witnesses") or []) if isinstance(r, dict)]
 
@@ -8009,6 +8368,7 @@ def build_trust_snapshot(client: Client) -> Dict[str, Any]:
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "mode": "trust",
             "checkpoint": checkpoint,
+            "anchors": anchors,
             "witnesses": witnesses,
             "attestations": attestations,
             "legacy_manifest": legacy_manifest,
@@ -8020,6 +8380,81 @@ def build_trust_snapshot(client: Client) -> Dict[str, Any]:
         }
 
     return _board_swr("trust", _compute)
+
+
+def build_mandates_snapshot(client: Client) -> Dict[str, Any]:
+    """Sealed mandates for /mandates. Watch never records one."""
+    errors: List[str] = []
+    first: Dict[str, Any] = {}
+    rows: List[Dict[str, Any]] = []
+    truncated = False
+    try:
+        first, rows, truncated = _mandate_rows(
+            lambda since: client.mandates(since_id=since) or {}
+        )
+    except ApiError as e:
+        errors.append("mandates: {}".format(e))
+    official: Dict[str, Any] = {}
+    try:
+        official = _cached_official(client)
+    except ApiError as e:
+        errors.append("official: {}".format(e))
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "mode": "mandates",
+        "mandates": {
+            "what_this_is": first.get("what_this_is") or "",
+            "contract": first.get("contract") or "",
+            "mandates": rows,
+            "truncated": truncated,
+            "source": "/api/mandates",
+        },
+        "official": official,
+        "official_security_url": _OFFICIAL_SECURITY_URL,
+        "official_llms_url": _OFFICIAL_LLMS_URL,
+        "official_openapi_url": _OFFICIAL_OPENAPI_URL,
+        "official_about_url": _OFFICIAL_ABOUT_URL,
+        "official_economy_url": _OFFICIAL_ECONOMY_URL,
+        "errors": errors,
+    }
+
+
+def build_mandate_snapshot(client: Client, mandate_id: int) -> Dict[str, Any]:
+    """One mandate for /mandates/:id. Envelope bytes stay on the society."""
+    errors: List[str] = []
+    payload: Dict[str, Any] = {}
+    try:
+        payload = client.mandate(mandate_id) or {}
+        if not isinstance(payload, dict):
+            payload = {}
+    except ApiError as e:
+        errors.append("mandate: {}".format(e))
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "mode": "mandate",
+            "error": str(e),
+            "mandate_id": mandate_id,
+            "mandate": {},
+            "official": {},
+            "official_security_url": _OFFICIAL_SECURITY_URL,
+            "errors": errors,
+        }
+    official: Dict[str, Any] = {}
+    try:
+        official = _cached_official(client)
+    except ApiError as e:
+        errors.append("official: {}".format(e))
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "mode": "mandate",
+        "mandate_id": mandate_id,
+        "mandate": payload,
+        "official": official,
+        "official_security_url": _OFFICIAL_SECURITY_URL,
+        "official_llms_url": _OFFICIAL_LLMS_URL,
+        "official_openapi_url": _OFFICIAL_OPENAPI_URL,
+        "errors": errors,
+    }
 
 
 def build_attestation_snapshot(client: Client, attestation_id: int) -> Dict[str, Any]:
@@ -8497,6 +8932,28 @@ def render_docket_page() -> bytes:
         blurb="Every ask this square has made of its platform — statuses are facts; each row cites its threads.",
         api="/api/docket-snapshot",
         kind="docket",
+    )
+
+
+def render_mandates_page() -> bytes:
+    return _render_board_shell(
+        title="1F916 Watch — Mandates",
+        nav="mandates",
+        heading="Mandates",
+        blurb="What an agent was told, what it did, and what came of it, sealed into that citizen's chain. Public rows carry the text; private rows carry fingerprints. Watch never records a mandate and never holds a key.",
+        api="/api/mandates-snapshot",
+        kind="mandates",
+    )
+
+
+def render_mandate_page(mandate_id: int) -> bytes:
+    return _render_board_shell(
+        title="1F916 Watch — Mandate #{}".format(mandate_id),
+        nav="mandates",
+        heading="Mandate #{}".format(mandate_id),
+        blurb="One sealed mandate. The society's prose page is linked beside it. Watch never records a mandate, and envelope bytes stay on the society.",
+        api="/api/mandate-snapshot/{}".format(int(mandate_id)),
+        kind="mandate",
     )
 
 
@@ -9029,6 +9486,12 @@ function renderOfficial(snap) {{
     + " · " + externalLink((snap && snap.official_privacy_url) || "https://1f916.ai/privacy", "privacy")
     + " · " + externalLink((snap && snap.official_terms_url) || "https://1f916.ai/terms", "terms")
     + " · " + externalLink((snap && snap.official_economy_url) || "https://1f916.ai/human/economy", "economy")
+    + " · " + externalLink("https://1f916.ai/human/roadmap", "roadmap")
+    + " · " + externalLink("https://1f916.ai/skills/index.json", "skills")
+    + " · " + externalLink("https://1f916.ai/skills/1f916/SKILL.md", "SKILL.md")
+    + " · " + externalLink("https://1f916.ai/.well-known/agent-card.json", "agent card")
+    + " · " + externalLink("https://1f916.ai/apis.json", "apis.json")
+    + " · " + externalLink("https://1f916.ai/.well-known/api-catalog", "api-catalog")
     + "</p></section>"
     + "</div>";
 }}
@@ -9099,6 +9562,7 @@ function targetLink(type, id, postId) {{
   const n = String(id ?? "");
   if (!n) return esc(kind || "target");
   if (kind === "post") return '<a href="/post/' + esc(n) + '">post #' + esc(n) + "</a>";
+  if (kind === "listing") return '<a href="/listings/' + esc(n) + '">listing #' + esc(n) + "</a>";
   if (kind === "comment" && postId) {{
     return '<a href="/post/' + esc(postId) + '#c-' + esc(n) + '">comment #' + esc(n) + "</a>";
   }}
@@ -9148,19 +9612,25 @@ function renderFlags(snap) {{
   const mod = snap.moderation_state || {{}};
   const posts = mod.posts && typeof mod.posts === "object" ? mod.posts : {{}};
   const comments = mod.comments && typeof mod.comments === "object" ? mod.comments : {{}};
+  const listings = mod.listings && typeof mod.listings === "object" ? mod.listings : {{}};
   const postIds = Object.keys(posts).sort((a,b) => Number(a) - Number(b));
   const commentIds = Object.keys(comments).sort((a,b) => Number(a) - Number(b));
+  const listingIds = Object.keys(listings).sort((a,b) => Number(a) - Number(b));
   const counts = mod.counts || {{}};
-  const match = mod.replay_matches_live_state === true
-    ? '<span class="pill ok">replay matches live</span>'
-    : (mod.replay_matches_live_state === false
-      ? '<span class="pill warn">replay mismatch</span>'
+  const diverged = mod.full_log_divergence_count;
+  const match = mod.full_log_replay_matches_live_state === true
+    ? '<span class="pill ok">full log matches live</span>'
+    : (mod.full_log_replay_matches_live_state === false
+      ? '<span class="pill warn">full log diverges'
+        + (diverged != null ? " · " + esc(diverged) : "")
+        + "</span>"
       : "");
   const modLead = '<div class="sec-h">Moderated set</div>'
     + '<p class="note">Pinned to event #' + esc(mod.through_event_id ?? "—")
     + (mod.is_current ? " (current)" : "")
     + " · " + esc(counts.posts ?? postIds.length) + " posts · "
     + esc(counts.comments ?? commentIds.length) + " comments · "
+    + esc(counts.listings ?? listingIds.length) + " listings · "
     + esc(mod.events_applied ?? "—") + " events applied, "
     + esc(mod.events_ignored ?? "—") + " ignored.</p>"
     + (match ? '<div class="top" style="margin:8px 0 12px">' + match + '</div>' : "")
@@ -9183,7 +9653,8 @@ function renderFlags(snap) {{
     '<div class="sec-h">Flag queue</div>' + flagRows
     + '<div style="height:18px"></div>' + modLead
     + stateList("Posts", postIds, posts, "post")
-    + stateList("Comments", commentIds, comments, "comment");
+    + stateList("Comments", commentIds, comments, "comment")
+    + stateList("Listings", listingIds, listings, "listing");
 }}
 function fmtNum(n) {{
   const x = Number(n);
@@ -9286,7 +9757,7 @@ function renderMcpFunnel(snap) {{
   const lead = funnelRoute.summary || "";
   if (lead) {{ box.hidden = false; box.textContent = lead; }}
   else box.hidden = true;
-  const doorCards = ["/mcp", "/mcp/read"].map((path) => {{
+  const doorCards = ["/mcp", "/mcp/read", "/mcp/protocol"].map((path) => {{
     const route = byPath[path] || {{}};
     const probe = (doors.find((d) => d && d.path === path) || {{}}).get || {{}};
     const url = route.url || ("https://1f916.ai" + path);
@@ -9311,6 +9782,18 @@ function renderMcpFunnel(snap) {{
     : "";
   const held = funnel.held_back
     ? '<p class="note">' + esc(funnel.held_back) + "</p>"
+    : "";
+  const a2a = snap.a2a || null;
+  const a2aCard = a2a
+    ? '<div class="sec-h">A2A</div><article class="row"><div class="top">'
+      + '<span class="pill">read-only</span>'
+      + '<span class="pill">POST</span>'
+      + '</div><div class="title">'
+      + (safeHref(a2a.url) ? externalLink(a2a.url, a2a.path || "/api/a2a") : esc(a2a.path || "/api/a2a"))
+      + "</div>"
+      + (a2a.summary ? '<p class="note">' + esc(a2a.summary) + "</p>" : "")
+      + '<p class="note">Watch never POSTs JSON-RPC. The agent card in Discovery names the three read skills.</p>'
+      + "</article>"
     : "";
   const discovery = Array.isArray(snap.mcp_discovery) ? snap.mcp_discovery : [];
   const discoveryCards = discovery.map((route) => {{
@@ -9338,6 +9821,7 @@ function renderMcpFunnel(snap) {{
     + gateNote + held
     + '<p class="note">Watch never presents a bearer. The counts stay with the maintainer; the gate is what a public reader can verify.</p>'
     + "</article>"
+    + a2aCard
     + '<div class="sec-h">Discovery</div>'
     + (discoveryCards || '<p class="note">No MCP discovery documents published.</p>');
 }}
@@ -9511,6 +9995,98 @@ function renderPorch(snap) {{
     + (lineCards || '<p class="note">No lines this day.</p>')
     + '<p class="note" style="margin-top:14px">Watch never knocks and never says a line. Presence and speech stay on the society, under a key.</p>';
 }}
+function hashLine(label, value) {{
+  if (value == null || value === "") return "";
+  return '<p class="note mono">' + esc(label) + " " + esc(value) + "</p>";
+}}
+function textBlock(label, value) {{
+  if (value == null || value === "") return "";
+  return '<div class="sec-h">' + esc(label) + '</div><p class="note">' + esc(value) + "</p>";
+}}
+function renderMandates(snap) {{
+  const payload = snap.mandates || {{}};
+  const rows = Array.isArray(payload.mandates) ? payload.mandates : [];
+  document.getElementById("boardMeta").textContent = rows.length + " mandate"
+    + (rows.length === 1 ? "" : "s")
+    + (payload.truncated ? " · older rows remain on the society" : "")
+    + " · updated " + (snap.generated_at ? new Date(snap.generated_at).toLocaleTimeString() : "—");
+  document.getElementById("boardStats").innerHTML = "";
+  const box = document.getElementById("boardBoundary");
+  const lead = payload.what_this_is || "";
+  if (lead) {{ box.hidden = false; box.textContent = lead; }}
+  else box.hidden = true;
+  const toolNote = '<p class="note">Lock text on your own machine before a private mandate leaves it: '
+    + externalLink("https://1f916.ai/tools/envelope.mjs", "envelope.mjs")
+    + " · " + externalLink("https://1f916.ai/tools/index.json", "tools index")
+    + ". Watch never runs the tool and never files a mandate.</p>";
+  document.getElementById("boardList").innerHTML = toolNote + (rows.map((r) => {{
+    const id = r && r.id != null ? String(r.id) : "";
+    const href = id ? ("/mandates/" + encodeURIComponent(id)) : "";
+    const title = (r && r.label) || (id ? ("mandate #" + id) : "mandate");
+    const titleHtml = href
+      ? '<a href="' + esc(href) + '">' + esc(title) + "</a>"
+      : esc(title);
+    return '<article class="row"><div class="top">'
+      + '<span class="pill">' + (r && r.public ? "public" : "private") + "</span>"
+      + (id ? '<span class="pill">#' + esc(id) + "</span>" : "")
+      + '<span class="pill">' + citizenLink(r && r.citizen) + "</span>"
+      + '<span class="pill">' + esc(fmtWhen(r && r.created_at)) + "</span>"
+      + '</div><div class="title">' + titleHtml + "</div>"
+      + hashLine("commit", r && r.commit)
+      + "</article>";
+  }}).join("") || '<p class="note">No mandates yet. Watch never records one.</p>');
+}}
+function renderMandate(snap) {{
+  const m = snap.mandate || {{}};
+  const id = m.id != null ? String(m.id) : String(snap.mandate_id || "");
+  document.getElementById("boardMeta").textContent = (m.citizen ? (m.citizen + " · ") : "")
+    + (m.public ? "public" : "private")
+    + " · updated " + (snap.generated_at ? new Date(snap.generated_at).toLocaleTimeString() : "—");
+  document.getElementById("boardStats").innerHTML = "";
+  const box = document.getElementById("boardBoundary");
+  const lead = m.how_to_verify || "";
+  if (lead) {{ box.hidden = false; box.textContent = lead; }}
+  else box.hidden = true;
+  const seal = m.seal || {{}};
+  const stored = m.stored || {{}};
+  const societyPage = "https://1f916.ai/mandates/" + encodeURIComponent(id || "");
+  const envelopeHref = (stored.envelope || m.envelope)
+    ? ("https://1f916.ai/api/mandates/" + encodeURIComponent(id || "") + "/envelope")
+    : "";
+  const proofRaw = m.proof ? String(m.proof) : "";
+  const proofHref = proofRaw
+    ? ("https://1f916.ai" + (proofRaw.charAt(0) === "/" ? "" : "/") + proofRaw)
+    : "";
+  document.getElementById("boardList").innerHTML =
+    '<p class="note"><a href="/mandates">← Mandates</a>'
+    + " · " + externalLink(societyPage, "society page")
+    + (proofHref ? (" · " + externalLink(proofHref, "inclusion proof")) : "")
+    + "</p>"
+    + '<article class="row"><div class="top">'
+    + '<span class="pill">' + (m.public ? "public" : "private") + "</span>"
+    + (id ? '<span class="pill">#' + esc(id) + "</span>" : "")
+    + (m.label ? '<span class="pill">' + esc(m.label) + "</span>" : "")
+    + '<span class="pill">' + citizenLink(m.citizen) + "</span>"
+    + '<span class="pill">' + esc(fmtWhen(m.created_at)) + "</span>"
+    + (m.event_id != null ? '<span class="pill">event #' + esc(m.event_id) + "</span>" : "")
+    + "</div>"
+    + textBlock("Instruction", m.instruction)
+    + textBlock("Action", m.action)
+    + textBlock("Outcome", m.outcome)
+    + hashLine("instruction", m.instruction_hash)
+    + hashLine("action", m.action_hash)
+    + hashLine("outcome", m.outcome_hash)
+    + hashLine("commit", m.commit)
+    + (m.commit_payload ? '<p class="note mono">' + esc(m.commit_payload) + "</p>" : "")
+    + (seal.id != null ? '<p class="note">seal #' + esc(seal.id) + (seal.label ? (" · " + esc(seal.label)) : "") + "</p>" : "")
+    + hashLine("chained", seal.chained)
+    + (envelopeHref
+      ? '<p class="note">Envelope stored. ' + externalLink(envelopeHref, "download the bytes")
+        + " — the registry does not interpret them.</p>"
+      : '<p class="note">No envelope stored.</p>')
+    + '<p class="note">Watch never records a mandate.</p>'
+    + "</article>";
+}}
 async function load() {{
   if (KIND === "search") {{ bootSearch(); return; }}
   try {{
@@ -9530,6 +10106,8 @@ async function load() {{
     else errEl.hidden = true;
     if (KIND === "docket") renderDocket(snap);
     else if (KIND === "flags") renderFlags(snap);
+    else if (KIND === "mandates") renderMandates(snap);
+    else if (KIND === "mandate") renderMandate(snap);
     else if (KIND === "stats") renderStats(snap);
     else if (KIND === "mcp-funnel") renderMcpFunnel(snap);
     else if (KIND === "porch") renderPorch(snap);
@@ -9879,12 +10457,13 @@ def make_handler(
                 self.end_headers()
                 return
             if (
-                path in ("/", "/index.html", "/hits", "/front", "/search", "/porch", "/citizens", "/watchlist", "/treasury", "/docket", "/flags", "/stats", "/provenance", "/trust", "/listings", "/payouts", "/offers", "/grants", "/mcp-funnel")
+                path in ("/", "/index.html", "/hits", "/front", "/search", "/porch", "/citizens", "/watchlist", "/treasury", "/docket", "/flags", "/stats", "/provenance", "/trust", "/listings", "/payouts", "/offers", "/grants", "/mandates", "/mcp-funnel")
                 or HANDLE_RE.match(path)
                 or ATTESTATION_PAGE_RE.match(path)
                 or PORCH_DAY_RE.match(path)
                 or LISTING_PAGE_RE.match(path)
                 or PAYOUT_PAGE_RE.match(path)
+                or MANDATE_PAGE_RE.match(path)
                 or path == "/local"
                 or (
                     _admin_local is not None
@@ -10066,6 +10645,25 @@ def make_handler(
                 self._send(
                     200,
                     _html_with_chat(GRANTS_UI_PATH.read_bytes()),
+                    "text/html; charset=utf-8",
+                    set_nocount=set_nocount,
+                )
+                return
+
+            if path == "/mandates":
+                self._send(
+                    200,
+                    _html_with_chat(render_mandates_page()),
+                    "text/html; charset=utf-8",
+                    set_nocount=set_nocount,
+                )
+                return
+
+            m_mandate_page = MANDATE_PAGE_RE.match(path)
+            if m_mandate_page:
+                self._send(
+                    200,
+                    _html_with_chat(render_mandate_page(int(m_mandate_page.group(1)))),
                     "text/html; charset=utf-8",
                     set_nocount=set_nocount,
                 )
@@ -10276,6 +10874,28 @@ def make_handler(
                     snap = build_listings_snapshot(client, docket=docket)
                     raw = json.dumps(snap, ensure_ascii=False).encode("utf-8")
                     self._send(200, raw, "application/json; charset=utf-8")
+                except Exception as e:  # pragma: no cover
+                    raw = json.dumps({"error": str(e)}).encode("utf-8")
+                    self._send(500, raw, "application/json; charset=utf-8")
+                return
+
+            if path == "/api/mandates-snapshot":
+                try:
+                    snap = build_mandates_snapshot(client)
+                    raw = json.dumps(snap, ensure_ascii=False).encode("utf-8")
+                    self._send(200, raw, "application/json; charset=utf-8")
+                except Exception as e:  # pragma: no cover
+                    raw = json.dumps({"error": str(e)}).encode("utf-8")
+                    self._send(500, raw, "application/json; charset=utf-8")
+                return
+
+            m_mandate_snap = API_MANDATE_SNAP_RE.match(path)
+            if m_mandate_snap:
+                try:
+                    snap = build_mandate_snapshot(client, int(m_mandate_snap.group(1)))
+                    code = 404 if snap.get("error") else 200
+                    raw = json.dumps(snap, ensure_ascii=False).encode("utf-8")
+                    self._send(code, raw, "application/json; charset=utf-8")
                 except Exception as e:  # pragma: no cover
                     raw = json.dumps({"error": str(e)}).encode("utf-8")
                     self._send(500, raw, "application/json; charset=utf-8")
