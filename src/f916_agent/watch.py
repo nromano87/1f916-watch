@@ -3420,6 +3420,7 @@ function renderOfficial(snap) {{
     + " · " + externalLink((snap && snap.official_terms_url) || "https://1f916.ai/terms", "terms")
     + " · " + externalLink((snap && snap.official_economy_url) || "https://1f916.ai/human/economy", "economy")
     + " · " + externalLink("https://1f916.ai/human/roadmap", "roadmap")
+    + " · " + externalLink("https://1f916.ai/human/setup", "setup")
     + " · " + externalLink("https://1f916.ai/skills/index.json", "skills")
     + " · " + externalLink("https://1f916.ai/skills/1f916/SKILL.md", "SKILL.md")
     + " · " + externalLink("https://1f916.ai/.well-known/agent-card.json", "agent card")
@@ -8461,6 +8462,27 @@ def build_mandates_snapshot(client: Client) -> Dict[str, Any]:
         )
     except ApiError as e:
         errors.append("mandates: {}".format(e))
+    budgets: Dict[str, Any] = {
+        "what_this_is": "",
+        "default_per_day": None,
+        "budgets": [],
+        "truncated": False,
+        "source": "/api/mandates/budgets",
+    }
+    try:
+        raw = client.mandate_budgets() or {}
+        if not isinstance(raw, dict):
+            raw = {}
+        budgets = {
+            "what_this_is": raw.get("what_this_is") or "",
+            "default_per_day": raw.get("default_per_day"),
+            "budgets": [r for r in (raw.get("budgets") or []) if isinstance(r, dict)],
+            "truncated": bool(raw.get("has_more")),
+            "source": "/api/mandates/budgets",
+        }
+    except ApiError as e:
+        errors.append("mandate budgets: {}".format(e))
+        budgets["error"] = str(e)
     official: Dict[str, Any] = {}
     try:
         official = _cached_official(client)
@@ -8475,6 +8497,7 @@ def build_mandates_snapshot(client: Client) -> Dict[str, Any]:
             "mandates": rows,
             "truncated": truncated,
             "source": "/api/mandates",
+            "budgets": budgets,
         },
         "official": official,
         "official_security_url": _OFFICIAL_SECURITY_URL,
@@ -9554,6 +9577,7 @@ function renderOfficial(snap) {{
     + " · " + externalLink((snap && snap.official_terms_url) || "https://1f916.ai/terms", "terms")
     + " · " + externalLink((snap && snap.official_economy_url) || "https://1f916.ai/human/economy", "economy")
     + " · " + externalLink("https://1f916.ai/human/roadmap", "roadmap")
+    + " · " + externalLink("https://1f916.ai/human/setup", "setup")
     + " · " + externalLink("https://1f916.ai/skills/index.json", "skills")
     + " · " + externalLink("https://1f916.ai/skills/1f916/SKILL.md", "SKILL.md")
     + " · " + externalLink("https://1f916.ai/.well-known/agent-card.json", "agent card")
@@ -10086,7 +10110,33 @@ function renderMandates(snap) {{
     + externalLink("https://1f916.ai/tools/envelope.mjs", "envelope.mjs")
     + " · " + externalLink("https://1f916.ai/tools/index.json", "tools index")
     + ". Watch never runs the tool and never files a mandate.</p>";
-  document.getElementById("boardList").innerHTML = toolNote + (rows.map((r) => {{
+  const budgets = payload.budgets || {{}};
+  const budgetRows = Array.isArray(budgets.budgets) ? budgets.budgets : [];
+  const budgetCards = budgetRows.map((r) => {{
+    const who = (r && (r.handle || r.citizen || r.account)) || "";
+    const per = r && r.per_day;
+    const seal = r && r.seal;
+    const sealId = seal && typeof seal === "object" ? seal.id : seal;
+    return '<article class="row"><div class="top">'
+      + (who ? '<span class="pill">' + citizenLink(who) + "</span>" : "")
+      + (per != null ? '<span class="pill">' + esc(per) + " / day</span>" : "")
+      + (r && r.id != null ? '<span class="pill">#' + esc(r.id) + "</span>" : "")
+      + '<span class="pill">' + esc(fmtWhen(r && r.created_at)) + "</span>"
+      + "</div>"
+      + (r && r.reason ? '<p class="note">' + esc(r.reason) + "</p>" : "")
+      + (sealId != null && sealId !== "" ? '<p class="note">seal #' + esc(sealId) + "</p>" : "")
+      + "</article>";
+  }}).join("");
+  const budgetEmpty = budgets.error
+    ? '<p class="note">' + esc(budgets.error) + "</p>"
+    : '<p class="note">No custom budgets. An account that is not listed may record '
+      + esc(budgets.default_per_day != null ? budgets.default_per_day : "the default")
+      + " a day.</p>";
+  const budgetHtml = '<div class="sec-h">Daily budgets</div>'
+    + (budgets.what_this_is ? '<p class="note">' + esc(budgets.what_this_is) + "</p>" : "")
+    + (budgetRows.length ? budgetCards : budgetEmpty)
+    + (budgets.truncated ? '<p class="note">Older budget rows remain on the society.</p>' : "");
+  document.getElementById("boardList").innerHTML = toolNote + budgetHtml + (rows.map((r) => {{
     const id = r && r.id != null ? String(r.id) : "";
     const href = id ? ("/mandates/" + encodeURIComponent(id)) : "";
     const title = (r && r.label) || (id ? ("mandate #" + id) : "mandate");
@@ -10117,6 +10167,9 @@ function renderMandate(snap) {{
   const seal = m.seal || {{}};
   const stored = m.stored || {{}};
   const societyPage = "https://1f916.ai/mandates/" + encodeURIComponent(id || "");
+  const recordsHref = m.citizen
+    ? ("https://1f916.ai/records/" + encodeURIComponent(m.citizen))
+    : "";
   const envelopeHref = (stored.envelope || m.envelope)
     ? ("https://1f916.ai/api/mandates/" + encodeURIComponent(id || "") + "/envelope")
     : "";
@@ -10127,6 +10180,7 @@ function renderMandate(snap) {{
   document.getElementById("boardList").innerHTML =
     '<p class="note"><a href="/mandates">← Mandates</a>'
     + " · " + externalLink(societyPage, "society page")
+    + (recordsHref ? (" · " + externalLink(recordsHref, "records")) : "")
     + (proofHref ? (" · " + externalLink(proofHref, "inclusion proof")) : "")
     + "</p>"
     + '<article class="row"><div class="top">'

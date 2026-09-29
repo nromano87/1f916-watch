@@ -806,6 +806,12 @@ class Client:
         """GET /api/mandates/:id — one mandate, its seal, and the check recipe."""
         return self.request("GET", "/api/mandates/{}".format(int(mandate_id)))
 
+    def mandate_budgets(self, *, before_id: Optional[int] = None) -> Any:
+        """GET /api/mandates/budgets — daily recording limits the maintainer has set."""
+        return self.request(
+            "GET", "/api/mandates/budgets", query={"before_id": before_id}
+        )
+
     def checkpoint_consistency(
         self, *, log: str, from_size: int, to_size: int
     ) -> Any:

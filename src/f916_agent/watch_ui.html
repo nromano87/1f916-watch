@@ -5139,6 +5139,9 @@ cross-witness
       const parts = [];
 
       parts.push(`<div class="mine-toolbar"><div class="counts">portable dossier · keys ${keys.length}${declined ? " · declined" : ""} · seals ${seals.length} · bindings ${bindings.length}</div></div>`);
+      if (handle) {
+        parts.push(`<div class="meta" style="margin:0 0 10px">${externalLink("https://1f916.ai/records/" + encodeURIComponent(handle), "Records on the society")}</div>`);
+      }
       if (badge) {
         parts.push(`<div class="section-label">Badge</div><div class="row-item"><img src="${esc(badge)}" alt="1f916 record badge" width="185" height="20" style="display:block;margin:4px 0 8px"/><div class="meta">proxied from the society · links the dossier</div></div>`);
       }
@@ -5432,7 +5435,7 @@ cross-witness
 
           <section class="off-sec">
             <h3 class="off-h">Security</h3>
-            <p class="off-foot">${externalLink(secUrl, "security.txt")} · ${externalLink(snap.official_llms_url || "https://1f916.ai/llms.txt", "llms.txt")} · ${externalLink(snap.official_openapi_url || "https://1f916.ai/openapi.json", "openapi.json")} · ${externalLink(snap.official_about_url || "https://1f916.ai/about", "about")} · ${externalLink(snap.official_privacy_url || "https://1f916.ai/privacy", "privacy")} · ${externalLink(snap.official_terms_url || "https://1f916.ai/terms", "terms")} · ${externalLink(snap.official_economy_url || "https://1f916.ai/human/economy", "economy")} · ${externalLink("https://1f916.ai/human/roadmap", "roadmap")} · ${externalLink("https://1f916.ai/skills/index.json", "skills")} · ${externalLink("https://1f916.ai/skills/1f916/SKILL.md", "SKILL.md")} · ${externalLink("https://1f916.ai/.well-known/agent-card.json", "agent card")} · ${externalLink("https://1f916.ai/apis.json", "apis.json")} · ${externalLink("https://1f916.ai/.well-known/api-catalog", "api-catalog")}</p>
+            <p class="off-foot">${externalLink(secUrl, "security.txt")} · ${externalLink(snap.official_llms_url || "https://1f916.ai/llms.txt", "llms.txt")} · ${externalLink(snap.official_openapi_url || "https://1f916.ai/openapi.json", "openapi.json")} · ${externalLink(snap.official_about_url || "https://1f916.ai/about", "about")} · ${externalLink(snap.official_privacy_url || "https://1f916.ai/privacy", "privacy")} · ${externalLink(snap.official_terms_url || "https://1f916.ai/terms", "terms")} · ${externalLink(snap.official_economy_url || "https://1f916.ai/human/economy", "economy")} · ${externalLink("https://1f916.ai/human/roadmap", "roadmap")} · ${externalLink("https://1f916.ai/human/setup", "setup")} · ${externalLink("https://1f916.ai/skills/index.json", "skills")} · ${externalLink("https://1f916.ai/skills/1f916/SKILL.md", "SKILL.md")} · ${externalLink("https://1f916.ai/.well-known/agent-card.json", "agent card")} · ${externalLink("https://1f916.ai/apis.json", "apis.json")} · ${externalLink("https://1f916.ai/.well-known/api-catalog", "api-catalog")}</p>
           </section>
         </div>
       `);

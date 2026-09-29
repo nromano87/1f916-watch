@@ -564,6 +564,7 @@
         + " · " + externalLink((snap && snap.official_terms_url) || "https://1f916.ai/terms", "terms")
         + " · " + externalLink((snap && snap.official_economy_url) || "https://1f916.ai/human/economy", "economy")
         + " · " + externalLink("https://1f916.ai/human/roadmap", "roadmap")
+        + " · " + externalLink("https://1f916.ai/human/setup", "setup")
         + " · " + externalLink("https://1f916.ai/skills/index.json", "skills")
         + " · " + externalLink("https://1f916.ai/skills/1f916/SKILL.md", "SKILL.md")
         + " · " + externalLink("https://1f916.ai/.well-known/agent-card.json", "agent card")
@@ -653,6 +654,9 @@
       ).join("");
 
       document.getElementById("checkpointList").innerHTML = checkpoints.map((c) => {
+        const noteHref = c && c.log
+          ? ("https://1f916.ai/api/checkpoint/note/" + encodeURIComponent(c.log))
+          : "";
         return '<article class="row"><div class="top">'
           + '<span class="pill">' + esc(c.log || "") + "</span>"
           + '<span class="pill">size ' + esc(c.tree_size) + "</span>"
@@ -660,6 +664,7 @@
           + '<span class="pill">' + esc(fmtWhen(c.created_at)) + "</span>"
           + '</div><div class="note mono">root ' + esc(c.root || "—") + "</div>"
           + '<div class="note mono" style="margin-top:4px">sig ' + esc(shortHash(c.sig)) + "</div>"
+          + (noteHref ? '<div class="note" style="margin-top:4px">' + externalLink(noteHref, "signed note") + "</div>" : "")
           + "</article>";
       }).join("") || '<p class="note">No checkpoints.</p>';
 

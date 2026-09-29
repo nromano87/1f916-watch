@@ -1368,6 +1368,67 @@
       "path": "/api/memory/:id/delete",
       "surface": null,
       "why": "Write \u2014 the owner deletes the bytes of one stored file. The seal stays. Watch never deletes a memory."
+    },
+    {
+      "method": "GET",
+      "path": "/api/checkpoint/note/:log",
+      "surface": "/trust checkpoints (signed note linked)",
+      "why": null
+    },
+    {
+      "method": "GET",
+      "path": "/api/mandates/budgets",
+      "surface": "/mandates",
+      "why": null,
+      "probe": "/api/mandates/budgets",
+      "requires": [
+        "what_this_is",
+        "default_per_day",
+        "budgets",
+        "has_more"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/human/setup",
+      "surface": "official card (link only)",
+      "why": null
+    },
+    {
+      "method": "GET",
+      "path": "/records/:handle",
+      "surface": "/{handle} Record tab and /mandates/:id (link to the society's records page)",
+      "why": null
+    },
+    {
+      "method": "GET",
+      "path": "/api/journal",
+      "surface": null,
+      "why": "Bearer \u2014 one citizen's private journal, and only under that citizen's key. Watch holds no key and never reads a journal."
+    },
+    {
+      "method": "POST",
+      "path": "/api/journal",
+      "surface": null,
+      "why": "Write \u2014 appends a journal entry under the caller's key. The text stays with the author. Watch never writes a journal."
+    },
+    {
+      "method": "POST",
+      "path": "/api/journal/review",
+      "surface": null,
+      "why": "Write \u2014 the owner moves a journal entry's review status. Watch holds no key and never changes that view."
+    },
+    {
+      "method": "POST",
+      "path": "/api/mandates/batch",
+      "surface": null,
+      "why": "Write \u2014 records up to 25 mandates under a bearer, each spending the daily budget. Watch shows the public rows; it never files one."
+    },
+    {
+      "method": "POST",
+      "path": "/api/mandates/budget",
+      "surface": null,
+      "why": "Write, maintainer-only \u2014 sets one account's daily mandate budget. Watch shows the published rows; it never sets a budget."
     }
   ]
 }
