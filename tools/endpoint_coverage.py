@@ -211,8 +211,43 @@ def run_coverage(manifest_path: Path) -> int:
     return 1
 
 
+def _fetch_smoke_body(url: str) -> Any:
+    """GET one probe. A 429 is a rate limit, not a schema miss, so wait and retry."""
+    import time
+
+    delay = 1.0
+    last_error: Optional[BaseException] = None
+    for attempt in range(6):
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": "f916-watch",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            last_error = e
+            if e.code not in (429, 503) or attempt == 5:
+                raise
+            retry_after = e.headers.get("Retry-After") if e.headers else None
+            try:
+                wait = float(retry_after) if retry_after else delay
+            except (TypeError, ValueError):
+                wait = delay
+            time.sleep(min(max(wait, 0.5), 20.0))
+            delay = min(delay * 2, 16.0)
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(url)
+
+
 def run_smoke(manifest_path: Path) -> int:
     """Fetch rendered endpoints and assert declared `requires` fields exist."""
+    import time
+
     manifest = load_manifest(manifest_path)
     targets = [
         e
@@ -228,9 +263,7 @@ def run_smoke(manifest_path: Path) -> int:
         path = substitute(str(entry.get("probe") or entry.get("path")))
         url = "{}{}".format(ORIGIN, path)
         try:
-            req = urllib.request.Request(url, headers={"Accept": "application/json"})
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
+            body = _fetch_smoke_body(url)
         except Exception as e:  # noqa: BLE001
             print(
                 "FAIL {} {} — {} at {}".format(
@@ -239,28 +272,28 @@ def run_smoke(manifest_path: Path) -> int:
                 file=sys.stderr,
             )
             failed += 1
-            continue
-
-        checked += 1
-        misses: List[str] = []
-        for field in entry["requires"]:
-            misses.extend(check_path(body, field))
-        if misses:
-            failed += 1
-            print(
-                "FAIL {} {} — schema drift:".format(
-                    entry.get("method"), entry.get("path")
-                ),
-                file=sys.stderr,
-            )
-            for m in misses:
-                print("  · {}".format(m), file=sys.stderr)
         else:
-            print(
-                "ok {} {} ({} fields)".format(
-                    entry.get("method"), entry.get("path"), len(entry["requires"])
+            checked += 1
+            misses: List[str] = []
+            for field in entry["requires"]:
+                misses.extend(check_path(body, field))
+            if misses:
+                failed += 1
+                print(
+                    "FAIL {} {} — schema drift:".format(
+                        entry.get("method"), entry.get("path")
+                    ),
+                    file=sys.stderr,
                 )
-            )
+                for m in misses:
+                    print("  · {}".format(m), file=sys.stderr)
+            else:
+                print(
+                    "ok {} {} ({} fields)".format(
+                        entry.get("method"), entry.get("path"), len(entry["requires"])
+                    )
+                )
+        time.sleep(0.2)
 
     print("\n{} endpoint(s) smoke-checked, {} failure(s).".format(checked, failed))
     return 1 if failed else 0
