@@ -2196,6 +2196,12 @@ a.pill:hover{{background:rgba(12,124,102,.18);border-color:rgba(12,124,102,.4)}}
 .inbox-list li{{padding:10px 12px;border-radius:12px;background:rgba(255,255,255,.55);border:1px solid rgba(18,32,28,.08);font-size:13px;line-height:1.45}}
 .inbox-list .eyebrow{{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;margin:0 0 4px;font-size:12px;color:#5a6a64}}
 .inbox-list .body{{color:#12201c}}
+.inbox-list details.post-fold{{margin:0}}
+.inbox-list details.post-fold summary{{cursor:pointer;list-style:none}}
+.inbox-list details.post-fold summary::-webkit-details-marker{{display:none}}
+.inbox-list details.post-fold[open] summary .clip{{display:none}}
+.inbox-list details.post-fold[open] summary::after{{content:"Show less";color:#0c7c66;font-weight:600}}
+.inbox-list .body.full{{white-space:pre-wrap}}
 .inbox-list a{{color:#0c7c66;font-weight:600;text-decoration:none}}
 .inbox-list a.pill{{font-weight:700}}
 .inbox-list .title{{font-family:Fraunces,Georgia,serif;font-weight:700;font-size:14px;margin:0 0 4px;line-height:1.3}}
@@ -2341,6 +2347,13 @@ a.pill:hover{{background:rgba(12,124,102,.18);border-color:rgba(12,124,102,.4)}}
     if (warming) return '<p class="meta">Warming public trail…</p>';
     return '<p class="meta">' + empty + "</p>";
   }}
+  const expandedPosts = new Set();
+  function countPill(n, singular, plural) {{
+    if (n == null || n === "") return "";
+    const v = Number(n);
+    if (!Number.isFinite(v)) return "";
+    return '<span class="pill muted">' + esc(v) + " " + (v === 1 ? singular : plural) + "</span>";
+  }}
   function postItemsHtml(posts, warming) {{
     const rows = Array.isArray(posts) ? posts : [];
     if (!rows.length) return quietNote(warming, "No posts in the public trail yet.");
@@ -2353,8 +2366,16 @@ a.pill:hover{{background:rgba(12,124,102,.18);border-color:rgba(12,124,102,.4)}}
       const pill = href
         ? '<a class="pill" href="' + href + '" title="Open post #' + esc(p.id) + '">post #' + esc(p.id) + "</a>"
         : '<span class="pill muted">post</span>';
-      return '<li><div class="eyebrow">' + pill + "<span>" + esc(fmtAgo(p.created_at)) + "</span></div>" +
-        titleHtml + (p.body ? '<div class="body">' + esc(p.body) + "</div>" : "") + "</li>";
+      const counts = countPill(p.votes, "karma", "karma") + countPill(p.comments, "comment", "comments");
+      const full = String(p.body_full || "");
+      const open = p.id != null && expandedPosts.has(String(p.id));
+      const bodyHtml = full
+        ? '<details class="post-fold"' + (open ? " open" : "") + ' data-post="' + esc(p.id) + '">'
+          + '<summary class="body"><span class="clip">' + esc(p.body || "") + "</span></summary>"
+          + '<div class="body full">' + esc(full) + "</div></details>"
+        : (p.body ? '<div class="body">' + esc(p.body) + "</div>" : "");
+      return '<li><div class="eyebrow">' + pill + counts + "<span>" + esc(fmtAgo(p.created_at)) + "</span></div>" +
+        titleHtml + bodyHtml + "</li>";
     }}).join("") + "</ul>";
   }}
   function commentItemsHtml(comments, warming) {{
@@ -2674,6 +2695,14 @@ a.pill:hover{{background:rgba(12,124,102,.18);border-color:rgba(12,124,102,.4)}}
       renderRemainTable();
       listEl.querySelectorAll("[data-wl-tab]").forEach((btn) => {{
         btn.addEventListener("click", () => setBodyPane(btn.getAttribute("data-wl-tab")));
+      }});
+      listEl.querySelectorAll("details.post-fold").forEach((el) => {{
+        el.addEventListener("toggle", () => {{
+          const id = el.getAttribute("data-post");
+          if (!id) return;
+          if (el.open) expandedPosts.add(id);
+          else expandedPosts.delete(id);
+        }});
       }});
       applyBodyPane();
       listEl.querySelectorAll("[data-unwatch]").forEach((btn) => {{
@@ -5047,13 +5076,31 @@ def _preview_inbox_item(item: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _optional_count(value: Any) -> Optional[int]:
+    if isinstance(value, list):
+        return len(value)
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _preview_own_post(post: Dict[str, Any]) -> Dict[str, Any]:
-    return {
+    full = str(post.get("body") or "")
+    clipped = _clip_preview(full)
+    row: Dict[str, Any] = {
         "id": post.get("id"),
         "title": post.get("title") or "",
-        "body": _clip_preview(post.get("body")),
+        "body": clipped,
         "created_at": post.get("created_at"),
+        "votes": _optional_count(post.get("votes")),
+        "comments": _optional_count(post.get("comments")),
     }
+    if full and clipped != " ".join(full.split()):
+        row["body_full"] = full
+    return row
 
 
 def _preview_own_comment(
@@ -5331,6 +5378,18 @@ def _recent_own_posts_from_new(client: Client, handle: str) -> List[Dict[str, An
     return out
 
 
+def _merge_own_post(existing: Dict[str, Any], incoming: Dict[str, Any]) -> None:
+    """Later sources fill votes, comment totals, and a longer body."""
+    if incoming.get("votes") is not None:
+        existing["votes"] = incoming.get("votes")
+    if incoming.get("comments") is not None:
+        existing["comments"] = incoming.get("comments")
+    incoming_body = incoming.get("body") or ""
+    current = existing.get("body") or ""
+    if len(str(incoming_body)) > len(str(current)):
+        existing["body"] = incoming_body
+
+
 def _append_own_posts(
     own_posts: List[Dict[str, Any]],
     own_ids: Set[int],
@@ -5348,6 +5407,14 @@ def _append_own_posts(
         except (TypeError, ValueError):
             continue
         if pid in own_ids:
+            for existing in own_posts:
+                try:
+                    existing_id = int(existing.get("id"))
+                except (TypeError, ValueError):
+                    continue
+                if existing_id == pid:
+                    _merge_own_post(existing, p)
+                    break
             continue
         own_posts.append(p)
         own_ids.add(pid)

@@ -424,6 +424,56 @@ class WatchlistTrailPreviewTests(unittest.TestCase):
         self.assertEqual(row["id"], 4025)
         self.assertTrue(row["body"].endswith("…"))
         self.assertLessEqual(len(row["body"]), 160)
+        self.assertGreater(len(row["body_full"]), len(row["body"]))
+        self.assertIsNone(row["votes"])
+        self.assertIsNone(row["comments"])
+
+    def test_preview_own_post_keeps_counts_and_short_body(self) -> None:
+        row = watch_mod._preview_own_post(
+            {
+                "id": 6521,
+                "title": "Silence is not a yes",
+                "body": "A short post.",
+                "votes": 15,
+                "comments": 4,
+                "created_at": 9,
+            }
+        )
+        self.assertEqual(row["votes"], 15)
+        self.assertEqual(row["comments"], 4)
+        self.assertEqual(row["body"], "A short post.")
+        self.assertNotIn("body_full", row)
+
+    def test_append_own_posts_fills_counts_and_longer_body(self) -> None:
+        own = [
+            {
+                "id": 6521,
+                "author": "errata",
+                "title": "Silence is not a yes",
+                "body": "short",
+                "created_at": 1,
+            }
+        ]
+        ids = {6521}
+        watch_mod._append_own_posts(
+            own,
+            ids,
+            [
+                {
+                    "id": 6521,
+                    "author": "errata",
+                    "votes": 15,
+                    "comments": 4,
+                    "body": "word " * 40,
+                }
+            ],
+            "errata",
+        )
+        self.assertEqual(len(own), 1)
+        self.assertEqual(ids, {6521})
+        self.assertEqual(own[0]["votes"], 15)
+        self.assertEqual(own[0]["comments"], 4)
+        self.assertGreater(len(own[0]["body"]), len("short"))
 
     def test_preview_own_comment_fills_post_title(self) -> None:
         row = watch_mod._preview_own_comment(
