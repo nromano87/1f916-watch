@@ -398,6 +398,24 @@ class CitizenApiTrailTests(unittest.TestCase):
         self.assertIn(7998, comment_ids)
 
 
+class ListingSummaryTests(unittest.TestCase):
+    def test_list_row_keeps_lifecycle_and_counts(self) -> None:
+        row = watch_mod._listing_summary(
+            {
+                "id": 12,
+                "title": "A listing",
+                "funder": "errata",
+                "lifecycle": "expired",
+                "submissions": 3,
+                "bindings": 1,
+            }
+        )
+        self.assertEqual(row["listing_id"], 12)
+        self.assertEqual(row["state"], "expired")
+        self.assertEqual(row["submissions"], 3)
+        self.assertEqual(row["bindings"], 1)
+
+
 class WatchlistTrailPreviewTests(unittest.TestCase):
     def tearDown(self) -> None:
         with watch_mod._CHANGES_COND:
@@ -731,6 +749,206 @@ class FrontSnapshotFreshnessTests(unittest.TestCase):
         self.assertEqual(cached["front"]["posts"][0]["id"], 6509)
         watch_mod._release_front_snapshot(filtered=False, fkey="", gen=gen)
         gate.set()
+
+    def test_slim_front_offers_keeps_join_fields(self) -> None:
+        rows = watch_mod._slim_front_offers(
+            {
+                "offers": [
+                    {
+                        "id": "offer-125",
+                        "offer_id": 125,
+                        "seller": "untash-napirisha-elam",
+                        "title": "Bitcoin-anchored timestamp receipts",
+                        "state": "open",
+                        "amount_atomic": "1000000",
+                        "asset": "USDC",
+                        "post_id": 7353,
+                        "terms": "long terms that must not ride on the front snapshot",
+                        "token": "not-for-the-feed",
+                    },
+                    {"offer_id": 9, "title": "no thread yet"},
+                    {
+                        "id": "offer-4",
+                        "seller": "ada",
+                        "title": "closed shop",
+                        "post_id": 10,
+                        "withdrawn_at": 1,
+                    },
+                ]
+            }
+        )
+        self.assertEqual([row["offer_id"] for row in rows], [125, 4])
+        self.assertEqual(rows[0]["post_id"], 7353)
+        self.assertEqual(rows[0]["amount_atomic"], "1000000")
+        self.assertEqual(rows[0]["asset"], "USDC")
+        self.assertNotIn("terms", rows[0])
+        self.assertNotIn("token", rows[0])
+        self.assertEqual(rows[1]["state"], "withdrawn")
+
+    def test_feed_refresh_keeps_offers(self) -> None:
+        watch_mod._FRONT_SNAP_CACHE["snap"] = {
+            "generated_at": "old",
+            "front": {"posts": [{"id": 7353, "title": "announce"}]},
+            "front_new": {"posts": [{"id": 7353, "title": "announce"}]},
+            "offers": [
+                {
+                    "offer_id": 125,
+                    "post_id": 7353,
+                    "state": "open",
+                    "title": "stamps",
+                    "seller": "ada",
+                }
+            ],
+        }
+        watch_mod._store_front_snapshot(
+            {
+                "generated_at": "new",
+                "front": {"posts": [{"id": 7353, "title": "announce"}]},
+                "front_new": {"posts": [{"id": 7400, "title": "later"}]},
+            },
+            filtered=False,
+            fkey="",
+        )
+        stored = watch_mod._FRONT_SNAP_CACHE["snap"]
+        self.assertEqual(stored["offers"][0]["offer_id"], 125)
+        self.assertEqual(stored["front_new"]["posts"][0]["id"], 7400)
+
+    def test_enrichment_replaces_offers(self) -> None:
+        watch_mod._FRONT_SNAP_CACHE["snap"] = {
+            "front": {"posts": [{"id": 1}]},
+            "front_new": {"posts": [{"id": 1}]},
+            "offers": [{"offer_id": 1, "post_id": 1, "state": "open"}],
+        }
+        watch_mod._merge_front_enrichment(
+            {
+                "offers": [
+                    {
+                        "offer_id": 125,
+                        "post_id": 7353,
+                        "state": "open",
+                        "title": "stamps",
+                        "seller": "ada",
+                    }
+                ],
+                "front": {"posts": [{"id": 1, "tags": ["square"]}]},
+                "front_new": {"posts": [{"id": 1}]},
+            },
+            filtered=False,
+            fkey="",
+        )
+        offers = watch_mod._FRONT_SNAP_CACHE["snap"]["offers"]
+        self.assertEqual(offers[0]["offer_id"], 125)
+        watch_mod._merge_front_enrichment(
+            {
+                "offers": [],
+                "front": {"posts": [{"id": 1}]},
+                "front_new": {"posts": [{"id": 1}]},
+            },
+            filtered=False,
+            fkey="",
+        )
+        self.assertEqual(watch_mod._FRONT_SNAP_CACHE["snap"]["offers"], [])
+
+    def test_slim_front_indexes_keeps_only_visible_moderation(self) -> None:
+        snap = watch_mod._slim_front_indexes(
+            {
+                "front": {"posts": [{"id": 10, "title": "hot"}]},
+                "front_new": {"posts": [{"id": 11, "title": "new"}]},
+                "front_comments": [{"id": 3, "post_id": 10}],
+                "moderation": {
+                    "count": 2,
+                    "by_key": {
+                        "post:10": {"action": "collapsed"},
+                        "comment:99999": {"action": "removed", "reason": "x" * 400},
+                    },
+                },
+                "flags": {
+                    "count": 1,
+                    "by_key": {"comment:3": {"flags": 1, "reason": "y" * 200}},
+                    "queue": [
+                        {
+                            "target_type": "comment",
+                            "target_id": 3,
+                            "flags": 1,
+                        }
+                    ],
+                },
+                "tags": {
+                    "tags": [
+                        {"tag": "rare", "uses": 1},
+                        {"tag": "square", "uses": 50},
+                    ]
+                    + [{"tag": "t{}".format(i), "uses": 2} for i in range(60)],
+                },
+            }
+        )
+        self.assertEqual(list(snap["moderation"]["by_key"]), ["post:10"])
+        self.assertEqual(snap["moderation"]["count"], 2)
+        self.assertEqual(snap["flags"]["by_key"], {})
+        self.assertEqual(snap["flags"]["queue"][0]["target_id"], 3)
+        self.assertLessEqual(len(snap["tags"]["tags"]), watch_mod._FRONT_TAG_CAP)
+        self.assertEqual(snap["tags"]["tags"][0]["tag"], "square")
+
+    def test_front_snapshot_body_is_reused_until_publish(self) -> None:
+        watch_mod._FRONT_SNAP_CACHE["snap"] = {
+            "generated_at": "t1",
+            "mode": "front",
+            "front": {"posts": [{"id": 1, "title": "a"}]},
+            "front_new": {"posts": [{"id": 1, "title": "a"}]},
+        }
+        watch_mod._FRONT_SNAP_CACHE["fetched_at"] = 10**12
+        first, enc = watch_mod._front_snapshot_body(
+            watch_mod._FRONT_SNAP_CACHE["snap"],
+            filtered=False,
+            fkey="",
+            gzip_ok=False,
+        )
+        second, _enc2 = watch_mod._front_snapshot_body(
+            {"generated_at": "t1"},
+            filtered=False,
+            fkey="",
+            gzip_ok=False,
+        )
+        self.assertIsNone(enc)
+        self.assertIs(first, second)
+        watch_mod._store_front_snapshot(
+            {
+                "generated_at": "t2",
+                "front": {"posts": [{"id": 2, "title": "b"}]},
+                "front_new": {"posts": [{"id": 2, "title": "b"}]},
+            },
+            filtered=False,
+            fkey="",
+        )
+        third, _enc3 = watch_mod._front_snapshot_body(
+            watch_mod._FRONT_SNAP_CACHE["snap"],
+            filtered=False,
+            fkey="",
+            gzip_ok=False,
+        )
+        self.assertIsNot(third, first)
+        self.assertIn(b'"id":2', third)
+
+    def test_front_thread_cache_fetches_each_post_once(self) -> None:
+        calls: list = []
+
+        def _fake(_client: Any, ids: list, max_workers: int = 4) -> Dict[str, Any]:
+            calls.append((list(ids), max_workers))
+            return {int(pid): {"post": {"id": int(pid)}} for pid in ids}
+
+        watch_mod._FRONT_THREAD_CACHE.clear()
+        original = watch_mod.fetch_threads
+        watch_mod.fetch_threads = _fake
+        try:
+            first = watch_mod._cached_front_threads(object(), [7, 8])
+            second = watch_mod._cached_front_threads(object(), [7, 8])
+        finally:
+            watch_mod.fetch_threads = original
+            watch_mod._FRONT_THREAD_CACHE.clear()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1], 1)
+        self.assertEqual(set(first), {7, 8})
+        self.assertEqual(second[7]["post"]["id"], 7)
 
 
 class WatchModerationStateTests(unittest.TestCase):

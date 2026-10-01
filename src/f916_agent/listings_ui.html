@@ -579,9 +579,22 @@
         + "</div>";
     }
 
+    function listingState(row) {
+      if (!row) return "open";
+      if (row.state) return row.state;
+      if (row.lifecycle) return row.lifecycle;
+      if (row.withdrawn_at) return "withdrawn";
+      if (row.expired) return "expired";
+      return "open";
+    }
+    function listingIsClosed(row) {
+      const st = String(listingState(row) || "").toLowerCase();
+      return !!row.expired || !!row.withdrawn_at
+        || st.indexOf("expired") >= 0 || st.indexOf("withdraw") >= 0;
+    }
     function listingCard(row, { href } = {}) {
       const id = listingId(row);
-      const state = row.state || (row.withdrawn_at ? "withdrawn" : (row.expired ? "expired" : "open"));
+      const state = listingState(row);
       const subs = Array.isArray(row.submissions) ? row.submissions.length : Number(row.submissions || 0);
       const binds = Array.isArray(row.bindings) ? row.bindings.length : Number(row.bindings || 0);
       const receipts = Number(row.receipts || 0);
@@ -976,17 +989,8 @@
       const showClosedOffers = document.getElementById("showClosedOffers")
         ? document.getElementById("showClosedOffers").checked
         : false;
-      const visible = rows.filter((r) => {
-        if (showExpired) return true;
-        if (r.expired || r.withdrawn_at) return false;
-        const st = String(r.state || "").toLowerCase();
-        if (st.indexOf("expired") >= 0 || st.indexOf("withdraw") >= 0) return false;
-        return true;
-      });
-      const openCount = rows.filter((r) => {
-        const st = String(r.state || "").toLowerCase();
-        return !r.expired && !r.withdrawn_at && st !== "expired" && st.indexOf("withdraw") < 0;
-      }).length;
+      const visible = rows.filter((r) => showExpired || !listingIsClosed(r));
+      const openCount = rows.filter((r) => !listingIsClosed(r)).length;
       const visibleOffers = offerRows.filter((r) => {
         if (showClosedOffers) return true;
         const st = String((r && r.state) || "").toLowerCase();

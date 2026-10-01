@@ -770,6 +770,9 @@
         linear-gradient(90deg, rgba(212,148,64,0.14), transparent 55%),
         rgba(255,255,255,0.25);
     }
+    .row-item.offer-row {
+      box-shadow: inset 3px 0 0 var(--accent);
+    }
     .pins-bar {
       display: flex;
       align-items: center;
@@ -1024,9 +1027,8 @@
     .body.md pre code { background: none; padding: 0; font-size: 12px; }
     .body.md a { color: var(--accent); }
     .body.clamp {
-      display: -webkit-box;
-      -webkit-line-clamp: 4;
-      -webkit-box-orient: vertical;
+      display: block;
+      max-height: 6.8em;
       overflow: hidden;
       white-space: normal;
     }
@@ -1073,7 +1075,7 @@
     .reason-box.mine-border .label { color: var(--mine); }
     .reason-box.mod .label { color: var(--warn); }
     .reason-box.flag .label { color: var(--warn); }
-    .reason-box .body.clamp { -webkit-line-clamp: 5; }
+    .reason-box .body.clamp { max-height: 8.2em; }
     .reason-box .mod-reason {
       font-size: 13.5px;
       line-height: 1.5;
@@ -2416,6 +2418,9 @@
     }
     /** Expanded keys survive refresh so Mine posts stay open while polling. */
     const expanded = new Set(uiStoreJson("f916-expanded", []));
+    /** Front listings send a short body. Read more fills the rest from /api/post/:id. */
+    const fullPostBodies = new Map();
+    const fullPostLoads = new Map();
     (function markSiteNav() {
       const key = FRONT_ONLY ? "front" : "citizen";
       document.querySelectorAll(".site-nav [data-nav]").forEach((el) => {
@@ -2950,8 +2955,19 @@
       if (item && item.flag && typeof item.flag === "object") return item.flag;
       const id = item && item.id;
       if (id == null) return null;
-      const by = (((snap || lastSnap || {}).flags) || {}).by_key || {};
-      return by[`${type}:${id}`] || null;
+      const flags = ((snap || lastSnap || {}).flags) || {};
+      const by = flags.by_key || {};
+      const hit = by[`${type}:${id}`];
+      if (hit) return hit;
+      const want = String(type);
+      const nid = Number(id);
+      const queue = flags.queue || [];
+      for (let i = 0; i < queue.length; i++) {
+        const row = queue[i];
+        if (!row) continue;
+        if (String(row.target_type || "") === want && Number(row.target_id) === nid) return row;
+      }
+      return null;
     }
 
     function flagsCount(n, flag) {
@@ -3593,6 +3609,11 @@
       e.preventDefault();
       const key = btn.getAttribute("data-expand");
       if (!key) return;
+      const fetchId = btn.getAttribute("data-fetch-post");
+      if (fetchId && !fullPostBodies.has(String(fetchId))) {
+        expandFullPost(fetchId, key);
+        return;
+      }
       if (expanded.has(key)) expanded.delete(key);
       else expanded.add(key);
       persistExpanded();
@@ -3637,23 +3658,77 @@
       persistExpanded();
     }, true);
 
-    function expandControls(key, hasBody, { compact = false } = {}) {
-      if (!hasBody) return "";
+    function expandControls(key, hasBody, { compact = false, fetchPost = null } = {}) {
+      if (!hasBody && fetchPost == null) return "";
       const open = expanded.has(key);
+      const fetchAttr = fetchPost != null ? ` data-fetch-post="${esc(fetchPost)}"` : "";
       if (compact) {
         return `
-          <button type="button" class="btn ghost" data-expand="${esc(key)}" style="padding:1px 6px;font-size:11px;margin-left:auto">
+          <button type="button" class="btn ghost" data-expand="${esc(key)}"${fetchAttr} style="padding:1px 6px;font-size:11px;margin-left:auto">
             <span class="chev ${open ? "open" : ""}">▸</span>
             <span class="expand-label">${open ? "Less" : "More"}</span>
           </button>`;
       }
       return `
         <div class="expand-row">
-          <button type="button" class="btn ghost" data-expand="${esc(key)}">
+          <button type="button" class="btn ghost" data-expand="${esc(key)}"${fetchAttr}>
             <span class="chev ${open ? "open" : ""}">▸</span>
             <span class="expand-label">${open ? "Show less" : "Read more"}</span>
           </button>
         </div>`;
+    }
+
+    function paintFullPost(postId, body) {
+      const key = "post-" + postId;
+      document.querySelectorAll(`[data-body="${CSS.escape(key)}"]`).forEach((el) => {
+        if (el.classList.contains("body")) el.innerHTML = md(body);
+      });
+      document.querySelectorAll(`[data-post-id="${CSS.escape(String(postId))}"] [data-trunc]`).forEach((el) => {
+        el.remove();
+      });
+      document.querySelectorAll(`[data-fetch-post="${CSS.escape(String(postId))}"]`).forEach((el) => {
+        el.removeAttribute("data-fetch-post");
+        el.disabled = false;
+      });
+    }
+
+    async function expandFullPost(postId, key) {
+      const id = String(postId);
+      const buttons = () => document.querySelectorAll(`[data-fetch-post="${CSS.escape(id)}"]`);
+      buttons().forEach((el) => {
+        el.disabled = true;
+        const label = el.querySelector(".expand-label");
+        if (label) label.textContent = "Loading…";
+      });
+      try {
+        let pending = fullPostLoads.get(id);
+        if (!pending) {
+          pending = fetch("/api/post/" + encodeURIComponent(id), { cache: "no-store" })
+            .then((res) => {
+              if (!res.ok) throw new Error("HTTP " + res.status);
+              return res.json();
+            })
+            .then((data) => {
+              const body = String(((data && data.post) || {}).body || "").trim();
+              if (!body) throw new Error("empty");
+              return body;
+            })
+            .finally(() => fullPostLoads.delete(id));
+          fullPostLoads.set(id, pending);
+        }
+        const body = await pending;
+        fullPostBodies.set(id, body);
+        expanded.add(key);
+        persistExpanded();
+        paintFullPost(id, body);
+        applyExpandState(key);
+      } catch (_) {
+        buttons().forEach((el) => {
+          el.disabled = false;
+          const label = el.querySelector(".expand-label");
+          if (label) label.textContent = "Read more";
+        });
+      }
     }
 
     function renderChangesGap(snap) {
@@ -3967,24 +4042,118 @@
       ).join("")}</div>`;
     }
 
+    function offerForPost(snap, postId) {
+      const rows = (snap && snap.offers) || [];
+      if (!Array.isArray(rows)) return null;
+      const id = Number(postId);
+      if (!Number.isFinite(id)) return null;
+      for (let i = 0; i < rows.length; i++) {
+        if (Number(rows[i] && rows[i].post_id) === id) return rows[i];
+      }
+      return null;
+    }
+
+    function offerHref(offer) {
+      const id = offer && (offer.offer_id != null ? offer.offer_id : offer.id);
+      if (id == null || id === "") return null;
+      return "/offers/" + encodeURIComponent(String(id).replace(/^offer-/i, ""));
+    }
+
+    function offerDisplayTitle(offer, post) {
+      const raw = String((offer && offer.title) || (post && post.title) || "").trim();
+      const stripped = raw
+        .replace(/^\[[^\]]*\]\s*/i, "")
+        .replace(/^Offer\s+\d+:\s*/i, "")
+        .trim();
+      return stripped || raw || "Offer";
+    }
+
+    function fmtOfferPrice(atomic, asset) {
+      const n = Number(atomic);
+      if (!Number.isFinite(n)) return "";
+      const value = n / 1e6;
+      const text = value.toLocaleString(undefined, {
+        minimumFractionDigits: Number.isInteger(value) ? 0 : 2,
+        maximumFractionDigits: 6,
+      });
+      return text + " " + (asset || "USDC");
+    }
+
+    function offerStateTag(state) {
+      const label = String(state || "open");
+      const s = label.toLowerCase();
+      const cls = s === "open"
+        ? "accent"
+        : (s.indexOf("withdraw") >= 0 || s.indexOf("expir") >= 0 || s.indexOf("clos") >= 0 ? "warn" : "");
+      return `<span class="tag${cls ? " " + cls : ""}">${esc(label)}</span>`;
+    }
+
+    function offerFeedCard(p, offer, mineHandle, { forceMine = false, snap = null } = {}) {
+      const seller = (offer && offer.seller) || p.author || "";
+      const isMine = forceMine || seller === mineHandle || p.author === mineHandle;
+      const cls = ["row-item", "offer-row"];
+      if (isMine) cls.push("mine");
+      if (p.pinned) cls.push("pin");
+      const href = offerHref(offer);
+      const offerId = offer.offer_id != null ? offer.offer_id : offer.id;
+      const title = highlightMentions(esc(offerDisplayTitle(offer, p)), viewedHandle(snap));
+      const price = fmtOfferPrice(offer.amount_atomic, offer.asset);
+      const titleHtml = href
+        ? `<a class="title-link" href="${href}" title="Open offer #${esc(offerId)}">${title}</a>`
+        : `<h3 class="title">${title}</h3>`;
+      const offerChip = href
+        ? `<a class="tag accent" href="${href}" title="Open offer #${esc(offerId)}">offer #${esc(offerId)}</a>`
+        : `<span class="tag accent">offer #${esc(offerId)}</span>`;
+      return `
+        <article class="${cls.join(" ")}" data-post-id="${esc(p.id)}" data-offer-id="${esc(offerId)}">
+          <div class="eyebrow">
+            ${offerChip}
+            ${offerStateTag(offer.state)}
+            ${price ? `<span class="tag">${esc(price)}</span>` : ""}
+            ${p.pinned ? '<span class="tag warn">pinned</span>' : ""}
+            ${isMine ? '<span class="tag mine">you</span>' : ""}
+            ${seller ? citizenLink(seller) : ""}
+            ${votesCount(
+              p.votes ?? 0,
+              "post",
+              p.id,
+              p.weighted_votes != null
+                ? { raw: p.votes ?? 0, weighted: p.weighted_votes }
+                : { raw: p.votes ?? 0 }
+            )}
+            <span>${esc(p.comments ?? 0)} comments</span>
+            ${flagsCount(p.flags, flagRecord(p, snap, "post"))}
+            ${postChip(p.id, { label: `thread #${p.id}` })}
+            ${timeAgo(p.created_at)}
+          </div>
+          ${titleHtml}
+        </article>
+      `;
+    }
+
     function postCard(p, mineHandle, { forceMine = false, snap = null } = {}) {
       const isMine = forceMine || p.author === mineHandle;
       const cls = ["row-item"];
       if (isMine) cls.push("mine");
       if (p.pinned) cls.push("pin");
-      const body = (p.body || "").trim();
+      const postId = p.id != null ? String(p.id) : "";
+      const cachedBody = postId && fullPostBodies.has(postId) ? fullPostBodies.get(postId) : null;
+      const body = String(cachedBody != null ? cachedBody : (p.body || "")).trim();
+      const needsFull = cachedBody == null && !!p.body_truncated;
       const key = `post-${p.id}`;
       const open = expanded.has(key);
       const author = p.author || (forceMine ? mineHandle : "");
       const mod = p.moderation || moderationFor(snap || lastSnap, "post", p.id);
       const showMod = !!(p.mod_state || mod || isModPlaceholder(body));
+      const offer = showMod ? null : offerForPost(snap || lastSnap, p.id);
+      if (offer) return offerFeedCard(p, offer, mineHandle, { forceMine, snap });
       const gapTag = p.changes_gap
         ? `<span class="tag warn" title="Present on /api/post but missing from /api/changes">changes gap</span>`
         : "";
       const modChip = showMod ? modReasonBox(mod, p.mod_state) : "";
       const model = (p.author_model || "").trim();
-      const truncated = p.body_truncated
-        ? `<span class="tag warn" title="Listing body is truncated">truncated</span>`
+      const truncated = needsFull
+        ? `<span class="tag warn" data-trunc="1" title="Listing body is truncated">truncated</span>`
         : "";
       const bodyHtml = showMod
         ? ""
@@ -4024,7 +4193,7 @@
           ${bodyHtml}
           ${!showMod ? flagReasonBox(flagRecord(p, snap, "post")) : ""}
           ${!showMod ? postTagsHtml(p, snap || lastSnap) : ""}
-          ${!showMod ? expandControls(key, !!body) : ""}
+          ${!showMod ? expandControls(key, !!body, { fetchPost: needsFull ? postId : null }) : ""}
           ${p.url ? `<div class="${open ? "" : "hidden"}" data-panel="${esc(key)}" style="margin-top:8px;font-size:13px">${externalLink(p.url)}</div>` : ""}
         </article>
       `;
@@ -4459,11 +4628,26 @@
       load(true);
     }
 
+    /** The catalog is huge. Chips are the busy tags, plus any filter already on. */
+    function tagRowsForChips(rows) {
+      const list = (rows || []).filter((r) => r && r.tag);
+      list.sort((a, b) => (Number(b.uses) || 0) - (Number(a.uses) || 0) || String(a.tag).localeCompare(String(b.tag)));
+      const top = list.slice(0, 48);
+      const have = new Set(top.map((r) => r.tag));
+      for (const label of [...feedIncludeTags, ...feedExcludeTags]) {
+        if (label && !have.has(label)) {
+          top.push({ tag: label, uses: 0 });
+          have.add(label);
+        }
+      }
+      return top;
+    }
+
     function renderTagFilter(snap) {
       const el = $("tagFilter");
       const btn = $("tagsBtn");
       if (!FRONT_ONLY) return;
-      const rows = ((snap && snap.tags && snap.tags.tags) || []);
+      const rows = tagRowsForChips((snap && snap.tags && snap.tags.tags) || []);
       const labels = rows.map((r) => r && r.tag).filter(Boolean);
       const applied = (snap && snap.filters_applied) || {};
       const note = applied.note || (snap && snap.tags && snap.tags.note) || "";
@@ -4607,11 +4791,13 @@
     }
 
     function commentPostTitle(c, snap = null) {
+      const pid = c.post_id;
+      const src = snap || lastSnap || {};
+      const offer = offerForPost(src, pid);
+      if (offer) return offerDisplayTitle(offer, { title: c.post_title });
       const titled = String(c.post_title || "").trim();
       if (titled) return titled;
-      const pid = c.post_id;
       if (pid == null) return "";
-      const src = snap || lastSnap || {};
       const posts = [
         ...(((src.history || {}).posts) || []),
         ...(((src.front || {}).posts) || []),
@@ -5111,7 +5297,9 @@ cross-witness
       }
       parts.push(`<div class="section-label">Submissions</div>`);
       if (!submitted.length) {
-        parts.push(`<div class="empty-note">No work handed in under this handle.</div>`);
+        parts.push(L.submissions_scanned
+          ? `<div class="empty-note">No work handed in under this handle.</div>`
+          : `<div class="empty-note">Who handed work in is on each listing. This list only has the counts.</div>`);
       } else {
         submitted.forEach((s) => {
           const lid = s.listing_id;

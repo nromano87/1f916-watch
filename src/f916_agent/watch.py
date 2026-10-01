@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import gzip
 import ipaddress
 import json
 import os
@@ -309,6 +310,13 @@ _FRONT_FILTER_TTL_SEC = 45.0
 _FRONT_SNAP_FAIL_BACKOFF_SEC = 15.0
 _FRONT_ENRICH_LOCK = threading.Lock()
 _FRONT_ENRICH_RUNNING = False
+# Thread bodies for the comments tab. Refetching every front post on each
+# 45s refresh holds every society-request slot and the page stops answering.
+_FRONT_THREAD_TTL_SEC = 180.0
+_FRONT_THREAD_CACHE: Dict[int, Dict[str, Any]] = {}
+_FRONT_THREAD_LOCK = threading.Lock()
+# Tag catalog is a thousand chips. The modal only needs the busy ones.
+_FRONT_TAG_CAP = 48
 _HIT_LOCK = threading.Lock()
 
 # Docket + provenance boards — light public reads.
@@ -4545,7 +4553,9 @@ def _fill_comment_votes(client: Client, post_ids: List[int]) -> None:
     stalls = 0
     while pending and stalls < 5:
         chunk = pending[:_COMMENT_VOTE_CHUNK]
-        threads = fetch_threads(client, chunk, max_workers=4)
+        # One slot. Four here plus the front crawl used up the society
+        # client and left /healthz waiting behind them.
+        threads = fetch_threads(client, chunk, max_workers=1)
         if not threads:
             stalls += 1
             time.sleep(1.5 * stalls)
@@ -6902,6 +6912,57 @@ def build_public_snapshot(
         raise
 
 
+def _offer_id_num(raw: Any) -> Optional[int]:
+    text = str(raw if raw is not None else "").strip()
+    if text.lower().startswith("offer-"):
+        text = text.split("-", 1)[1]
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def _slim_front_offers(payload: Any) -> List[Dict[str, Any]]:
+    """Join keys for the front: which post announces which offer, and the card fields."""
+    rows: List[Any] = []
+    if isinstance(payload, dict):
+        raw = payload.get("offers")
+        if isinstance(raw, list):
+            rows = raw
+    elif isinstance(payload, list):
+        rows = payload
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        offer_id = _offer_id_num(row.get("offer_id"))
+        if offer_id is None:
+            offer_id = _offer_id_num(row.get("id"))
+        if offer_id is None:
+            continue
+        try:
+            post_id = int(row.get("post_id"))
+        except (TypeError, ValueError):
+            continue
+        state = row.get("state")
+        if not state:
+            state = "withdrawn" if row.get("withdrawn_at") else "open"
+        item: Dict[str, Any] = {
+            "offer_id": offer_id,
+            "post_id": post_id,
+            "state": str(state),
+            "seller": str(row.get("seller") or ""),
+            "title": str(row.get("title") or ""),
+        }
+        if row.get("amount_atomic") not in (None, ""):
+            item["amount_atomic"] = row.get("amount_atomic")
+        asset = str(row.get("asset") or "").strip()
+        if asset:
+            item["asset"] = asset
+        out.append(item)
+    return out
+
+
 def _front_comment_titles(posts: List[Dict[str, Any]]) -> Dict[int, str]:
     titles: Dict[int, str] = {}
     for p in posts or []:
@@ -7041,6 +7102,185 @@ def _tag_labels_from_thread(data: Dict[str, Any]) -> List[str]:
     return labels
 
 
+def _cached_front_threads(
+    client: Client, post_ids: List[int]
+) -> Dict[int, Dict[str, Any]]:
+    """Reuse recent /api/post bodies. One in-flight fetch, not four."""
+    now = time.time()
+    fresh: Dict[int, Dict[str, Any]] = {}
+    missing: List[int] = []
+    with _FRONT_THREAD_LOCK:
+        for pid in post_ids:
+            try:
+                key = int(pid)
+            except (TypeError, ValueError):
+                continue
+            row = _FRONT_THREAD_CACHE.get(key)
+            if row and (now - float(row.get("at") or 0)) < _FRONT_THREAD_TTL_SEC:
+                fresh[key] = row["data"]
+            else:
+                missing.append(key)
+    if not missing:
+        return fresh
+    fetched = fetch_threads(client, missing, max_workers=1) or {}
+    now = time.time()
+    with _FRONT_THREAD_LOCK:
+        for pid, data in fetched.items():
+            _FRONT_THREAD_CACHE[int(pid)] = {"at": now, "data": data}
+            fresh[int(pid)] = data
+        if len(_FRONT_THREAD_CACHE) > 400:
+            oldest = sorted(
+                _FRONT_THREAD_CACHE,
+                key=lambda k: float(_FRONT_THREAD_CACHE[k].get("at") or 0),
+            )[:100]
+            for key in oldest:
+                _FRONT_THREAD_CACHE.pop(key, None)
+    return fresh
+
+
+def _front_row_key(kind: str, row: Any, *, id_field: str = "id") -> Optional[str]:
+    if not isinstance(row, dict):
+        return None
+    try:
+        return "{}:{}".format(kind, int(row.get(id_field)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _slim_front_indexes(snap: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop society-wide registers the front page never looks up.
+
+    moderation.by_key is every collapsed comment in the square (~600KB).
+    flags.by_key repeats flags.queue. The tag catalog is a thousand chips.
+    """
+    if not isinstance(snap, dict):
+        return snap
+    needed: Set[str] = set()
+    for blob_key in ("front", "front_new"):
+        blob = snap.get(blob_key)
+        if not isinstance(blob, dict):
+            continue
+        for row in blob.get("posts") or []:
+            key = _front_row_key("post", row)
+            if key:
+                needed.add(key)
+    for row in list(snap.get("front_comments") or []) + list(
+        snap.get("front_comments_top") or []
+    ):
+        key = _front_row_key("comment", row)
+        if key:
+            needed.add(key)
+    flags = snap.get("flags") if isinstance(snap.get("flags"), dict) else {}
+    for row in flags.get("queue") or []:
+        if not isinstance(row, dict):
+            continue
+        key = _front_row_key(
+            str(row.get("target_type") or ""), row, id_field="target_id"
+        )
+        if key:
+            needed.add(key)
+
+    mod = snap.get("moderation")
+    if isinstance(mod, dict) and isinstance(mod.get("by_key"), dict):
+        mod = dict(mod)
+        mod["by_key"] = {
+            key: val
+            for key, val in mod["by_key"].items()
+            if key in needed
+        }
+        snap["moderation"] = mod
+
+    if isinstance(flags, dict) and flags.get("by_key"):
+        # The flagged sort reads queue. Rows that are flagged already carry
+        # .flag. Shipping by_key again was a second copy of the same register.
+        flags = dict(flags)
+        flags["by_key"] = {}
+        snap["flags"] = flags
+
+    tags = snap.get("tags")
+    if isinstance(tags, dict) and isinstance(tags.get("tags"), list):
+        rows = [row for row in tags["tags"] if isinstance(row, dict) and row.get("tag")]
+        if len(rows) > _FRONT_TAG_CAP:
+            def _uses(row: Dict[str, Any]) -> int:
+                try:
+                    return int(row.get("uses") or 0)
+                except (TypeError, ValueError):
+                    return 0
+
+            rows.sort(key=_uses, reverse=True)
+            tags = dict(tags)
+            tags["tags"] = rows[:_FRONT_TAG_CAP]
+            tags["capped"] = True
+            snap["tags"] = tags
+    return snap
+
+
+def _drop_front_body(entry: Dict[str, Any]) -> None:
+    entry.pop("body", None)
+    entry.pop("body_gz", None)
+    entry.pop("body_for", None)
+    entry["body_gen"] = int(entry.get("body_gen") or 0) + 1
+
+
+def _front_snapshot_body(
+    snap: Dict[str, Any],
+    *,
+    filtered: bool,
+    fkey: str,
+    gzip_ok: bool,
+) -> Tuple[bytes, Optional[str]]:
+    """Encode the front snapshot once per publish. Polls reuse the bytes.
+
+    The cached object is the identity. A merge replaces that object and
+    bumps ``body_gen``, so a poll cannot keep serving the previous page.
+    """
+    with _FRONT_SNAP_COND:
+        if filtered:
+            entry = _FRONT_FILTER_CACHE.get(fkey) or {}
+        else:
+            entry = _FRONT_SNAP_CACHE
+        gen = int(entry.get("body_gen") or 0)
+        source = entry.get("snap") if isinstance(entry.get("snap"), dict) else snap
+        if entry.get("body_for") == gen and isinstance(entry.get("body"), bytes):
+            if gzip_ok and isinstance(entry.get("body_gz"), bytes):
+                return entry["body_gz"], "gzip"
+            if not gzip_ok:
+                return entry["body"], None
+    raw = json.dumps(source, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    gz = gzip.compress(raw, compresslevel=6) if gzip_ok else None
+    with _FRONT_SNAP_COND:
+        if filtered:
+            entry = _FRONT_FILTER_CACHE.setdefault(fkey, {})
+        else:
+            entry = _FRONT_SNAP_CACHE
+        if int(entry.get("body_gen") or 0) == gen and entry.get("snap") is source:
+            entry["body"] = raw
+            entry["body_for"] = gen
+            if gz is not None:
+                entry["body_gz"] = gz
+    if gzip_ok and gz is not None:
+        return gz, "gzip"
+    return raw, None
+
+
+def front_snapshot_response(
+    client: Client,
+    *,
+    tag: Optional[str] = None,
+    exclude: Optional[str] = None,
+    gzip_ok: bool = False,
+) -> Tuple[bytes, Optional[str]]:
+    tag_q = _normalize_tag_csv(tag)
+    exclude_q = _normalize_tag_csv(exclude)
+    snap = build_front_snapshot(client, tag=tag, exclude=exclude)
+    return _front_snapshot_body(
+        snap,
+        filtered=bool(tag_q or exclude_q),
+        fkey=_front_filter_key(tag_q, exclude_q),
+        gzip_ok=gzip_ok,
+    )
+
+
 def _front_comments_top(
     client: Client,
     front_posts: List[Dict[str, Any]],
@@ -7066,7 +7306,7 @@ def _front_comments_top(
         post_ids.append(pid)
         if p.get("title"):
             titles[pid] = str(p.get("title"))
-    threads = fetch_threads(client, post_ids) if post_ids else {}
+    threads = _cached_front_threads(client, post_ids) if post_ids else {}
     vote_map: Dict[int, int] = {}
     post_flags: Dict[int, int] = {}
     post_tags: Dict[str, List[str]] = {}
@@ -7338,14 +7578,21 @@ def _store_front_snapshot(
                 "tags",
                 "post_tags",
                 "filters_applied",
+                "offers",
             ):
                 if key not in snap and prev.get(key) is not None:
                     snap[key] = prev.get(key)
         if filtered:
-            _FRONT_FILTER_CACHE[fkey] = {"fetched_at": now, "snap": snap}
+            prev_entry = _FRONT_FILTER_CACHE.get(fkey) or {}
+            _FRONT_FILTER_CACHE[fkey] = {
+                "fetched_at": now,
+                "snap": snap,
+                "body_gen": int(prev_entry.get("body_gen") or 0) + 1,
+            }
         else:
             _FRONT_SNAP_CACHE["fetched_at"] = now
             _FRONT_SNAP_CACHE["snap"] = snap
+            _drop_front_body(_FRONT_SNAP_CACHE)
 
 
 def _release_front_snapshot(
@@ -7404,6 +7651,7 @@ def _compute_front_snapshot(
         ("events", lambda: client.events() or {}),
         ("stats", lambda: build_stats_snapshot(client)),
         ("changes_tip", lambda: _fetch_changes_tip(client, max_pages=2)),
+        ("offers", lambda: client.offers(include_closed=True) or {}),
     )
     published = False
     with ThreadPoolExecutor(max_workers=4) as pool:
@@ -7547,7 +7795,7 @@ def _compute_front_snapshot(
     front_comments = _enrich_rows_flags(
         front_comments, flags_index, target_type="comment"
     )
-    return {
+    snap = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "mode": "front",
         "front": front,
@@ -7577,6 +7825,9 @@ def _compute_front_snapshot(
         "identity_events": identity_events,
         "errors": errors,
     }
+    if "offers" in bucket:
+        snap["offers"] = _slim_front_offers(bucket.get("offers"))
+    return _slim_front_indexes(snap)
 
 
 def _fetch_front_feeds(
@@ -7693,15 +7944,19 @@ def _merge_front_enrichment(
                 merged[key] = val
         if snap.get("errors"):
             merged["errors"] = list(snap.get("errors") or [])
+        if "offers" in snap:
+            merged["offers"] = list(snap.get("offers") or [])
         merged["front"] = _overlay_feed_posts(prev.get("front"), snap.get("front"))
         merged["front_new"] = _overlay_feed_posts(
             prev.get("front_new"), snap.get("front_new")
         )
         if filtered:
             entry["snap"] = merged
+            _drop_front_body(entry)
             _FRONT_FILTER_CACHE[fkey] = entry
         else:
             _FRONT_SNAP_CACHE["snap"] = merged
+            _drop_front_body(_FRONT_SNAP_CACHE)
 
 
 def _start_front_enrichment(
@@ -8599,22 +8854,42 @@ def _coerce_listing_id(row: Any) -> Optional[int]:
         return None
 
 
+def _as_count(value: Any) -> int:
+    if isinstance(value, list):
+        return len(value)
+    if isinstance(value, bool) or value is None or value == "":
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _listing_state(row: Dict[str, Any]) -> str:
+    state = row.get("state") or row.get("lifecycle")
+    if state:
+        return str(state)
+    if row.get("withdrawn_at"):
+        return "withdrawn"
+    if row.get("expired"):
+        return "expired"
+    return "open"
+
+
 def _listing_summary(detail: Dict[str, Any]) -> Dict[str, Any]:
     lid = _coerce_listing_id(detail)
-    subs = detail.get("submissions") if isinstance(detail.get("submissions"), list) else []
-    binds = detail.get("bindings") if isinstance(detail.get("bindings"), list) else []
     return {
         "listing_id": lid,
         "id": detail.get("id") or ("listing-{}".format(lid) if lid is not None else None),
         "row": detail.get("row") or ("listing-{}".format(lid) if lid is not None else None),
         "title": detail.get("title"),
         "funder": detail.get("funder"),
-        "state": detail.get("state"),
+        "state": _listing_state(detail),
         "amount_atomic": detail.get("amount_atomic"),
         "expiry": detail.get("expiry"),
         "post_id": detail.get("post_id"),
-        "submissions": len(subs),
-        "bindings": len(binds),
+        "submissions": _as_count(detail.get("submissions")),
+        "bindings": _as_count(detail.get("bindings")),
         "expired": detail.get("expired"),
         "withdrawn_at": detail.get("withdrawn_at"),
     }
@@ -8641,15 +8916,9 @@ def build_listings_snapshot(
             listings = client.listings(include_expired=True) or {}
         except ApiError as e:
             errors.append("listings: {}".format(e))
-        ids: List[int] = []
-        seen: set = set()
-        for row in list(listings.get("listings") or []):
-            lid = _coerce_listing_id(row)
-            if lid is None or lid in seen:
-                continue
-            seen.add(lid)
-            ids.append(lid)
-        details: List[Dict[str, Any]] = []
+        # The register already carries lifecycle and submission counts.
+        # One GET /api/listings/:id per row is what trips the society's
+        # rate limit and paints a wall of 429s on this page.
         satellite = (
             ("payouts", lambda: client.payouts(docket=docket or None) or {}),
             ("listings/guide", lambda: client.listings_guide() or {}),
@@ -8661,26 +8930,13 @@ def build_listings_snapshot(
         )
         with ThreadPoolExecutor(max_workers=5) as pool:
             futs = [pool.submit(_fetch, label, fn) for label, fn in satellite]
-            if ids:
-                detail_futs = {
-                    pool.submit(client.listing, i, retry=False): i for i in ids
-                }
-                for fut in as_completed(detail_futs):
-                    i = detail_futs[fut]
-                    try:
-                        payload = fut.result() or {}
-                        if isinstance(payload, dict):
-                            details.append(payload)
-                    except ApiError as e:
-                        errors.append("listings/{}: {}".format(i, e))
             for fut in futs:
                 fut.result()
-        details.sort(key=lambda d: int(_coerce_listing_id(d) or 0))
         return {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "mode": "listings",
             "listings": listings,
-            "listing_details": details,
+            "listing_details": [],
             "payouts": extras.get("payouts")
             if isinstance(extras.get("payouts"), dict)
             else {},
@@ -8917,12 +9173,18 @@ def _listings_for_handle(
             return {"funded": [], "submitted": [], "source": "/api/listings"}
     if not isinstance(snap, dict):
         return {"funded": [], "submitted": [], "source": "/api/listings"}
+    register = snap.get("listings") if isinstance(snap.get("listings"), dict) else {}
+    for row in list(register.get("listings") or []):
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("funder") or "") == handle:
+            funded.append(_listing_summary(row))
+    scanned = False
     for detail in snap.get("listing_details") or []:
         if not isinstance(detail, dict):
             continue
+        scanned = True
         lid = _coerce_listing_id(detail)
-        if str(detail.get("funder") or "") == handle:
-            funded.append(_listing_summary(detail))
         for sub in list(detail.get("submissions") or []):
             if not isinstance(sub, dict):
                 continue
@@ -8944,6 +9206,7 @@ def _listings_for_handle(
     return {
         "funded": funded,
         "submitted": submitted,
+        "submissions_scanned": scanned,
         "source": "/api/listings",
     }
 
@@ -10899,9 +11162,22 @@ def make_handler(
                 try:
                     tag = (qs.get("tag") or [None])[0]
                     exclude = (qs.get("exclude") or [None])[0]
-                    snap = build_front_snapshot(client, tag=tag, exclude=exclude)
-                    raw = json.dumps(snap, ensure_ascii=False).encode("utf-8")
-                    self._send(200, raw, "application/json; charset=utf-8")
+                    gzip_ok = "gzip" in (
+                        (self.headers.get("Accept-Encoding") or "").lower()
+                    )
+                    raw, encoding = front_snapshot_response(
+                        client,
+                        tag=tag,
+                        exclude=exclude,
+                        gzip_ok=gzip_ok,
+                    )
+                    extra = {"Content-Encoding": encoding} if encoding else None
+                    self._send(
+                        200,
+                        raw,
+                        "application/json; charset=utf-8",
+                        extra_headers=extra,
+                    )
                 except Exception as e:  # pragma: no cover
                     raw = json.dumps({"error": str(e)}).encode("utf-8")
                     self._send(500, raw, "application/json; charset=utf-8")
