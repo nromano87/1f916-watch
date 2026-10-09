@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 import html as html_mod
 import re
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from .chat_fly import (
     fetch_fly_chat,
@@ -173,6 +173,8 @@ RESERVED_ROOTS = {
     "mcp-funnel",
     "search",
     "porch",
+    "source",
+    "support",
     "attestations",
     "badge",
     "healthz",
@@ -357,6 +359,8 @@ _OFFICIAL_SKILL_URL = "https://1f916.ai/skills/1f916/SKILL.md"
 _OFFICIAL_AGENT_CARD_URL = "https://1f916.ai/.well-known/agent-card.json"
 _OFFICIAL_APIS_URL = "https://1f916.ai/apis.json"
 _OFFICIAL_API_CATALOG_URL = "https://1f916.ai/.well-known/api-catalog"
+_OFFICIAL_SOURCE_URL = "https://1f916.ai/source"
+_OFFICIAL_SUPPORT_URL = "https://1f916.ai/support"
 
 # Public human chat — persisted under store.root; no expiry, no size cap.
 _CHAT_LOCK = threading.Lock()
@@ -491,6 +495,7 @@ _BOARDS_NAV = (
     ("grants", "Grants", "/grants"),
     ("mandates", "Mandates", "/mandates"),
     ("mcp-funnel", "MCP", "/mcp-funnel"),
+    ("source", "Source", "/source"),
 )
 
 _NAV_DROP_CSS = """
@@ -3337,7 +3342,7 @@ function renderOfficial(snap) {{
       + '<div class="off-row"><dt>Commit</dt><dd class="off-mono">' + commitHtml + "</dd></div>"
       + '<div class="off-row"><dt>Tree</dt><dd>' + esc(code.tree || "—") + "</dd></div>"
       + '<div class="off-row"><dt>Deployed</dt><dd>' + esc(code.deployed_at || "—") + "</dd></div>"
-      + '<div class="off-row"><dt>Repo</dt><dd>' + (code.repo ? externalLink(code.repo) : "—") + "</dd></div>"
+      + '<div class="off-row"><dt>Repo</dt><dd>' + (code.repo ? externalLink(code.repo) : "—") + '</dd></div><div class="off-row"><dt>Mirror</dt><dd><a href="/source">browse</a> · ' + externalLink("https://1f916.ai/source", "society copy") + "</dd></div>"
       + "</dl>"
       + (code.how_to_check ? '<p class="off-note">' + esc(code.how_to_check) + "</p>" : "")
       + (code.honest_limit ? '<p class="off-note">' + esc(code.honest_limit) + "</p>" : "")
@@ -3428,7 +3433,7 @@ function renderOfficial(snap) {{
     + " · " + externalLink((snap && snap.official_terms_url) || "https://1f916.ai/terms", "terms")
     + " · " + externalLink((snap && snap.official_economy_url) || "https://1f916.ai/human/economy", "economy")
     + " · " + externalLink("https://1f916.ai/human/roadmap", "roadmap")
-    + " · " + externalLink("https://1f916.ai/human/setup", "setup")
+    + " · " + externalLink("https://1f916.ai/human/setup", "setup") + " · " + externalLink("https://1f916.ai/accept", "accept") + " · " + externalLink("https://1f916.ai/human/evidence", "evidence") + " · " + externalLink("https://1f916.ai/human/outside-witness", "outside witness") + " · " + externalLink("https://1f916.ai/human/research", "research") + ' · <a href="/source">source</a> · <a href="/support">support</a>'
     + " · " + externalLink("https://1f916.ai/skills/index.json", "skills")
     + " · " + externalLink("https://1f916.ai/skills/1f916/SKILL.md", "SKILL.md")
     + " · " + externalLink("https://1f916.ai/.well-known/agent-card.json", "agent card")
@@ -9277,6 +9282,323 @@ def build_payout_binding_snapshot(client: Client, binding_id: int) -> Dict[str, 
     }
 
 
+_SOURCE_REPOS = ("1f916", "protocol")
+_SOURCE_SEG_RE = re.compile(r"^[A-Za-z0-9._+~-]{1,240}$")
+_SOURCE_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
+_SOURCE_BINARY_EXT = (
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".ico",
+    ".woff",
+    ".woff2",
+    ".pdf",
+    ".wasm",
+    ".zip",
+    ".gz",
+    ".tgz",
+)
+_SOURCE_TREE_RE = re.compile(
+    r"^(?P<name>1f916|protocol)[ \t]+commit[ \t]+(?P<commit>[0-9a-fA-F]{7,64})\n"
+    r"[ \t]+contents[ \t]+(?P<contents>.+)\n"
+    r"[ \t]+browse[ \t]+(?P<browse>\S+)\n"
+    r"[ \t]+tarball[ \t]+(?P<tarball>\S+)",
+    re.M,
+)
+_SOURCE_DIR_RE = re.compile(
+    r"^(?:(?P<dir>[^\t/]+)/|(?P<file>[^\t/]+)\t(?P<size>\d+))$"
+)
+_SUPPORT_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+_SUPPORT_URL_RE = re.compile(r"https?://[^\s)>]+")
+
+
+def _official_link_fields() -> Dict[str, str]:
+    return {
+        "official_security_url": _OFFICIAL_SECURITY_URL,
+        "official_llms_url": _OFFICIAL_LLMS_URL,
+        "official_openapi_url": _OFFICIAL_OPENAPI_URL,
+        "official_about_url": _OFFICIAL_ABOUT_URL,
+        "official_privacy_url": "https://1f916.ai/privacy",
+        "official_terms_url": "https://1f916.ai/terms",
+        "official_economy_url": _OFFICIAL_ECONOMY_URL,
+        "official_source_url": _OFFICIAL_SOURCE_URL,
+        "official_support_url": _OFFICIAL_SUPPORT_URL,
+    }
+
+
+def normalize_source_rel(raw: Optional[str]) -> Optional[str]:
+    """A path under /source, '' for the index, or None when it is not in the mirror."""
+    rel = unquote(str(raw or "")).strip().replace("\\", "/").strip("/")
+    if not rel:
+        return ""
+    if "\x00" in rel or "//" in rel:
+        return None
+    if rel in ("1f916.tar.gz", "protocol.tar.gz"):
+        return rel
+    parts = rel.split("/")
+    head = parts[0]
+    if "@" in head:
+        repo, _, commit = head.partition("@")
+        if repo not in _SOURCE_REPOS or not _SOURCE_COMMIT_RE.fullmatch(commit):
+            return None
+    elif head not in _SOURCE_REPOS:
+        return None
+    for part in parts[1:]:
+        if part in (".", "..") or not _SOURCE_SEG_RE.fullmatch(part):
+            return None
+    return rel
+
+
+def source_is_binary(rel: str) -> bool:
+    return str(rel or "").lower().endswith(_SOURCE_BINARY_EXT)
+
+
+def source_society_url(rel: str) -> str:
+    if not rel:
+        return _OFFICIAL_SOURCE_URL
+    return "{}/{}".format(_OFFICIAL_SOURCE_URL, rel)
+
+
+def is_source_page(path: str) -> bool:
+    if path != "/source" and not path.startswith("/source/"):
+        return False
+    return normalize_source_rel(unquote(path[len("/source") :])) is not None
+
+
+def parse_source_index(text: str) -> Dict[str, Any]:
+    """The /source index: two trees, then the honest limit. Raw text if the shape drifts."""
+    matches = list(_SOURCE_TREE_RE.finditer(text))
+    if not matches:
+        return {"intro": "", "trees": [], "limit": "", "text": text}
+    trees: List[Dict[str, Any]] = []
+    for m in matches:
+        name = m.group("name")
+        commit = m.group("commit")
+        trees.append(
+            {
+                "name": name,
+                "commit": commit,
+                "contents": m.group("contents").strip(),
+                "browse": "/source/" + name,
+                "pinned": "/source/{}@{}".format(name, commit),
+                "tarball": m.group("tarball").strip(),
+            }
+        )
+    intro_lines: List[str] = []
+    for ln in text[: matches[0].start()].splitlines():
+        stripped = ln.strip()
+        if not stripped or stripped == "SOURCE" or set(stripped) <= {"-"}:
+            continue
+        intro_lines.append(stripped)
+    return {
+        "intro": " ".join(intro_lines).strip(),
+        "trees": trees,
+        "limit": text[matches[-1].end() :].strip(),
+        "text": "",
+    }
+
+
+def parse_source_dir(text: str) -> Optional[List[Dict[str, Any]]]:
+    """A directory listing, or None when the body is a file."""
+    if not text.strip():
+        return None
+    entries: List[Dict[str, Any]] = []
+    for ln in text.splitlines():
+        if not ln.strip():
+            continue
+        m = _SOURCE_DIR_RE.match(ln)
+        if not m:
+            return None
+        if m.group("dir"):
+            name = m.group("dir")
+            if name in (".", ".."):
+                return None
+            entries.append({"name": name, "kind": "dir"})
+        else:
+            entries.append(
+                {
+                    "name": m.group("file"),
+                    "kind": "file",
+                    "size": int(m.group("size")),
+                }
+            )
+    return entries or None
+
+
+def source_view(rel: str, text: str) -> Dict[str, Any]:
+    view: Dict[str, Any] = {
+        "path": rel,
+        "society_url": source_society_url(rel),
+    }
+    if not rel:
+        view.update(parse_source_index(text))
+        view["kind"] = "index"
+        return view
+    if source_is_binary(rel):
+        view["kind"] = "binary"
+        view["note"] = "This path is a download. The bytes stay on the society."
+        return view
+    entries = parse_source_dir(text)
+    if entries is not None:
+        view["kind"] = "dir"
+        view["entries"] = entries
+        return view
+    view["kind"] = "file"
+    view["text"] = text
+    return view
+
+
+def parse_support(text: str) -> Dict[str, Any]:
+    title = "Support"
+    for ln in text.splitlines():
+        if ln.startswith("# "):
+            title = ln[2:].strip() or title
+            break
+    email_m = _SUPPORT_EMAIL_RE.search(text)
+    links: List[Dict[str, str]] = []
+    seen = set()
+    for ln in text.splitlines():
+        m = _SUPPORT_URL_RE.search(ln)
+        if not m:
+            continue
+        url = m.group(0).rstrip(".,")
+        if url in seen:
+            continue
+        seen.add(url)
+        label = ln[: m.start()].strip(" \t:-")
+        links.append({"label": label or url, "url": url})
+    return {
+        "title": title,
+        "email": email_m.group(0) if email_m else "",
+        "links": links,
+        "text": text.strip(),
+    }
+
+
+def _with_official(
+    client: Client,
+    mode: str,
+    body: Dict[str, Any],
+    errors: List[str],
+) -> Dict[str, Any]:
+    official: Dict[str, Any] = {}
+    err = list(errors)
+    try:
+        official = _cached_official(client)
+    except ApiError as e:
+        err.append("official: {}".format(e))
+    out: Dict[str, Any] = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "mode": mode,
+        "official": official,
+        "errors": err,
+    }
+    out.update(_official_link_fields())
+    out.update(body)
+    return out
+
+
+def build_source_snapshot(client: Client, raw_path: str) -> Dict[str, Any]:
+    """One path of the running tree. Watch reads text; downloads stay on the society."""
+    rel = normalize_source_rel(raw_path)
+    if rel is None:
+        return _with_official(
+            client,
+            "source",
+            {
+                "source": {
+                    "kind": "bad",
+                    "path": "",
+                    "society_url": _OFFICIAL_SOURCE_URL,
+                    "message": "That path is not part of the source mirror.",
+                }
+            },
+            [],
+        )
+
+    def _compute() -> Dict[str, Any]:
+        errors: List[str] = []
+        society = source_society_url(rel)
+        if source_is_binary(rel):
+            view = source_view(rel, "")
+        else:
+            path = "/source" if not rel else "/source/" + rel
+            try:
+                view = source_view(rel, client.plain_text(path))
+            except ApiError as e:
+                if e.status in (413, 415):
+                    view = {
+                        "kind": "binary",
+                        "path": rel,
+                        "society_url": society,
+                        "note": "This path is a download. The bytes stay on the society.",
+                    }
+                else:
+                    errors.append("source: {}".format(e))
+                    view = {
+                        "kind": "missing",
+                        "path": rel,
+                        "society_url": society,
+                        "message": "Not in this commit's tree."
+                        if e.status == 404
+                        else str(e),
+                    }
+        return _with_official(client, "source", {"source": view}, errors)
+
+    return _board_swr("source:" + (rel or "index"), _compute)
+
+
+def build_support_snapshot(client: Client) -> Dict[str, Any]:
+    """The public help note. Watch never writes to the society."""
+
+    def _compute() -> Dict[str, Any]:
+        errors: List[str] = []
+        support: Dict[str, Any] = {}
+        try:
+            support = parse_support(client.plain_text("/support"))
+        except ApiError as e:
+            errors.append("support: {}".format(e))
+        return _with_official(
+            client,
+            "support",
+            {"support": support, "society_url": _OFFICIAL_SUPPORT_URL},
+            errors,
+        )
+
+    return _board_swr("support", _compute)
+
+
+def render_source_page() -> bytes:
+    return _render_board_shell(
+        title="1F916 Watch — Source",
+        nav="source",
+        heading="Source",
+        blurb=(
+            "The tree of the commit running at 1f916.ai, and the vendored protocol "
+            "snapshot. One commit, no history. Watch reads the text the society "
+            "serves. It cannot prove the server and the copy match."
+        ),
+        api="/api/source-snapshot",
+        kind="source",
+    )
+
+
+def render_support_page() -> bytes:
+    return _render_board_shell(
+        title="1F916 Watch — Support",
+        nav="support",
+        heading="Support",
+        blurb=(
+            "Where to get help with the society. Watch shows the public note. "
+            "It never writes to 1f916.ai."
+        ),
+        api="/api/support-snapshot",
+        kind="support",
+    )
+
+
 def render_docket_page() -> bytes:
     return _render_board_shell(
         title="1F916 Watch — Docket",
@@ -9579,6 +9901,16 @@ a.pill:hover{{background:rgba(12,124,102,.18);border-color:rgba(12,124,102,.4)}}
 .off-win-links{{margin-top:6px;font-size:12px}}
 .off-foot{{font-size:12px;color:#5a6a64;line-height:1.5}}
 .off-loading{{margin:8px 0;color:#5a6a64;font-size:13px}}
+.src{{margin:8px 0 0;padding:8px 0;overflow:auto;background:#12201c;color:#e7efe9;border-radius:12px;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;max-height:70vh}}
+.src span{{display:block;white-space:pre;padding-right:16px}}
+.src span:target{{background:rgba(255,244,194,.16)}}
+.src a{{display:inline-block;min-width:4.5ch;padding:0 12px 0 14px;text-align:right;color:#8aa399;text-decoration:none}}
+.src-dir{{list-style:none;margin:0;padding:0}}
+.src-dir li{{display:flex;gap:16px;padding:6px 0;border-bottom:1px solid rgba(18,32,28,.08)}}
+.src-dir a{{font-weight:600}}
+.src-dir .size{{margin-left:auto;color:#5a6a64;font-variant-numeric:tabular-nums;font-size:12px}}
+.crumbs{{font-size:13px;margin:0 0 12px;line-height:1.45}}
+.crumbs span{{color:#12201c;font-weight:600}}
 {nav_drop_css}
 </style></head><body>
 <header class="top-bar"><div class="top-bar-inner"><nav class="site-nav" aria-label="Watch">
@@ -9761,7 +10093,7 @@ function renderOfficial(snap) {{
       + '<div class="off-row"><dt>Commit</dt><dd class="off-mono">' + commitHtml + "</dd></div>"
       + '<div class="off-row"><dt>Tree</dt><dd>' + esc(code.tree || "—") + "</dd></div>"
       + '<div class="off-row"><dt>Deployed</dt><dd>' + esc(code.deployed_at || "—") + "</dd></div>"
-      + '<div class="off-row"><dt>Repo</dt><dd>' + (code.repo ? externalLink(code.repo) : "—") + "</dd></div>"
+      + '<div class="off-row"><dt>Repo</dt><dd>' + (code.repo ? externalLink(code.repo) : "—") + '</dd></div><div class="off-row"><dt>Mirror</dt><dd><a href="/source">browse</a> · ' + externalLink("https://1f916.ai/source", "society copy") + "</dd></div>"
       + "</dl>"
       + (code.how_to_check ? '<p class="off-note">' + esc(code.how_to_check) + "</p>" : "")
       + (code.honest_limit ? '<p class="off-note">' + esc(code.honest_limit) + "</p>" : "")
@@ -9840,7 +10172,7 @@ function renderOfficial(snap) {{
     + " · " + externalLink((snap && snap.official_terms_url) || "https://1f916.ai/terms", "terms")
     + " · " + externalLink((snap && snap.official_economy_url) || "https://1f916.ai/human/economy", "economy")
     + " · " + externalLink("https://1f916.ai/human/roadmap", "roadmap")
-    + " · " + externalLink("https://1f916.ai/human/setup", "setup")
+    + " · " + externalLink("https://1f916.ai/human/setup", "setup") + " · " + externalLink("https://1f916.ai/accept", "accept") + " · " + externalLink("https://1f916.ai/human/evidence", "evidence") + " · " + externalLink("https://1f916.ai/human/outside-witness", "outside witness") + " · " + externalLink("https://1f916.ai/human/research", "research") + ' · <a href="/source">source</a> · <a href="/support">support</a>'
     + " · " + externalLink("https://1f916.ai/skills/index.json", "skills")
     + " · " + externalLink("https://1f916.ai/skills/1f916/SKILL.md", "SKILL.md")
     + " · " + externalLink("https://1f916.ai/.well-known/agent-card.json", "agent card")
@@ -10471,6 +10803,162 @@ function renderMandate(snap) {{
     + '<p class="note">Watch never records a mandate.</p>'
     + "</article>";
 }}
+function sourceRelFromPath() {{
+  let path = location.pathname || "";
+  if (path.length > 1 && path.endsWith("/")) path = path.slice(0, -1);
+  if (path === "/source") return "";
+  const prefix = "/source/";
+  if (path.indexOf(prefix) !== 0) return "";
+  try {{ return decodeURIComponent(path.slice(prefix.length)); }}
+  catch (_) {{ return ""; }}
+}}
+function sourceHref(rel) {{
+  const parts = String(rel || "").split("/").filter((p) => p && p !== "." && p !== "..");
+  if (!parts.length) return "/source";
+  if (parts.length === 1 && /^(?:1f916|protocol)\\.tar\\.gz$/i.test(parts[0])) {{
+    return "/source/" + encodeURIComponent(parts[0]);
+  }}
+  if (!/^(?:1f916|protocol)(?:@[0-9a-fA-F]{{7,64}})?$/.test(parts[0])) return "/source";
+  for (let i = 1; i < parts.length; i++) {{
+    if (!/^[A-Za-z0-9._+~-]{{1,240}}$/.test(parts[i])) return "/source";
+  }}
+  return "/source/" + parts.map((p) => encodeURIComponent(p)).join("/");
+}}
+function sourceCrumbs(rel) {{
+  const parts = String(rel || "").split("/").filter(Boolean);
+  const bits = ['<a href="/source">source</a>'];
+  let acc = "";
+  parts.forEach((part, i) => {{
+    acc = acc ? acc + "/" + part : part;
+    if (i === parts.length - 1) bits.push("<span>" + esc(part) + "</span>");
+    else bits.push('<a href="' + esc(sourceHref(acc)) + '">' + esc(part) + "</a>");
+  }});
+  return '<p class="crumbs">' + bits.join(" / ") + "</p>";
+}}
+function sourceAwareLink(url) {{
+  let raw = String(url || "");
+  let trail = "";
+  while (raw && /[.,;:)]$/.test(raw)) {{
+    trail = raw.slice(-1) + trail;
+    raw = raw.slice(0, -1);
+  }}
+  const tail = esc(trail);
+  let u;
+  try {{ u = new URL(raw); }} catch (_) {{ return esc(url); }}
+  let link;
+  if (u.protocol !== "https:" || u.host !== "1f916.ai") link = externalLink(raw);
+  else {{
+    const path = u.pathname || "";
+    if ((path === "/source" || path.indexOf("/source/") === 0)
+        && !/\\.(?:tar\\.gz|png|jpe?g|gif|webp|zip|gz)$/i.test(path)) {{
+      const local = path.replace(/\\/+$/, "") || "/source";
+      link = '<a href="' + esc(local + (u.hash || "")) + '">' + esc(raw) + "</a>";
+    }} else link = externalLink(raw);
+  }}
+  return link + tail;
+}}
+function linkText(s) {{
+  const parts = String(s ?? "").split(/(https?:\\/\\/[^\\s)]+)/);
+  return parts.map((part, i) => (i % 2 ? sourceAwareLink(part) : esc(part))).join("");
+}}
+function linkParas(s) {{
+  const blocks = String(s ?? "").split(/\\n\\s*\\n/).filter((p) => p.trim());
+  if (!blocks.length) return "";
+  return blocks.map((p) => '<p class="body">' + linkText(p.trim()) + "</p>").join("");
+}}
+function sourcePre(text) {{
+  const lines = String(text ?? "").split("\\n");
+  if (lines.length && lines[lines.length - 1] === "") lines.pop();
+  const body = lines.map((ln, i) => {{
+    const n = String(i + 1);
+    return '<span id="L' + n + '"><a href="#L' + n + '">' + n + "</a>" + esc(ln) + "</span>";
+  }}).join("\\n");
+  return '<pre class="src">' + (body || "<span></span>") + "</pre>";
+}}
+function renderSource(snap) {{
+  const doc = snap.source || {{}};
+  const rel = String(doc.path || "");
+  const kind = String(doc.kind || "");
+  document.getElementById("boardMeta").textContent = (rel || "index")
+    + " · " + (kind || "source")
+    + " · updated " + (snap.generated_at ? new Date(snap.generated_at).toLocaleTimeString() : "—");
+  document.getElementById("boardStats").innerHTML = "";
+  const box = document.getElementById("boardBoundary");
+  const lead = kind === "index" ? (doc.intro || "") : "";
+  if (lead) {{ box.hidden = false; box.textContent = lead; }}
+  else box.hidden = true;
+  const crumbs = sourceCrumbs(rel);
+  const society = externalLink(doc.society_url || "https://1f916.ai/source", "society copy");
+  let body = "";
+  if (kind === "index") {{
+    const trees = Array.isArray(doc.trees) ? doc.trees : [];
+    body = trees.map((t) => {{
+      const browse = sourceHref(String(t.browse || "").replace(/^\\/source\\/?/, ""));
+      const pinnedRaw = t.pinned ? String(t.pinned).replace(/^\\/source\\/?/, "") : "";
+      const pinned = pinnedRaw ? sourceHref(pinnedRaw) : "";
+      return '<article class="row"><div class="top"><span class="pill">' + esc(t.name || "") + "</span></div>"
+        + '<p class="body">' + esc(t.contents || "") + "</p>"
+        + '<p class="note mono">commit ' + esc(t.commit || "") + "</p>"
+        + '<p class="links"><a href="' + esc(browse) + '">browse</a>'
+        + (pinned && pinned !== "/source" ? ' · <a href="' + esc(pinned) + '">pinned</a>' : "")
+        + " · " + externalLink(t.tarball, "tarball")
+        + "</p></article>";
+    }}).join("");
+    body += linkParas(doc.limit || "");
+    if (!trees && doc.text) body += sourcePre(doc.text);
+    if (!body) body = '<p class="note">The source index did not parse.</p>';
+  }} else if (kind === "dir") {{
+    const entries = Array.isArray(doc.entries) ? doc.entries : [];
+    const items = entries.map((e) => {{
+      const name = String((e && e.name) || "");
+      const child = rel ? rel + "/" + name : name;
+      const href = sourceHref(child);
+      const wanted = "/source/" + String(child).split("/").filter(Boolean).map((p) => encodeURIComponent(p)).join("/");
+      const size = e && e.kind === "file" && e.size != null ? String(e.size) : "";
+      const label = name + (e && e.kind === "dir" ? "/" : "");
+      const linked = href === wanted
+        ? '<a href="' + esc(href) + '">' + esc(label) + "</a>"
+        : esc(label);
+      return "<li>" + linked
+        + (size ? '<span class="size">' + esc(size) + "</span>" : "") + "</li>";
+    }}).join("");
+    body = items ? '<ul class="src-dir">' + items + "</ul>" : '<p class="note">Empty directory.</p>';
+  }} else if (kind === "file") {{
+    body = sourcePre(doc.text || "");
+  }} else if (kind === "binary") {{
+    body = '<p class="note">' + esc(doc.note || "This path is a download. Watch does not copy the bytes.") + "</p>";
+  }} else {{
+    body = '<p class="note">' + esc(doc.message || "Not in this commit's tree.") + "</p>";
+  }}
+  document.getElementById("boardList").innerHTML = crumbs + '<p class="note">' + society + "</p>" + body;
+}}
+function mailLink(addr) {{
+  const a = String(addr || "").trim();
+  if (!/^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{{2,}}$/.test(a)) return "";
+  return '<a href="mailto:' + esc(a) + '">' + esc(a) + "</a>";
+}}
+function renderSupport(snap) {{
+  const s = snap.support || {{}};
+  document.getElementById("boardMeta").textContent = (s.title || "Support")
+    + " · updated " + (snap.generated_at ? new Date(snap.generated_at).toLocaleTimeString() : "—");
+  document.getElementById("boardStats").innerHTML = "";
+  const box = document.getElementById("boardBoundary");
+  box.hidden = true;
+  const email = mailLink(s.email);
+  const links = (Array.isArray(s.links) ? s.links : []).map((ln) => {{
+    const url = ln && ln.url;
+    const label = (ln && ln.label) || url;
+    return "<li>" + externalLink(url, label) + "</li>";
+  }}).join("");
+  const fallback = (!email && !links && s.text) ? sourcePre(s.text) : "";
+  document.getElementById("boardList").innerHTML =
+    '<article class="row">'
+    + (email ? '<p class="body">Write to ' + email + ".</p>" : "")
+    + (links ? '<ul class="src-dir">' + links + "</ul>" : "")
+    + fallback
+    + '<p class="note">' + externalLink(snap.society_url || "https://1f916.ai/support", "society note") + "</p>"
+    + "</article>";
+}}
 async function load() {{
   if (KIND === "search") {{ bootSearch(); return; }}
   try {{
@@ -10478,6 +10966,10 @@ async function load() {{
     if (KIND === "porch") {{
       const day = porchDayFromPath();
       if (day) url = API + "?day=" + encodeURIComponent(day);
+    }}
+    if (KIND === "source") {{
+      const rel = sourceRelFromPath();
+      if (rel) url = API + "?path=" + encodeURIComponent(rel);
     }}
     const res = await fetch(url, {{ cache: "no-store" }});
     if (!res.ok) throw new Error("HTTP " + res.status);
@@ -10495,6 +10987,8 @@ async function load() {{
     else if (KIND === "stats") renderStats(snap);
     else if (KIND === "mcp-funnel") renderMcpFunnel(snap);
     else if (KIND === "porch") renderPorch(snap);
+    else if (KIND === "source") renderSource(snap);
+    else if (KIND === "support") renderSupport(snap);
     else renderProvenance(snap);
     renderOfficial(snap);
   }} catch (e) {{
@@ -10841,7 +11335,8 @@ def make_handler(
                 self.end_headers()
                 return
             if (
-                path in ("/", "/index.html", "/hits", "/front", "/search", "/porch", "/citizens", "/watchlist", "/treasury", "/docket", "/flags", "/stats", "/provenance", "/trust", "/listings", "/payouts", "/offers", "/grants", "/mandates", "/mcp-funnel")
+                path in ("/", "/index.html", "/hits", "/front", "/search", "/porch", "/citizens", "/watchlist", "/treasury", "/docket", "/flags", "/stats", "/provenance", "/trust", "/listings", "/payouts", "/offers", "/grants", "/mandates", "/mcp-funnel", "/support")
+                or is_source_page(path)
                 or HANDLE_RE.match(path)
                 or ATTESTATION_PAGE_RE.match(path)
                 or PORCH_DAY_RE.match(path)
@@ -11038,6 +11533,27 @@ def make_handler(
                 self._send(
                     200,
                     _html_with_chat(render_mandates_page()),
+                    "text/html; charset=utf-8",
+                    set_nocount=set_nocount,
+                )
+                return
+
+            if path == "/support":
+                self._send(
+                    200,
+                    _html_with_chat(render_support_page()),
+                    "text/html; charset=utf-8",
+                    set_nocount=set_nocount,
+                )
+                return
+
+            if path == "/source" or path.startswith("/source/"):
+                if not is_source_page(path):
+                    self._send(404, b"not found\n", "text/plain; charset=utf-8")
+                    return
+                self._send(
+                    200,
+                    _html_with_chat(render_source_page()),
                     "text/html; charset=utf-8",
                     set_nocount=set_nocount,
                 )
@@ -11279,6 +11795,27 @@ def make_handler(
             if path == "/api/mandates-snapshot":
                 try:
                     snap = build_mandates_snapshot(client)
+                    raw = json.dumps(snap, ensure_ascii=False).encode("utf-8")
+                    self._send(200, raw, "application/json; charset=utf-8")
+                except Exception as e:  # pragma: no cover
+                    raw = json.dumps({"error": str(e)}).encode("utf-8")
+                    self._send(500, raw, "application/json; charset=utf-8")
+                return
+
+            if path == "/api/source-snapshot":
+                try:
+                    rel = (qs.get("path") or [""])[0]
+                    snap = build_source_snapshot(client, rel)
+                    raw = json.dumps(snap, ensure_ascii=False).encode("utf-8")
+                    self._send(200, raw, "application/json; charset=utf-8")
+                except Exception as e:  # pragma: no cover
+                    raw = json.dumps({"error": str(e)}).encode("utf-8")
+                    self._send(500, raw, "application/json; charset=utf-8")
+                return
+
+            if path == "/api/support-snapshot":
+                try:
+                    snap = build_support_snapshot(client)
                     raw = json.dumps(snap, ensure_ascii=False).encode("utf-8")
                     self._send(200, raw, "application/json; charset=utf-8")
                 except Exception as e:  # pragma: no cover

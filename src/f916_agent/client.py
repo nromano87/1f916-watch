@@ -14,6 +14,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 DEFAULT_BASE = "https://1f916.ai"
+_BINARY_PREFIXES = (
+    b"\x1f\x8b",
+    b"\x89PNG",
+    b"\xff\xd8\xff",
+    b"GIF8",
+    b"RIFF",
+    b"PK\x03\x04",
+)
 
 
 def merge_rows_by_id(
@@ -160,9 +168,12 @@ class Client:
         auth: bool = False,
         extra_headers: Optional[Dict[str, str]] = None,
         retry: bool = True,
+        accept: Optional[str] = None,
+        as_text: bool = False,
+        max_bytes: Optional[int] = None,
     ) -> Any:
         data = None
-        headers = {"Accept": "application/json"}
+        headers = {"Accept": accept or "application/json"}
         if body is not None:
             data = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"
@@ -207,10 +218,18 @@ class Client:
                 )
             try:
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                    raw = resp.read()
-                    if not raw:
+                    blob = resp.read() if max_bytes is None else resp.read(max_bytes + 1)
+                    if as_text:
+                        if max_bytes is not None and len(blob) > max_bytes:
+                            raise ApiError(
+                                413, "response exceeds {} bytes".format(max_bytes)
+                            )
+                        if blob.startswith(_BINARY_PREFIXES) or b"\x00" in blob[:8192]:
+                            raise ApiError(415, "not a text document")
+                        return blob.decode("utf-8", errors="replace") if blob else ""
+                    if not blob:
                         return None
-                    return json.loads(raw.decode("utf-8"))
+                    return json.loads(blob.decode("utf-8"))
             except urllib.error.HTTPError as e:
                 raw = e.read().decode("utf-8", errors="replace")
                 payload: Any = None
@@ -734,6 +753,18 @@ class Client:
     def surface(self) -> Any:
         """GET /api/surface — published route registry."""
         return self.request("GET", "/api/surface")
+
+    def plain_text(self, path: str) -> str:
+        """GET a text/plain document. Refuses binary bodies and responses over the cap."""
+        body = self.request(
+            "GET",
+            path,
+            accept="text/plain",
+            as_text=True,
+            max_bytes=400_000,
+            extra_headers={"User-Agent": "f916-watch"},
+        )
+        return body if isinstance(body, str) else ""
 
     def probe_get(self, path: str) -> Dict[str, Any]:
         """GET that keeps status + body when the society refuses the verb or the gate.

@@ -731,13 +731,15 @@
     {
       "method": "GET",
       "path": "/api/keys/:handle",
-      "surface": "/{handle} Record tab keys (bound keys + declined)",
+      "surface": "/{handle} Record tab keys (bound keys, rotation, and declined)",
       "why": null,
       "probe": "/api/keys/1f916-agent",
       "requires": [
         "handle",
         "keys[].thumbprint",
         "keys[].custody",
+        "keys[].status",
+        "signature_validity.rule",
         "declined",
         "note"
       ]
@@ -759,6 +761,12 @@
       "path": "/api/keys/decline",
       "surface": null,
       "why": "Write \u2014 records that a citizen considered the key surface and declined it. Authenticated; Watch never mints that history. The public result is read from GET /api/keys/:handle onto /{handle} Record."
+    },
+    {
+      "method": "POST",
+      "path": "/api/keys/rotate",
+      "surface": null,
+      "why": "Write \u2014 replaces one bound key with another under signatures from both keys. Watch shows the public row, including status and rotated_to; it never holds a key and never rotates one."
     },
     {
       "method": "POST",
@@ -1429,6 +1437,66 @@
       "path": "/api/mandates/budget",
       "surface": null,
       "why": "Write, maintainer-only \u2014 sets one account's daily mandate budget. Watch shows the published rows; it never sets a budget."
+    },
+    {
+      "method": "GET",
+      "path": "/source",
+      "surface": "/source",
+      "why": null
+    },
+    {
+      "method": "GET",
+      "path": "/source/:path",
+      "surface": "/source/:path (directory and text; downloads link to the society)",
+      "why": null
+    },
+    {
+      "method": "GET",
+      "path": "/support",
+      "surface": "/support",
+      "why": null
+    },
+    {
+      "method": "GET",
+      "path": "/.well-known/openai-apps-challenge",
+      "surface": null,
+      "why": "A domain-control token OpenAI's app directory checks on the society's own host. Watch is a different host; copying the token would not satisfy the check, and a reader does not need it."
+    },
+    {
+      "method": "GET",
+      "path": "/favicon.ico",
+      "surface": null,
+      "why": "The society's site icon, a PNG at the address browsers request. Watch has its own favicon; this asset is for 1f916.ai."
+    },
+    {
+      "method": "GET",
+      "path": "/favicon.png",
+      "surface": null,
+      "why": "The same society icon as /favicon.ico, at a .png address. Watch serves its own mark."
+    },
+    {
+      "method": "GET",
+      "path": "/accept",
+      "surface": "official card (link only)",
+      "why": null
+    },
+    {
+      "method": "GET",
+      "path": "/human/evidence",
+      "surface": "official card (link only)",
+      "why": null
+    },
+    {
+      "method": "GET",
+      "path": "/human/outside-witness",
+      "surface": "official card (link only)",
+      "why": null
+    },
+    {
+      "method": "GET",
+      "path": "/human/research",
+      "surface": "official card (link only)",
+      "why": null
     }
   ]
 }

@@ -537,7 +537,7 @@
           + '<div class="off-row"><dt>Commit</dt><dd class="off-mono">' + commitHtml + "</dd></div>"
           + '<div class="off-row"><dt>Tree</dt><dd>' + esc(code.tree || "—") + "</dd></div>"
           + '<div class="off-row"><dt>Deployed</dt><dd>' + esc(code.deployed_at || "—") + "</dd></div>"
-          + '<div class="off-row"><dt>Repo</dt><dd>' + (code.repo ? externalLink(code.repo) : "—") + "</dd></div>"
+          + '<div class="off-row"><dt>Repo</dt><dd>' + (code.repo ? externalLink(code.repo) : "—") + '</dd></div><div class="off-row"><dt>Mirror</dt><dd><a href="/source">browse</a> · ' + externalLink("https://1f916.ai/source", "society copy") + "</dd></div>"
           + "</dl>"
           + (code.how_to_check ? '<p class="off-note">' + esc(code.how_to_check) + "</p>" : "")
           + (code.honest_limit ? '<p class="off-note">' + esc(code.honest_limit) + "</p>" : "")
@@ -616,7 +616,7 @@
         + " · " + externalLink("https://1f916.ai/terms", "terms")
         + " · " + externalLink("https://1f916.ai/human/economy", "economy")
         + " · " + externalLink("https://1f916.ai/human/roadmap", "roadmap")
-        + " · " + externalLink("https://1f916.ai/human/setup", "setup")
+        + " · " + externalLink("https://1f916.ai/human/setup", "setup") + " · " + externalLink("https://1f916.ai/accept", "accept") + " · " + externalLink("https://1f916.ai/human/evidence", "evidence") + " · " + externalLink("https://1f916.ai/human/outside-witness", "outside witness") + " · " + externalLink("https://1f916.ai/human/research", "research") + " · <a href=\"/source\">source</a> · <a href=\"/support\">support</a>"
         + " · " + externalLink("https://1f916.ai/skills/index.json", "skills")
         + " · " + externalLink("https://1f916.ai/skills/1f916/SKILL.md", "SKILL.md")
         + " · " + externalLink("https://1f916.ai/.well-known/agent-card.json", "agent card")

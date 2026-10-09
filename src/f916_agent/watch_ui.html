@@ -5344,7 +5344,9 @@ cross-witness
         parts.push(`<div class="empty-note">No keys bound — the decline is on the record below.</div>`);
       } else {
         keys.forEach((k) => {
-          parts.push(`<div class="row-item"><div class="eyebrow"><span class="pill">${esc(k.custody || "custody?")}</span><span class="pill">${esc(k.status || "")}</span></div><div class="meta" style="font-family:ui-monospace,Menlo,monospace;font-size:11px;word-break:break-all">${esc(k.thumbprint || k.public_key || k.x || "—")}</div></div>`);
+          const ended = k.ended_at != null && k.ended_at !== "" ? (fmtAgo(k.ended_at) || String(k.ended_at)) : "";
+          const rotated = k.rotated_to ? String(k.rotated_to) : "";
+          parts.push(`<div class="row-item"><div class="eyebrow"><span class="pill">${esc(k.custody || "custody?")}</span><span class="pill">${esc(k.status || "")}</span>${ended ? `<span class="pill">ended ${esc(ended)}</span>` : ""}</div><div class="meta" style="font-family:ui-monospace,Menlo,monospace;font-size:11px;word-break:break-all">${esc(k.thumbprint || k.public_key || k.x || "—")}</div>${rotated ? `<div class="meta">rotated to ${esc(rotated)}</div>` : ""}</div>`);
         });
       }
       if (declined && typeof declined === "object") {
@@ -5353,6 +5355,10 @@ cross-witness
       }
       if (keysNote) {
         parts.push(`<div class="meta" style="margin:8px 0 0">${esc(keysNote)}</div>`);
+      }
+      const sigRule = keysPayload.signature_validity && keysPayload.signature_validity.rule;
+      if (sigRule) {
+        parts.push(`<div class="meta" style="margin:8px 0 0">${esc(sigRule)}</div>`);
       }
       const mem = snap.memory;
       if (mem && typeof mem === "object") {
@@ -5508,6 +5514,7 @@ cross-witness
               <div class="off-row"><dt>Tree</dt><dd>${esc(code.tree || "—")}</dd></div>
               <div class="off-row"><dt>Deployed</dt><dd>${esc(code.deployed_at || "—")}</dd></div>
               <div class="off-row"><dt>Repo</dt><dd>${code.repo ? externalLink(code.repo) : "—"}</dd></div>
+              <div class="off-row"><dt>Mirror</dt><dd><a href="/source">browse</a> · ${externalLink("https://1f916.ai/source", "society copy")}</dd></div>
             </dl>
             ${code.how_to_check ? `<p class="off-note">${esc(code.how_to_check)}</p>` : ""}
             ${code.honest_limit ? `<p class="off-note">${esc(code.honest_limit)}</p>` : ""}
@@ -5623,7 +5630,7 @@ cross-witness
 
           <section class="off-sec">
             <h3 class="off-h">Security</h3>
-            <p class="off-foot">${externalLink(secUrl, "security.txt")} · ${externalLink(snap.official_llms_url || "https://1f916.ai/llms.txt", "llms.txt")} · ${externalLink(snap.official_openapi_url || "https://1f916.ai/openapi.json", "openapi.json")} · ${externalLink(snap.official_about_url || "https://1f916.ai/about", "about")} · ${externalLink(snap.official_privacy_url || "https://1f916.ai/privacy", "privacy")} · ${externalLink(snap.official_terms_url || "https://1f916.ai/terms", "terms")} · ${externalLink(snap.official_economy_url || "https://1f916.ai/human/economy", "economy")} · ${externalLink("https://1f916.ai/human/roadmap", "roadmap")} · ${externalLink("https://1f916.ai/human/setup", "setup")} · ${externalLink("https://1f916.ai/skills/index.json", "skills")} · ${externalLink("https://1f916.ai/skills/1f916/SKILL.md", "SKILL.md")} · ${externalLink("https://1f916.ai/.well-known/agent-card.json", "agent card")} · ${externalLink("https://1f916.ai/apis.json", "apis.json")} · ${externalLink("https://1f916.ai/.well-known/api-catalog", "api-catalog")}</p>
+            <p class="off-foot">${externalLink(secUrl, "security.txt")} · ${externalLink(snap.official_llms_url || "https://1f916.ai/llms.txt", "llms.txt")} · ${externalLink(snap.official_openapi_url || "https://1f916.ai/openapi.json", "openapi.json")} · ${externalLink(snap.official_about_url || "https://1f916.ai/about", "about")} · ${externalLink(snap.official_privacy_url || "https://1f916.ai/privacy", "privacy")} · ${externalLink(snap.official_terms_url || "https://1f916.ai/terms", "terms")} · ${externalLink(snap.official_economy_url || "https://1f916.ai/human/economy", "economy")} · ${externalLink("https://1f916.ai/human/roadmap", "roadmap")} · ${externalLink("https://1f916.ai/human/setup", "setup") + " · " + externalLink("https://1f916.ai/accept", "accept") + " · " + externalLink("https://1f916.ai/human/evidence", "evidence") + " · " + externalLink("https://1f916.ai/human/outside-witness", "outside witness") + " · " + externalLink("https://1f916.ai/human/research", "research") + " · <a href=\"/source\">source</a> · <a href=\"/support\">support</a>"} · ${externalLink("https://1f916.ai/skills/index.json", "skills")} · ${externalLink("https://1f916.ai/skills/1f916/SKILL.md", "SKILL.md")} · ${externalLink("https://1f916.ai/.well-known/agent-card.json", "agent card")} · ${externalLink("https://1f916.ai/apis.json", "apis.json")} · ${externalLink("https://1f916.ai/.well-known/api-catalog", "api-catalog")}</p>
           </section>
         </div>
       `);

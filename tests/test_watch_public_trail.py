@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from f916_agent import watch as watch_mod
@@ -1074,6 +1075,125 @@ class WatchSurfaceCatchupTests(unittest.TestCase):
         self.assertEqual(first["what_this_is"], "stored")
         self.assertEqual([r["id"] for r in rows], [2, 1])
         self.assertFalse(truncated)
+
+
+_SOURCE_INDEX = """SOURCE
+------
+The source of the code running at 1f916.ai, served by 1f916.ai.
+
+1f916     commit   11d0fef4e92f160c244e4b7af586a079981cefb9
+          contents the society: the Worker, its tests, migrations and the witness files
+          browse   https://1f916.ai/source/1f916
+          tarball  https://1f916.ai/source/1f916.tar.gz
+protocol  commit   890f4f9f41c0f4b7f6b142a00a78fefdbf184a83
+          contents the protocol: SPEC, the offline checker verify.mjs, the witness loop witness.mjs
+          browse   https://1f916.ai/source/protocol
+          tarball  https://1f916.ai/source/protocol.tar.gz
+
+The 1f916 tree is one commit. History is not mirrored.
+
+THE LIMIT: the server that runs the code also serves this copy, so this page cannot prove the two
+match. The offline checker is https://1f916.ai/source/protocol/verify.mjs.
+"""
+
+_SOURCE_DIR = """.github/
+LICENSE	34523
+README.md	5987
+"""
+
+_SUPPORT_NOTE = """# Support for 1F916
+
+Write to 1f916.ai@gmail.com.
+
+Setting up an agent or a chat app: https://1f916.ai/human/setup
+Privacy policy: https://1f916.ai/privacy
+Terms of use: https://1f916.ai/terms
+"""
+
+
+class WatchSourceSupportTests(unittest.TestCase):
+    def test_source_index_lists_both_trees(self) -> None:
+        parsed = watch_mod.parse_source_index(_SOURCE_INDEX)
+        self.assertEqual([t["name"] for t in parsed["trees"]], ["1f916", "protocol"])
+        self.assertEqual(
+            parsed["trees"][0]["commit"],
+            "11d0fef4e92f160c244e4b7af586a079981cefb9",
+        )
+        self.assertEqual(parsed["trees"][0]["browse"], "/source/1f916")
+        self.assertTrue(parsed["trees"][0]["pinned"].startswith("/source/1f916@"))
+        self.assertIn("cannot prove", parsed["limit"])
+        self.assertIn("running at 1f916.ai", parsed["intro"])
+
+    def test_source_directory_and_file(self) -> None:
+        entries = watch_mod.parse_source_dir(_SOURCE_DIR)
+        self.assertIsNotNone(entries)
+        assert entries is not None
+        self.assertEqual(entries[0], {"name": ".github", "kind": "dir"})
+        self.assertEqual(entries[1]["size"], 34523)
+        self.assertIsNone(watch_mod.parse_source_dir("hello\nworld\n"))
+        listing = watch_mod.source_view("1f916", _SOURCE_DIR)
+        self.assertEqual(listing["kind"], "dir")
+        self.assertEqual(len(listing["entries"]), 3)
+        filed = watch_mod.source_view("protocol/verify.mjs", "#!/usr/bin/env node\n")
+        self.assertEqual(filed["kind"], "file")
+        self.assertIn("env node", filed["text"])
+
+    def test_source_path_rejects_traversal_and_marks_downloads(self) -> None:
+        self.assertEqual(watch_mod.normalize_source_rel(""), "")
+        self.assertEqual(
+            watch_mod.normalize_source_rel("1f916/src/index.ts"),
+            "1f916/src/index.ts",
+        )
+        self.assertEqual(
+            watch_mod.normalize_source_rel("1f916@11d0fef4e92f/src/index.ts"),
+            "1f916@11d0fef4e92f/src/index.ts",
+        )
+        self.assertEqual(watch_mod.normalize_source_rel("protocol.tar.gz"), "protocol.tar.gz")
+        self.assertIsNone(watch_mod.normalize_source_rel("../etc/passwd"))
+        self.assertIsNone(watch_mod.normalize_source_rel("1f916/../../x"))
+        self.assertIsNone(watch_mod.normalize_source_rel("not-a-repo/README.md"))
+        self.assertTrue(watch_mod.source_is_binary("1f916.tar.gz"))
+        self.assertTrue(watch_mod.source_is_binary("1f916/assets/icon.png"))
+        self.assertFalse(watch_mod.source_is_binary("protocol/verify.mjs"))
+        binary = watch_mod.source_view("1f916.tar.gz", "")
+        self.assertEqual(binary["kind"], "binary")
+        self.assertFalse(watch_mod.is_source_page("/source/../secret"))
+        self.assertTrue(watch_mod.is_source_page("/source/protocol/SPEC.md"))
+
+    def test_support_note_pulls_email_and_links(self) -> None:
+        parsed = watch_mod.parse_support(_SUPPORT_NOTE)
+        self.assertEqual(parsed["title"], "Support for 1F916")
+        self.assertEqual(parsed["email"], "1f916.ai@gmail.com")
+        self.assertEqual(parsed["links"][0]["url"], "https://1f916.ai/human/setup")
+        self.assertEqual(parsed["links"][1]["label"], "Privacy policy")
+
+    def test_pages_render_the_new_rooms(self) -> None:
+        source = watch_mod.render_source_page().decode()
+        support = watch_mod.render_support_page().decode()
+        self.assertIn("renderSource", source)
+        self.assertIn("/api/source-snapshot", source)
+        self.assertIn('data-nav="source"', source)
+        self.assertIn("renderSupport", support)
+        self.assertIn("/api/support-snapshot", support)
+        self.assertIn('href="/source"', source)
+        self.assertIn('href="/support"', support)
+        citizens = watch_mod.render_landing_page([]).decode()
+        self.assertIn('href="/source"', citizens)
+        self.assertIn('href="/support"', citizens)
+        for url in (
+            "https://1f916.ai/accept",
+            "https://1f916.ai/human/evidence",
+            "https://1f916.ai/human/outside-witness",
+            "https://1f916.ai/human/research",
+        ):
+            self.assertIn(url, source)
+            self.assertIn(url, citizens)
+
+    def test_record_tab_shows_a_rotated_key(self) -> None:
+        html = (Path(__file__).resolve().parents[1] / "src" / "f916_agent" / "watch_ui.html").read_text()
+        self.assertIn("k.rotated_to", html)
+        self.assertIn("signature_validity", html)
+        self.assertIn("k.ended_at", html)
 
 
 if __name__ == "__main__":
