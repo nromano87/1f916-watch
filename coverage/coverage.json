@@ -682,11 +682,16 @@
     {
       "method": "GET",
       "path": "/api/witnesses",
-      "surface": "/trust witnesses section",
+      "surface": "/trust witnesses section (directory, key history, and pushed countersignatures)",
       "why": null,
       "requires": [
         "witnesses[].name",
         "witnesses[].url",
+        "witnesses[].countersigned.identity_events",
+        "witnesses[].countersigned.ledger",
+        "countersignature_payload_format",
+        "countersignature_note",
+        "countersigned_note",
         "how_to_join",
         "directory_contract"
       ]
@@ -703,6 +708,12 @@
         "events",
         "chained"
       ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/witnesses/:id/countersignatures",
+      "surface": null,
+      "why": "Write \u2014 a witness pushes one countersignature row {log, tree_size, root, witness_sig}. No bearer: the signature is the credential, and the registry stores the newest row per log. Watch never pushes. The public result (tree size, lag, receipt, stale key, or null) is read from GET /api/witnesses onto /trust."
     },
     {
       "method": "POST",

@@ -253,10 +253,11 @@
     <h1>Trust</h1>
     <p class="blurb">
       Signed checkpoints, the external anchors over that text, the witness
-      directory with chained key history, the attestation ledger, and the
-      pre-publication legacy-prefix digest — plus tools to fetch inclusion and
-      consistency proofs. Read-only; this window never holds a citizen key and
-      never seals a manifest.
+      directory with chained key history and the countersignatures each witness
+      has pushed, the attestation ledger, and the pre-publication legacy-prefix
+      digest — plus tools to fetch inclusion and consistency proofs. Read-only;
+      this window never holds a citizen key, never seals a manifest, and never
+      pushes a countersignature.
     </p>
     <div class="meta" id="boardMeta">loading…</div>
     <div id="error" class="err" hidden></div>
@@ -378,6 +379,62 @@
       const n = Number(ms);
       if (!n) return "—";
       try { return new Date(n).toLocaleString(); } catch (_) { return String(ms); }
+    }
+    function fmtLag(seconds) {
+      const n = Number(seconds);
+      if (!Number.isFinite(n) || n < 0) return "—";
+      const s = Math.floor(n);
+      const days = Math.floor(s / 86400);
+      const hours = Math.floor((s % 86400) / 3600);
+      const mins = Math.floor((s % 3600) / 60);
+      if (days > 0) return days + "d " + hours + "h";
+      if (hours > 0) return hours + "h " + mins + "m";
+      if (mins > 0) return mins + "m " + (s % 60) + "s";
+      return s + "s";
+    }
+    function renderCountersigned(w) {
+      const block = w && w.countersigned && typeof w.countersigned === "object" ? w.countersigned : null;
+      if (!block) {
+        return '<div class="hist"><div class="hist-h">Pushed countersignatures</div>'
+          + '<p class="note">This reply did not include a countersigned block.</p></div>';
+      }
+      const rows = ["identity_events", "ledger"].map((log) => {
+        const row = block[log];
+        if (row == null || typeof row !== "object") {
+          return '<div class="hist-event"><div class="top">'
+            + '<span class="pill">' + esc(log) + "</span>"
+            + '<span class="pill">no push</span>'
+            + "</div></div>";
+        }
+        const lag = Number(row.lag_s);
+        const stale = row.stale_key === true;
+        const receipt = row.receipt && typeof row.receipt === "object" ? row.receipt : null;
+        return '<div class="hist-event"><div class="top">'
+          + '<span class="pill">' + esc(log) + "</span>"
+          + '<span class="pill">size ' + esc(row.tree_size) + "</span>"
+          + '<span class="pill' + (lag > 0 ? " warn" : "") + '">lag ' + esc(fmtLag(row.lag_s)) + "</span>"
+          + (row.witness_epoch != null ? '<span class="pill">signed epoch ' + esc(row.witness_epoch) + "</span>" : "")
+          + (stale ? '<span class="pill warn">earlier key</span>' : "")
+          + (row.checkpoint_id != null ? '<span class="pill">checkpoint #' + esc(row.checkpoint_id) + "</span>" : "")
+          + '<span class="pill">received ' + esc(fmtWhen(row.received_at)) + "</span>"
+          + '</div>'
+          + '<div class="note mono">root ' + esc(row.root || "—") + "</div>"
+          + '<div class="note mono">witness sig ' + esc(shortHash(row.witness_sig)) + "</div>"
+          + (receipt && receipt.sig
+            ? '<div class="note mono">receipt ' + esc(shortHash(receipt.sig)) + "</div>"
+            : '<div class="note">No registry receipt on this row.</div>')
+          + (lag === 0
+            ? '<div class="note">No checkpoint on this log is newer than the pushed row. A quiet log is not a dead witness.</div>'
+            : "")
+          + (stale
+            ? '<div class="note">Pushed under an earlier key than this witness\'s current epoch. Read it as history, not as the current key\'s word.</div>'
+            : "")
+          + "</div>";
+      }).join("");
+      return '<div class="hist"><div class="hist-h">Pushed countersignatures</div>'
+        + '<p class="note" style="margin:0 0 8px">Newest row this witness pushed, per log. Watch never posts one.</p>'
+        + rows
+        + "</div>";
     }
 
     function renderOfficial(snap) {
@@ -716,6 +773,18 @@
       const contract = wit.directory_contract
         ? '<p class="note" style="margin:0 0 12px">' + esc(wit.directory_contract) + "</p>"
         : "";
+      const counterNotes = [
+        '<p class="note" style="margin:0 0 8px">Watch never posts to /api/witnesses/:id/countersignatures.</p>',
+        wit.countersigned_note
+          ? '<p class="note" style="margin:0 0 8px">' + esc(wit.countersigned_note) + "</p>"
+          : "",
+        wit.countersignature_note
+          ? '<p class="note" style="margin:0 0 8px">' + esc(wit.countersignature_note) + "</p>"
+          : "",
+        wit.countersignature_payload_format
+          ? '<p class="note mono" style="margin:0 0 12px">' + esc(wit.countersignature_payload_format) + "</p>"
+          : "",
+      ].join("");
       const witnessCards = witnesses.map((w) => {
         const hist = w.history || {};
         const events = Array.isArray(hist.events) ? hist.events : [];
@@ -754,11 +823,12 @@
           + '</div><div class="title">' + esc(w.name || "—") + "</div>"
           + '<div class="links">' + (w.url ? externalLink(w.url, "open") : "") + "</div>"
           + (w.note ? '<p class="note" style="margin-top:6px">' + esc(w.note) + "</p>" : "")
+          + renderCountersigned(w)
           + histHtml
           + "</article>";
       }).join("");
       document.getElementById("witnessList").innerHTML =
-        contract + (witnessCards || '<p class="note">No witnesses listed.</p>');
+        contract + counterNotes + (witnessCards || '<p class="note">No witnesses listed.</p>');
       document.getElementById("witnessList").querySelectorAll("[data-proof-event]").forEach((btn) => {
         btn.addEventListener("click", () => {
           document.getElementById("proofLog").value = "identity_events";
