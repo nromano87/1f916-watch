@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from unittest.mock import patch
 
 from f916_agent import watch as watch_mod
 
@@ -1185,6 +1187,8 @@ class WatchSourceSupportTests(unittest.TestCase):
             "https://1f916.ai/human/evidence",
             "https://1f916.ai/human/outside-witness",
             "https://1f916.ai/human/research",
+            "https://1f916.ai/.well-known/1f916-identity-assertion",
+            "https://1f916.ai/.well-known/1f916-identity-jwks.json",
         ):
             self.assertIn(url, source)
             self.assertIn(url, citizens)
@@ -1194,6 +1198,175 @@ class WatchSourceSupportTests(unittest.TestCase):
         self.assertIn("k.rotated_to", html)
         self.assertIn("signature_validity", html)
         self.assertIn("k.ended_at", html)
+        self.assertIn("k.custody_declaration", html)
+        self.assertIn("custody_chain_check_note", html)
+        self.assertIn("authorizes_payouts", html)
+
+
+class WatchlistColdLoadTests(unittest.TestCase):
+    """A cold watchlist must paint before citizen fetches finish."""
+
+    def setUp(self) -> None:
+        self._patches = [
+            patch.object(watch_mod, "_ensure_changes_index_async", lambda _client: None),
+            patch.object(watch_mod, "_fetch_house_healthz", lambda: {}),
+            patch.object(watch_mod, "_cached_changes_tip", lambda _client, **_k: ([], [])),
+            patch.object(watch_mod, "_load_new_feed_posts", lambda _client: []),
+        ]
+        for item in self._patches:
+            item.start()
+        with watch_mod._CHANGES_LOCK:
+            self._changes = dict(watch_mod._CHANGES_CACHE)
+            watch_mod._CHANGES_CACHE["fetched_at"] = time.time()
+            watch_mod._CHANGES_CACHE["posts"] = []
+            watch_mod._CHANGES_CACHE["comments"] = []
+            watch_mod._CHANGES_CACHE["gap"] = {}
+        self._clear()
+
+    def tearDown(self) -> None:
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            with watch_mod._WATCHLIST_INBOX_COND:
+                busy = any(watch_mod._WATCHLIST_INBOX_REFRESHING.values())
+            if not busy:
+                break
+            time.sleep(0.05)
+        self._clear()
+        with watch_mod._CHANGES_LOCK:
+            watch_mod._CHANGES_CACHE.clear()
+            watch_mod._CHANGES_CACHE.update(self._changes)
+        for item in self._patches:
+            item.stop()
+
+    def _clear(self) -> None:
+        with watch_mod._WATCHLIST_INBOX_COND:
+            watch_mod._WATCHLIST_INBOX_CACHE.clear()
+            watch_mod._WATCHLIST_INBOX_REFRESHING.clear()
+        with watch_mod._CITIZEN_ID_LOCK:
+            watch_mod._CITIZEN_ID_CACHE.clear()
+        with watch_mod._CITIZEN_TRAIL_LOCK:
+            watch_mod._CITIZEN_TRAIL_CACHE.clear()
+
+    def test_cold_bundle_returns_before_citizen_fetch(self) -> None:
+        class _Client:
+            def __init__(self) -> None:
+                self.citizen_calls = 0
+                self.request_calls = 0
+
+            def citizen(self, handle: str, query: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                self.citizen_calls += 1
+                time.sleep(5)
+                return {}
+
+            def request(
+                self,
+                method: str,
+                path: str,
+                query: Optional[Dict[str, Any]] = None,
+                retry: bool = True,
+                **_kwargs: Any,
+            ) -> Dict[str, Any]:
+                self.request_calls += 1
+                self.assert_retry = retry
+                return {
+                    "citizen": {"handle": "verso", "karma": 3, "model": "x"},
+                    "truncated": False,
+                    "posts": [
+                        {
+                            "id": 9,
+                            "title": "hi",
+                            "created_at": 100,
+                            "author": "verso",
+                        }
+                    ],
+                    "comments": [],
+                    "paging": {
+                        "posts": {"next_posts_before": None},
+                        "comments": {"next_comments_before": None},
+                    },
+                }
+
+        client = _Client()
+        started = time.time()
+        first = watch_mod.build_watchlist_inbox(client, ["verso"])
+        elapsed = time.time() - started
+        self.assertLess(elapsed, 0.5)
+        self.assertTrue(first.get("warming"))
+        self.assertEqual(first["citizens"][0]["handle"], "verso")
+
+        deadline = time.time() + 3
+        filled: Dict[str, Any] = {}
+        while time.time() < deadline:
+            with watch_mod._WATCHLIST_INBOX_COND:
+                row = watch_mod._WATCHLIST_INBOX_CACHE.get("verso") or {}
+            payload = row.get("payload") or {}
+            if payload and not payload.get("warming"):
+                filled = payload
+                break
+            time.sleep(0.05)
+        self.assertFalse(filled.get("warming"))
+        posts = (filled.get("citizens") or [{}])[0].get("posts") or []
+        self.assertEqual([p.get("id") for p in posts], [9])
+        self.assertEqual(client.citizen_calls, 0)
+        self.assertGreaterEqual(client.request_calls, 1)
+        self.assertFalse(client.assert_retry)
+
+        again = watch_mod.build_watchlist_inbox(client, ["verso"])
+        self.assertFalse(again.get("warming"))
+        self.assertEqual(again["citizens"][0]["posts"][0]["id"], 9)
+
+
+class TrustWitnessRetireTests(unittest.TestCase):
+    def test_history_keeps_retire_and_page_bounds(self) -> None:
+        class _Client:
+            def checkpoint(self) -> Dict[str, Any]:
+                return {}
+
+            def witnesses(self) -> Dict[str, Any]:
+                return {"witnesses": [{"id": 4, "name": "x"}]}
+
+            def attestations(self) -> Dict[str, Any]:
+                return {}
+
+            def legacy_manifest(self) -> Dict[str, Any]:
+                return {}
+
+            def probe_get(self, path: str) -> Dict[str, Any]:
+                return {"status": 503, "body": {"error": "not configured: " + path}}
+
+            def witness_history(self, wid: int) -> Dict[str, Any]:
+                return {
+                    "witness": {"id": wid, "name": "x", "retired": True},
+                    "events": [{"id": 1, "kind": "witness-retire"}],
+                    "chained": "yes",
+                    "count": 1,
+                    "total": 2,
+                    "has_more": True,
+                }
+
+        with patch.object(watch_mod, "_board_swr", lambda _key, compute: compute()), patch.object(
+            watch_mod, "_cached_official", lambda _client: {}
+        ), patch.object(watch_mod, "_anchor_board", lambda _fetch: {}):
+            snap = watch_mod.build_trust_snapshot(_Client())
+        hist = snap["witnesses"]["witnesses"][0]["history"]
+        self.assertTrue(hist["retired"])
+        self.assertEqual(hist["count"], 1)
+        self.assertEqual(hist["total"], 2)
+        self.assertTrue(hist["has_more"])
+        self.assertEqual(hist["events"][0]["kind"], "witness-retire")
+        ident = snap["identity_assertion"]
+        self.assertEqual(ident["contract_status"], 503)
+        self.assertEqual(ident["jwks_status"], 503)
+        self.assertIn("not configured", ident["contract_error"])
+        self.assertIn("/.well-known/1f916-identity-assertion", ident["contract_error"])
+        self.assertIsNone(ident["meaning"])
+        page = watch_mod.TRUST_UI_PATH.read_text(encoding="utf-8")
+        self.assertIn("never retires a witness pointer", page)
+        self.assertIn("mints an assertion", page)
+        self.assertIn("renderIdentityAssertion", page)
+        self.assertIn("1f916-identity-assertion", page)
+        self.assertIn("hist.retired", page)
+        self.assertIn("hist.has_more", page)
 
 
 if __name__ == "__main__":

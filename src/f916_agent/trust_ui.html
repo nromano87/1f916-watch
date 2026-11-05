@@ -255,9 +255,11 @@
       Signed checkpoints, the external anchors over that text, the witness
       directory with chained key history and the countersignatures each witness
       has pushed, the attestation ledger, and the pre-publication legacy-prefix
-      digest — plus tools to fetch inclusion and consistency proofs. Read-only;
-      this window never holds a citizen key, never seals a manifest, and never
-      pushes a countersignature.
+      digest — plus the identity-assertion contract and its verification keys,
+      and tools to fetch inclusion and consistency proofs. Read-only;
+      this window never holds a citizen key, never seals a manifest, never
+      pushes a countersignature, never retires a witness pointer, and never
+      mints an assertion.
     </p>
     <div class="meta" id="boardMeta">loading…</div>
     <div id="error" class="err" hidden></div>
@@ -267,6 +269,12 @@
       <p class="lead" id="checkpointLead">Latest signed Merkle heads over the sealed chains.</p>
       <div class="stats" id="checkpointStats"></div>
       <div id="checkpointList"></div>
+    </section>
+
+    <section class="sec" id="identitySec">
+      <h2>Identity assertions</h2>
+      <p class="lead" id="identityLead">A five-minute Square-signed proof for one audience and one nonce. Watch never mints one.</p>
+      <div id="identityList"></div>
     </section>
 
     <section class="sec" id="anchorSec">
@@ -627,6 +635,8 @@
         + " · " + externalLink("https://1f916.ai/.well-known/agent-card.json", "agent card")
         + " · " + externalLink("https://1f916.ai/apis.json", "apis.json")
         + " · " + externalLink("https://1f916.ai/.well-known/api-catalog", "api-catalog")
+        + " · " + externalLink("https://1f916.ai/.well-known/1f916-identity-assertion", "identity assertion")
+        + " · " + externalLink("https://1f916.ai/.well-known/1f916-identity-jwks.json", "assertion keys")
         + "</p></section>"
         + "</div>";
     }
@@ -675,6 +685,58 @@
         + (sealed.note ? '<p class="note" style="margin-top:8px">' + esc(sealed.note) + "</p>" : "")
         + table
         + "</article>";
+    }
+    function renderIdentityAssertion(snap) {
+      const block = (snap && snap.identity_assertion) || {};
+      const keys = Array.isArray(block.keys) ? block.keys : [];
+      const cont = block.key_continuity || {};
+      const configured = block.contract_status === 200 && block.jwks_status === 200;
+      const lead = document.getElementById("identityLead");
+      if (lead) {
+        lead.textContent = configured && block.meaning
+          ? block.meaning
+          : "A five-minute Square-signed proof for one audience and one nonce. Watch never mints one.";
+      }
+      const contractUrl = block.contract_url || "https://1f916.ai/.well-known/1f916-identity-assertion";
+      const jwksUrl = block.jwks_url || "https://1f916.ai/.well-known/1f916-identity-jwks.json";
+      let html = '<p class="note" style="margin:0 0 8px">Watch links the contract and the verification keys. It never asks the society to mint an assertion, and it never declares who holds a private key.</p>'
+        + '<p class="note" style="margin:0 0 8px">'
+        + externalLink(contractUrl, "discovery contract")
+        + " · "
+        + externalLink(jwksUrl, "verification keys")
+        + "</p>";
+      if (!configured) {
+        const err = block.contract_error || block.jwks_error || "The contract is not being served.";
+        html += '<p class="note">' + esc(err) + "</p>"
+          + '<p class="note">That is the designed answer when the signing key is not configured. It is not an outage of this window.</p>';
+      } else {
+        const life = block.maximum_lifetime_seconds != null
+          ? (String(block.maximum_lifetime_seconds) + "s")
+          : "—";
+        const count = block.configured_public_keys != null ? block.configured_public_keys : keys.length;
+        html += '<div class="stats">'
+          + '<div class="stat"><div class="k">lifetime</div><div class="v">' + esc(life) + "</div></div>"
+          + '<div class="stat"><div class="k">keys</div><div class="v">' + esc(count) + "</div></div>"
+          + '<div class="stat"><div class="k">issuer</div><div class="v" style="font-size:13px">' + esc(block.issuer || "—") + "</div></div>"
+          + "</div>";
+        if (block.verification) html += '<p class="note">' + esc(block.verification) + "</p>";
+        if (block.mcp_boundary) html += '<p class="note">' + esc(block.mcp_boundary) + "</p>";
+        if (cont.rotation) html += '<p class="note"><strong>Rotation.</strong> ' + esc(cont.rotation) + "</p>";
+        if (cont.unknown_kid) html += '<p class="note"><strong>Unknown key.</strong> ' + esc(cont.unknown_kid) + "</p>";
+        if (cont.emergency) html += '<p class="note"><strong>Emergency.</strong> ' + esc(cont.emergency) + "</p>";
+        html += keys.length
+          ? keys.map((k) => {
+              return '<article class="row"><div class="top">'
+                + '<span class="pill">' + esc(k.alg || "EdDSA") + "</span>"
+                + '<span class="pill">' + esc(k.crv || k.kty || "key") + "</span>"
+                + (k.kid ? '<span class="pill mono">' + esc(k.kid) + "</span>" : "")
+                + '</div>'
+                + (k.x ? '<div class="note mono">x ' + esc(k.x) + "</div>" : "")
+                + "</article>";
+            }).join("")
+          : '<p class="note">No verification keys in the published set.</p>';
+      }
+      document.getElementById("identityList").innerHTML = html;
     }
     function renderTrust(snap) {
       const cp = snap.checkpoint || {};
@@ -725,6 +787,8 @@
           + "</article>";
       }).join("") || '<p class="note">No checkpoints.</p>';
 
+      renderIdentityAssertion(snap);
+
       const anchorRows = Array.isArray(anchors.anchors) ? anchors.anchors : [];
       const verify = anchors.how_to_verify || {};
       document.getElementById("anchorLead").textContent =
@@ -774,7 +838,7 @@
         ? '<p class="note" style="margin:0 0 12px">' + esc(wit.directory_contract) + "</p>"
         : "";
       const counterNotes = [
-        '<p class="note" style="margin:0 0 8px">Watch never posts to /api/witnesses/:id/countersignatures.</p>',
+        '<p class="note" style="margin:0 0 8px">Watch never posts to /api/witnesses/:id/countersignatures, and never retires a pointer.</p>',
         wit.countersigned_note
           ? '<p class="note" style="margin:0 0 8px">' + esc(wit.countersigned_note) + "</p>"
           : "",
@@ -789,6 +853,14 @@
         const hist = w.history || {};
         const events = Array.isArray(hist.events) ? hist.events : [];
         let histHtml = '<div class="hist"><div class="hist-h">Key history</div>';
+        if (hist.retired) {
+          histHtml += '<p class="note">This keyless pointer was retired. The row has left the directory; the retire event stays on the identity log.</p>';
+        }
+        if (hist.has_more) {
+          const shown = hist.count != null ? hist.count : events.length;
+          const total = hist.total != null ? (" of " + hist.total) : "";
+          histHtml += '<p class="note">This lineage is clipped (' + esc(shown) + esc(total) + '). A short page is not the whole history.</p>';
+        }
         if (hist.error) {
           histHtml += '<p class="note">' + esc(hist.error) + "</p>";
         } else if (events.length) {
@@ -809,7 +881,7 @@
         } else if (hist.predates_chaining) {
           histHtml += '<p class="note">' + esc(hist.predates_chaining) + "</p>";
         } else {
-          histHtml += '<p class="note">No chained register/rotate events recorded.</p>';
+          histHtml += '<p class="note">No chained register, rotate, or retire events recorded.</p>';
         }
         if (hist.chained) {
           histHtml += '<p class="note" style="margin-top:8px">' + esc(hist.chained) + "</p>";
@@ -820,6 +892,7 @@
           + (w.id != null ? '<span class="pill">#' + esc(w.id) + "</span>" : "")
           + (w.epoch != null ? '<span class="pill">epoch ' + esc(w.epoch) + "</span>" : "")
           + (w.public_key ? '<span class="pill mono">' + esc(shortHash(w.public_key)) + "</span>" : '<span class="pill">no public key</span>')
+          + (hist.retired ? '<span class="pill">retired</span>' : "")
           + '</div><div class="title">' + esc(w.name || "—") + "</div>"
           + '<div class="links">' + (w.url ? externalLink(w.url, "open") : "") + "</div>"
           + (w.note ? '<p class="note" style="margin-top:6px">' + esc(w.note) + "</p>" : "")

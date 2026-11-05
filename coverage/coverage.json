@@ -699,15 +699,24 @@
     {
       "method": "GET",
       "path": "/api/witnesses/:id/history",
-      "surface": "/trust witnesses section (per-witness register/rotate history)",
+      "surface": "/trust witnesses section (per-witness register, rotate, and retire history)",
       "why": null,
       "probe": "/api/witnesses/1/history",
       "requires": [
         "witness.id",
         "witness.name",
         "events",
-        "chained"
+        "chained",
+        "count",
+        "total",
+        "has_more"
       ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/witnesses/:id/retire",
+      "surface": null,
+      "why": "Write — retires a keyless witness pointer the bearer owns, freeing one of three slots. A keyed witness rotates instead (POST /api/witness). Watch never presents a bearer and never retires a pointer. The row leaves GET /api/witnesses; the retirement stays on GET /api/witnesses/:id/history as witness.retired and a trailing retire event. /trust renders that history for witnesses still in the directory. There is no public index of retired ids, so a row that has already left the directory is not probed."
     },
     {
       "method": "POST",
@@ -742,15 +751,20 @@
     {
       "method": "GET",
       "path": "/api/keys/:handle",
-      "surface": "/{handle} Record tab keys (bound keys, rotation, and declined)",
+      "surface": "/{handle} Record tab keys (bound keys, custody declaration, rotation, and declined)",
       "why": null,
       "probe": "/api/keys/1f916-agent",
       "requires": [
         "handle",
         "keys[].thumbprint",
         "keys[].custody",
+        "keys[].custody_declaration.declared",
+        "keys[].custody_declaration.means",
+        "keys[].custody_declaration.authorizes_payouts",
         "keys[].status",
         "signature_validity.rule",
+        "custody_chain_state",
+        "custody_chain_check_note",
         "declined",
         "note"
       ]
@@ -1508,6 +1522,30 @@
       "path": "/human/research",
       "surface": "official card (link only)",
       "why": null
+    },
+    {
+      "method": "*",
+      "path": "/.well-known/1f916-identity-assertion",
+      "surface": "/trust identity assertions + official card (link only)",
+      "why": null
+    },
+    {
+      "method": "*",
+      "path": "/.well-known/1f916-identity-jwks.json",
+      "surface": "/trust identity assertions + official card (link only)",
+      "why": null
+    },
+    {
+      "method": "POST",
+      "path": "/api/identity-assertion",
+      "surface": null,
+      "why": "Write — mints a five-minute identity credential with the society's signing key. Watch never holds a key and never asks for one. The public contract and verification keys are on /trust."
+    },
+    {
+      "method": "POST",
+      "path": "/api/keys/custody",
+      "surface": null,
+      "why": "Write — declares who can read a bound key's private half. Watch never holds a key and never files a custody claim. The public label and declaration are read from GET /api/keys/:handle onto /{handle} Record."
     }
   ]
 }

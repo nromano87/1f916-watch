@@ -1287,6 +1287,9 @@ _WATCHLIST_INBOX_LOCK = threading.Lock()
 _WATCHLIST_INBOX_COND = threading.Condition(_WATCHLIST_INBOX_LOCK)
 _WATCHLIST_INBOX_REFRESHING: Dict[str, bool] = {}
 _WATCHLIST_INBOX_TTL_SEC = 45.0
+# Placeholder bundles expire quickly so a failed fill is retried, without
+# letting the browser sit on the request while society calls back off.
+_WATCHLIST_WARM_TTL_SEC = 3.0
 _CITIZEN_ID_CACHE: Dict[str, Dict[str, Any]] = {}
 _CITIZEN_ID_LOCK = threading.Lock()
 _CITIZEN_ID_TTL_SEC = 120.0
@@ -2731,7 +2734,7 @@ a.pill:hover{{background:rgba(12,124,102,.18);border-color:rgba(12,124,102,.4)}}
       }}
       meta.textContent = handles.length + " watched · warming trail…";
       if (silent || Date.now() >= deadline) break;
-      await new Promise((r) => setTimeout(r, 1500));
+      await new Promise((r) => setTimeout(r, 400));
       }}
     }} catch (e) {{
       if (silent) return;
@@ -3439,6 +3442,8 @@ function renderOfficial(snap) {{
     + " · " + externalLink("https://1f916.ai/.well-known/agent-card.json", "agent card")
     + " · " + externalLink("https://1f916.ai/apis.json", "apis.json")
     + " · " + externalLink("https://1f916.ai/.well-known/api-catalog", "api-catalog")
+    + " · " + externalLink("https://1f916.ai/.well-known/1f916-identity-assertion", "identity assertion")
+    + " · " + externalLink("https://1f916.ai/.well-known/1f916-identity-jwks.json", "assertion keys")
     + "</p></section>"
     + "</div>";
 }}
@@ -5005,7 +5010,36 @@ def _ensure_changes_index_async(client: Client) -> None:
     threading.Thread(target=_run, name="changes-refresh", daemon=True).start()
 
 
-def find_citizen(client: Client, handle: str) -> Optional[Dict[str, Any]]:
+def _read_citizen(
+    client: Client,
+    handle: str,
+    query: Optional[Dict[str, Any]] = None,
+    *,
+    retry: bool = True,
+) -> Any:
+    """GET /api/citizen/:handle.
+
+    ``retry=False`` skips the shared cooldown sleep. A 429 used to pin the
+    watchlist request for the full backoff (up to 45s) before any card could
+    paint. Callers that already degrade to a cached or warming bundle use it.
+    """
+    if not retry:
+        request = getattr(client, "request", None)
+        if request is not None:
+            return request(
+                "GET",
+                "/api/citizen/{}".format(handle),
+                query=query,
+                retry=False,
+            )
+    if query:
+        return client.citizen(handle, query=query)
+    return client.citizen(handle)
+
+
+def find_citizen(
+    client: Client, handle: str, *, retry: bool = True
+) -> Optional[Dict[str, Any]]:
     """Resolve one handle via GET /api/citizen/:handle.
 
     Do not page the census for this. A 1,700-row /api/citizens walk 429s, and
@@ -5020,13 +5054,14 @@ def find_citizen(client: Client, handle: str) -> Optional[Dict[str, Any]]:
     if not needle:
         return None
     try:
-        data = client.citizen(needle) or {}
+        data = _read_citizen(client, needle, retry=retry) or {}
     except ApiError as e:
         if int(getattr(e, "status", 0) or 0) == 404:
             return None
-        person = _find_citizen_on_census_page(client, needle)
-        if person:
-            return person
+        if retry:
+            person = _find_citizen_on_census_page(client, needle)
+            if person:
+                return person
         raise
     if not isinstance(data, dict):
         return None
@@ -5152,35 +5187,62 @@ def _watchlist_inbox_key(handles: List[str]) -> str:
     return ",".join(sorted(h.lower() for h in handles))
 
 
-def _claim_watchlist_inbox(key: str) -> Tuple[Optional[Dict[str, Any]], bool]:
-    """Returns ``(payload, should_compute)``. Stale + should_compute means
-    return the last bundle now and refresh behind it."""
+def _claim_watchlist_inbox(
+    key: str, *, placeholder: Optional[Dict[str, Any]] = None
+) -> Tuple[Optional[Dict[str, Any]], bool]:
+    """Returns ``(payload, should_compute)``.
+
+    A fresh bundle is returned as-is. A stale one is returned with
+    ``should_compute`` so the caller can refresh behind it. A cold key stores
+    ``placeholder`` (warming stub) under the lock and computes behind the
+    response — the request must not wait on citizen fetches or a 429 sleep.
+    """
     with _WATCHLIST_INBOX_COND:
-        while True:
-            now = datetime.now(timezone.utc).timestamp()
-            entry = _WATCHLIST_INBOX_CACHE.get(key) or {}
-            cached = entry.get("payload")
-            age = now - float(entry.get("fetched_at") or 0)
-            refreshing = bool(_WATCHLIST_INBOX_REFRESHING.get(key))
-            if cached is not None and age < _WATCHLIST_INBOX_TTL_SEC:
-                return dict(cached), False
-            if refreshing:
-                if cached is not None:
-                    return dict(cached), False
-                _WATCHLIST_INBOX_COND.wait(timeout=12)
-                continue
-            _WATCHLIST_INBOX_REFRESHING[key] = True
+        now = datetime.now(timezone.utc).timestamp()
+        entry = _WATCHLIST_INBOX_CACHE.get(key) or {}
+        cached = entry.get("payload")
+        age = now - float(entry.get("fetched_at") or 0)
+        ttl = float(entry.get("ttl") or _WATCHLIST_INBOX_TTL_SEC)
+        refreshing = bool(_WATCHLIST_INBOX_REFRESHING.get(key))
+        if cached is not None and age < ttl:
+            return dict(cached), False
+        if refreshing:
             if cached is not None:
-                return dict(cached), True
-            return None, True
+                return dict(cached), False
+            return None, False
+        _WATCHLIST_INBOX_REFRESHING[key] = True
+        if cached is not None:
+            return dict(cached), True
+        if placeholder is not None:
+            _WATCHLIST_INBOX_CACHE[key] = {
+                "fetched_at": now,
+                "payload": placeholder,
+                "ttl": _WATCHLIST_WARM_TTL_SEC,
+            }
+            return dict(placeholder), True
+        return None, True
 
 
-def _store_watchlist_inbox(key: str, payload: Dict[str, Any]) -> None:
+def _store_watchlist_inbox(
+    key: str,
+    payload: Dict[str, Any],
+    *,
+    ttl: Optional[float] = None,
+    only_if_warming: bool = False,
+) -> None:
     with _WATCHLIST_INBOX_COND:
-        _WATCHLIST_INBOX_CACHE[key] = {
+        if only_if_warming:
+            prev = (_WATCHLIST_INBOX_CACHE.get(key) or {}).get("payload") or {}
+            if prev and not prev.get("warming"):
+                return
+        entry: Dict[str, Any] = {
             "fetched_at": datetime.now(timezone.utc).timestamp(),
             "payload": payload,
         }
+        if ttl is not None:
+            entry["ttl"] = float(ttl)
+        _WATCHLIST_INBOX_CACHE[key] = entry
+        _WATCHLIST_INBOX_COND.notify_all()
 
 
 def _release_watchlist_inbox(key: str) -> None:
@@ -5189,7 +5251,9 @@ def _release_watchlist_inbox(key: str) -> None:
         _WATCHLIST_INBOX_COND.notify_all()
 
 
-def _cached_find_citizen(client: Client, handle: str) -> Optional[Dict[str, Any]]:
+def _cached_find_citizen(
+    client: Client, handle: str, *, retry: bool = True
+) -> Optional[Dict[str, Any]]:
     needle = (handle or "").strip()
     if not needle:
         return None
@@ -5201,7 +5265,7 @@ def _cached_find_citizen(client: Client, handle: str) -> Optional[Dict[str, Any]
         if row and age < _CITIZEN_ID_TTL_SEC and "person" in row:
             person = row.get("person")
             return dict(person) if isinstance(person, dict) else None
-    person = find_citizen(client, needle)
+    person = find_citizen(client, needle, retry=retry)
     with _CITIZEN_ID_LOCK:
         _CITIZEN_ID_CACHE[key] = {
             "fetched_at": datetime.now(timezone.utc).timestamp(),
@@ -5476,6 +5540,18 @@ def _recent_own_comments_from_changes(
     return out
 
 
+def _citizen_trail_is_fresh(handle: str) -> bool:
+    key = (handle or "").strip().lower()
+    if not key:
+        return False
+    now = time.time()
+    with _CITIZEN_TRAIL_LOCK:
+        row = _CITIZEN_TRAIL_CACHE.get(key) or {}
+        if "posts" not in row:
+            return False
+        return (now - float(row.get("fetched_at") or 0)) < _CITIZEN_TRAIL_TTL_SEC
+
+
 def _stamp_own_author(row: Dict[str, Any], handle: str) -> Dict[str, Any]:
     out = dict(row)
     if not str(out.get("author") or "").strip():
@@ -5514,7 +5590,7 @@ def _own_trail_from_citizen_api(
                 query["posts_before"] = posts_before
             if comments_before is not None:
                 query["comments_before"] = comments_before
-            data = client.citizen(h, query=query or None) or {}
+            data = _read_citizen(client, h, query=query or None, retry=False) or {}
             if not isinstance(data, dict):
                 break
             for p in data.get("posts") or []:
@@ -5712,7 +5788,7 @@ def _watchlist_entry_for_handle(
     lookup_error: Optional[str] = None
     person: Optional[Dict[str, Any]] = None
     try:
-        person = _cached_find_citizen(client, handle)
+        person = _cached_find_citizen(client, handle, retry=False)
     except ApiError as e:
         lookup_error = "identity: {}".format(e)
         person = {"handle": handle}
@@ -5781,7 +5857,11 @@ def _watchlist_entry_for_handle(
         _recent_own_comments_from_changes(client, h),
         h,
     )
+    trail_fresh = _citizen_trail_is_fresh(h)
     api_posts, api_comments = _own_trail_from_citizen_api(client, h)
+    if not trail_fresh and not _citizen_trail_is_fresh(h):
+        # A 429 (or timeout) must not be cached as "this citizen has no posts".
+        entry["trail_stale"] = True
     _append_own_posts(own_posts, own_ids, api_posts, h)
     _append_own_comments(own_comments, own_comment_ids, api_comments, h)
     titles = _front_comment_titles(list(all_posts) + list(own_posts))
@@ -5935,6 +6015,8 @@ def _compute_watchlist_inbox(
             },
             None,
         )
+        if entry.pop("trail_stale", None):
+            warming = True
         if lookup_error:
             errors.append("{}: {}".format(handle, lookup_error))
         citizens_out.append(entry)
@@ -5963,9 +6045,47 @@ def _refresh_watchlist_inbox(
         )
         if not payload.get("warming"):
             _store_watchlist_inbox(key, payload)
+        else:
+            # Keep the last complete bundle. A warming result only replaces
+            # another placeholder, and only for a few seconds.
+            _store_watchlist_inbox(
+                key,
+                payload,
+                ttl=_WATCHLIST_WARM_TTL_SEC,
+                only_if_warming=True,
+            )
         return payload
     finally:
         _release_watchlist_inbox(key)
+
+
+def _warming_watchlist_payload(handles: List[str]) -> Dict[str, Any]:
+    """Identity-only bundle the page can paint while trails are fetched."""
+    citizens = []
+    for handle in handles:
+        citizens.append(
+            {
+                "handle": handle,
+                "model": None,
+                "karma": None,
+                "error": None,
+                "inbox": {"items": [], "counts": {"total": 0}},
+                "item_ids": [],
+                "posts": [],
+                "comments": [],
+                "posts_count": None,
+                "comments_count": None,
+                "posts_remaining": None,
+                "comments_remaining": None,
+            }
+        )
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "mode": "watchlist",
+        "warming": True,
+        "citizens": citizens,
+        "errors": [],
+    }
 
 
 def build_watchlist_inbox(
@@ -5977,10 +6097,11 @@ def build_watchlist_inbox(
 ) -> Dict[str, Any]:
     """Lightweight inbox bundle for browser watchlists (shared changes crawl).
 
-    Cold cache returns identity immediately with ``warming: true`` while
-    /api/changes fills in. After the first complete build, an expired TTL
-    returns the last bundle immediately and refreshes behind it. Trail
-    bodies come from /api/changes — Watchlist does not crawl /api/post.
+    Cold cache returns identity immediately with ``warming: true`` and builds
+    the bundle on a background thread. The page polls until ``warming``
+    clears. After the first complete build, an expired TTL returns the last
+    bundle immediately and refreshes behind it. Trail bodies come from
+    /api/changes plus GET /api/citizen — Watchlist does not crawl /api/post.
     """
     cleaned: List[str] = []
     seen_keys = set()
@@ -6005,20 +6126,20 @@ def build_watchlist_inbox(
         }
 
     cache_key = _watchlist_inbox_key(cleaned)
-    cached, should_compute = _claim_watchlist_inbox(cache_key)
-    if not should_compute:
-        return cached or {}
-    if cached is not None:
+    stub = _warming_watchlist_payload(cleaned)
+    cached, should_compute = _claim_watchlist_inbox(
+        cache_key, placeholder=stub
+    )
+    if should_compute:
         threading.Thread(
             target=_refresh_watchlist_inbox,
             args=(client, cleaned, cache_key, preview_limit, store),
             name="watchlist-inbox",
             daemon=True,
         ).start()
+    if cached is not None:
         return cached
-    return _refresh_watchlist_inbox(
-        client, cleaned, cache_key, preview_limit, store
-    )
+    return stub
 
 
 def list_citizens(
@@ -8618,6 +8739,66 @@ def build_provenance_snapshot(client: Client) -> Dict[str, Any]:
     return _board_snapshot("provenance", client, client.provenance)
 
 
+_IDENTITY_ASSERTION_URL = "https://1f916.ai/.well-known/1f916-identity-assertion"
+_IDENTITY_JWKS_URL = "https://1f916.ai/.well-known/1f916-identity-jwks.json"
+
+
+def _probe_dict(probe: Any) -> Dict[str, Any]:
+    if not isinstance(probe, dict):
+        return {}
+    body = probe.get("body")
+    return body if isinstance(body, dict) else {}
+
+
+def _public_identity_assertion(meta_probe: Any, jwks_probe: Any) -> Dict[str, Any]:
+    """Public discovery contract and verification keys. Never a minted credential."""
+    meta = _probe_dict(meta_probe)
+    jwks = _probe_dict(jwks_probe)
+    try:
+        meta_status = int(meta_probe.get("status") or 0) if isinstance(meta_probe, dict) else 0
+    except (TypeError, ValueError):
+        meta_status = 0
+    try:
+        jwks_status = int(jwks_probe.get("status") or 0) if isinstance(jwks_probe, dict) else 0
+    except (TypeError, ValueError):
+        jwks_status = 0
+    continuity = meta.get("key_continuity") if isinstance(meta.get("key_continuity"), dict) else {}
+    keys: List[Dict[str, Any]] = []
+    for key in list(jwks.get("keys") or []):
+        if not isinstance(key, dict):
+            continue
+        keys.append(
+            {
+                "kid": key.get("kid"),
+                "kty": key.get("kty"),
+                "crv": key.get("crv"),
+                "alg": key.get("alg"),
+                "use": key.get("use"),
+                "x": key.get("x"),
+            }
+        )
+    return {
+        "contract_url": _IDENTITY_ASSERTION_URL,
+        "jwks_url": _IDENTITY_JWKS_URL,
+        "contract_status": meta_status,
+        "jwks_status": jwks_status,
+        "issuer": meta.get("issuer"),
+        "maximum_lifetime_seconds": meta.get("maximum_lifetime_seconds"),
+        "meaning": meta.get("meaning"),
+        "verification": meta.get("verification"),
+        "mcp_boundary": meta.get("mcp_boundary"),
+        "configured_public_keys": meta.get("configured_public_keys"),
+        "key_continuity": {
+            "rotation": continuity.get("rotation"),
+            "unknown_kid": continuity.get("unknown_kid"),
+            "emergency": continuity.get("emergency"),
+        },
+        "keys": keys,
+        "contract_error": meta.get("error") if meta_status != 200 else None,
+        "jwks_error": jwks.get("error") if jwks_status != 200 else None,
+    }
+
+
 def build_trust_snapshot(client: Client) -> Dict[str, Any]:
     """Checkpoints, external anchors, witnesses, and the attestation ledger for /trust."""
 
@@ -8637,6 +8818,14 @@ def build_trust_snapshot(client: Client) -> Dict[str, Any]:
             ("attestations", lambda: client.attestations() or {}),
             ("legacy-manifest", lambda: client.legacy_manifest() or {}),
             ("official", lambda: _cached_official(client)),
+            (
+                "identity-assertion",
+                lambda: client.probe_get("/.well-known/1f916-identity-assertion"),
+            ),
+            (
+                "identity-jwks",
+                lambda: client.probe_get("/.well-known/1f916-identity-jwks.json"),
+            ),
         )
         with ThreadPoolExecutor(max_workers=4) as pool:
             futs = [pool.submit(_fetch, label, fn) for label, fn in jobs]
@@ -8681,10 +8870,15 @@ def build_trust_snapshot(client: Client) -> Dict[str, Any]:
                 errors.append("witnesses/{}/history: {}".format(wid, e))
                 row["history"] = {"error": str(e), "events": []}
                 return
+            witness = hist.get("witness") if isinstance(hist.get("witness"), dict) else {}
             row["history"] = {
                 "events": list(hist.get("events") or []),
                 "chained": hist.get("chained"),
                 "predates_chaining": hist.get("predates_chaining"),
+                "retired": bool(witness.get("retired")),
+                "count": hist.get("count"),
+                "total": hist.get("total"),
+                "has_more": bool(hist.get("has_more")),
             }
 
         if rows:
@@ -8700,6 +8894,10 @@ def build_trust_snapshot(client: Client) -> Dict[str, Any]:
             "witnesses": witnesses,
             "attestations": attestations,
             "legacy_manifest": legacy_manifest,
+            "identity_assertion": _public_identity_assertion(
+                bucket.get("identity-assertion"),
+                bucket.get("identity-jwks"),
+            ),
             "official": official,
             "official_security_url": _OFFICIAL_SECURITY_URL,
             "official_llms_url": _OFFICIAL_LLMS_URL,
@@ -10178,6 +10376,8 @@ function renderOfficial(snap) {{
     + " · " + externalLink("https://1f916.ai/.well-known/agent-card.json", "agent card")
     + " · " + externalLink("https://1f916.ai/apis.json", "apis.json")
     + " · " + externalLink("https://1f916.ai/.well-known/api-catalog", "api-catalog")
+    + " · " + externalLink("https://1f916.ai/.well-known/1f916-identity-assertion", "identity assertion")
+    + " · " + externalLink("https://1f916.ai/.well-known/1f916-identity-jwks.json", "assertion keys")
     + "</p></section>"
     + "</div>";
 }}

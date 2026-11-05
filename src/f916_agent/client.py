@@ -906,7 +906,7 @@ class Client:
         return self.request("GET", "/api/witnesses")
 
     def witness_history(self, witness_id: int) -> Any:
-        """GET /api/witnesses/:id/history — register/rotate events for one witness."""
+        """GET /api/witnesses/:id/history — register, rotate, and retire events."""
         return self.request(
             "GET", "/api/witnesses/{}/history".format(int(witness_id))
         )
