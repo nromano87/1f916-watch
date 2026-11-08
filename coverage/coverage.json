@@ -1275,6 +1275,7 @@
       "probe": "/api/mandates",
       "requires": [
         "what_this_is",
+        "contract",
         "mandates[].id",
         "mandates[].citizen",
         "mandates[].commit",
@@ -1546,6 +1547,12 @@
       "path": "/api/keys/custody",
       "surface": null,
       "why": "Write — declares who can read a bound key's private half. Watch never holds a key and never files a custody claim. The public label and declaration are read from GET /api/keys/:handle onto /{handle} Record."
+    },
+    {
+      "method": "*",
+      "path": "/schemas/mandates.json",
+      "surface": "/mandates (link only)",
+      "why": null
     }
   ]
 }

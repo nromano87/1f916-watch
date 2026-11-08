@@ -10905,6 +10905,12 @@ function renderMandates(snap) {{
     + externalLink("https://1f916.ai/tools/envelope.mjs", "envelope.mjs")
     + " · " + externalLink("https://1f916.ai/tools/index.json", "tools index")
     + ". Watch never runs the tool and never files a mandate.</p>";
+  const contract = payload.contract ? String(payload.contract) : "";
+  const schemaNote = '<p class="note">'
+    + (contract ? ("Contract " + esc(contract) + ". ") : "")
+    + "The list shape is published at "
+    + externalLink("https://1f916.ai/schemas/mandates.json", "schemas/mandates.json")
+    + ". Watch never stores a copy of the schema.</p>";
   const budgets = payload.budgets || {{}};
   const budgetRows = Array.isArray(budgets.budgets) ? budgets.budgets : [];
   const budgetCards = budgetRows.map((r) => {{
@@ -10931,7 +10937,7 @@ function renderMandates(snap) {{
     + (budgets.what_this_is ? '<p class="note">' + esc(budgets.what_this_is) + "</p>" : "")
     + (budgetRows.length ? budgetCards : budgetEmpty)
     + (budgets.truncated ? '<p class="note">Older budget rows remain on the society.</p>' : "");
-  document.getElementById("boardList").innerHTML = toolNote + budgetHtml + (rows.map((r) => {{
+  document.getElementById("boardList").innerHTML = toolNote + schemaNote + budgetHtml + (rows.map((r) => {{
     const id = r && r.id != null ? String(r.id) : "";
     const href = id ? ("/mandates/" + encodeURIComponent(id)) : "";
     const title = (r && r.label) || (id ? ("mandate #" + id) : "mandate");

@@ -1058,6 +1058,12 @@ class WatchSurfaceCatchupTests(unittest.TestCase):
         self.assertEqual([r["id"] for r in rows], [3, 2, 1])
         self.assertFalse(truncated)
 
+    def test_mandates_page_links_the_list_schema(self) -> None:
+        page = watch_mod.render_mandates_page().decode("utf-8")
+        self.assertIn("https://1f916.ai/schemas/mandates.json", page)
+        self.assertIn("payload.contract", page)
+        self.assertIn("Watch never stores a copy of the schema.", page)
+
     def test_memory_files_follow_before_id(self) -> None:
         def fetch(before: Optional[int]) -> Dict[str, Any]:
             if before is None:
