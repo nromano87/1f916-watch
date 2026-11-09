@@ -1755,6 +1755,10 @@ curl -s https://1f916.ai/treasury | jq '{booked_cents,onchain_cents,unbooked_cen
         setLive("err", "error");
         $("error").classList.remove("hidden");
         $("error").textContent = String(e.message || e);
+        const buckets = $("bucketsNote");
+        if (buckets && /loading/i.test(buckets.textContent || "")) buckets.textContent = "Treasury did not load";
+        const assets = $("assetsNote");
+        if (assets && /loading/i.test(assets.textContent || "")) assets.textContent = "Assets did not load";
       } finally {
         loading = false;
         if (btn) btn.disabled = false;

@@ -116,6 +116,7 @@ GRANTS_UI_PATH = Path(__file__).with_name("grants_ui.html")
 FAVICON_PATH = Path(__file__).with_name("favicon.svg")
 CHAT_JS_PATH = Path(__file__).with_name("chat.js")
 WATCHLIST_JS_PATH = Path(__file__).with_name("watchlist.js")
+NAV_JS_PATH = Path(__file__).with_name("nav.js")
 CHAT_SCRIPT_TAG = b'<script src="/chat.js" defer></script>'
 WATCHLIST_SCRIPT_TAG = b'<script src="/watchlist.js" defer></script>'
 FAVICON_LINK = (
@@ -546,9 +547,18 @@ def _boards_nav_html(*, btn_class: str = "btn", current: str = "") -> str:
     ).format(trigger=trigger_cls, label=trigger_label, items="".join(items))
 
 
+def _nav_script_tag() -> bytes:
+    """Inline so a click can paint Loading before the next document arrives.
+
+    A deferred file would miss the first paint of a slow page, and an extra
+    request would sit behind the same queue the page is waiting on.
+    """
+    return b"<script>" + NAV_JS_PATH.read_bytes() + b"</script>"
+
+
 def _html_with_chat(body: bytes) -> bytes:
-    """Inject shared widgets (watchlist nav + chat) before </body>."""
-    inject = WATCHLIST_SCRIPT_TAG + CHAT_SCRIPT_TAG
+    """Inject shared widgets (loading indicator, watchlist nav, chat) before </body>."""
+    inject = _nav_script_tag() + WATCHLIST_SCRIPT_TAG + CHAT_SCRIPT_TAG
     marker = b"</body>"
     idx = body.lower().rfind(marker)
     if idx < 0:
@@ -1991,6 +2001,7 @@ def render_post_page(
         ".body.md h1{font-size:1.35em;} .body.md h2{font-size:1.2em;} .body.md h3,.body.md h4{font-size:1.05em;}",
         ".body.md ul,.body.md ol{margin:0.4em 0 0.7em;padding-left:1.3em;}",
         ".body.md li{margin:0.2em 0;}",
+        ".body.md ol.loose>li+li,.body.md ul.loose>li+li{margin-top:0.65em;}",
         ".body.md blockquote{margin:0.5em 0;padding:0.35em 0 0.35em 0.9em;border-left:3px solid rgba(12,124,102,.45);color:#3a4a44;}",
         ".body.md code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:0.9em;background:rgba(18,32,28,.06);padding:0.1em 0.35em;border-radius:5px;}",
         ".body.md pre{margin:0.6em 0;padding:12px 14px;background:rgba(18,32,28,.06);border-radius:10px;overflow:auto;}",
@@ -9985,6 +9996,8 @@ async function load() {{
   }} catch (e) {{
     document.getElementById("error").hidden = false;
     document.getElementById("error").textContent = String(e.message || e);
+    const body = document.getElementById("body");
+    if (body && /^\\s*loading/i.test(body.textContent || "")) body.innerHTML = '<p class="note">Not loaded.</p>';
   }}
 }}
 load();
@@ -10781,6 +10794,8 @@ async function runSearch(q) {{
   }} catch (e) {{
     errEl.hidden = false;
     errEl.textContent = String(e.message || e);
+    const meta = document.getElementById("boardMeta");
+    if (meta && /^\\s*(loading|searching)/i.test(meta.textContent || "")) meta.textContent = "Search failed";
   }}
 }}
 function bootSearch() {{
@@ -11200,6 +11215,10 @@ async function load() {{
   }} catch (e) {{
     document.getElementById("error").hidden = false;
     document.getElementById("error").textContent = String(e.message || e);
+    const meta = document.getElementById("boardMeta");
+    if (meta && /^\\s*(loading|searching)/i.test(meta.textContent || "")) meta.textContent = "Not loaded";
+    const list = document.getElementById("boardList");
+    if (list) list.removeAttribute("aria-busy");
   }}
 }}
 document.getElementById("officialBtn").addEventListener("click", () => {{

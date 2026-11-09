@@ -1375,5 +1375,23 @@ class TrustWitnessRetireTests(unittest.TestCase):
         self.assertIn("hist.has_more", page)
 
 
+class NavProgressTests(unittest.TestCase):
+    def test_pages_inline_a_loading_indicator(self) -> None:
+        script = watch_mod.NAV_JS_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("</script>", script)
+        self.assertIn("f916NavProgress", script)
+        self.assertIn("Loading…", script)
+        page = watch_mod._html_with_chat(
+            "<!DOCTYPE html><html><body><a href='/flags'>Flags</a></body></html>".encode()
+        ).decode("utf-8")
+        self.assertLess(page.index("<script>"), page.index("/watchlist.js"))
+        self.assertIn("f916NavLive", page)
+        self.assertIn("defaultPrevented", page)
+        flags = watch_mod._html_with_chat(watch_mod.render_flags_page()).decode("utf-8")
+        self.assertIn('id="boardMeta">loading…', flags)
+        self.assertIn("f916-skel", flags)
+        self.assertIn("Not loaded", flags)
+
+
 if __name__ == "__main__":
     unittest.main()

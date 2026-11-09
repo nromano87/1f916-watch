@@ -1004,6 +1004,7 @@
     .body.md h3, .body.md h4 { font-size: 1.05em; }
     .body.md ul, .body.md ol { margin: 0.35em 0 0.65em; padding-left: 1.3em; }
     .body.md li { margin: 0.15em 0; }
+    .body.md ol.loose > li + li, .body.md ul.loose > li + li { margin-top: 0.65em; }
     .body.md blockquote {
       margin: 0.45em 0;
       padding: 0.3em 0 0.3em 0.85em;
@@ -3164,6 +3165,79 @@
 
       const lines = escLine(raw).split("\n");
       const blocks = [];
+      const listMark = (s) => {
+        const m = /^(?:([-*+]) |(\d+)\. )/.exec(s);
+        if (!m) return null;
+        if (m[2] != null) return { kind: "ol", start: Number(m[2]), end: m[0].length };
+        return { kind: "ul", start: null, end: m[0].length };
+      };
+      const isListCont = (s) => s.startsWith("  ") || s.startsWith("\t");
+      const blockStart = (s) =>
+        /^@@FENCE\d+@@$/.test(s) ||
+        /^#{1,4}\s+/.test(s) ||
+        s.startsWith("&gt;") ||
+        listMark(s) != null;
+      const itemHtml = (parts, loose) => {
+        const paras = [];
+        let buf = [];
+        const flush = () => {
+          if (!buf.length) return;
+          paras.push(buf.map(inline).join("<br>"));
+          buf = [];
+        };
+        for (const part of parts) {
+          if (part === "") flush();
+          else buf.push(part);
+        }
+        flush();
+        if (!paras.length) return "<li></li>";
+        if (loose || paras.length > 1) return `<li>${paras.map((p) => `<p>${p}</p>`).join("")}</li>`;
+        return `<li>${paras[0]}</li>`;
+      };
+      // Blank lines between items stay in one list. A new <ol> per item
+      // makes the browser restart every marker at 1.
+      const renderList = (at) => {
+        const first = listMark(lines[at]);
+        const kind = first.kind;
+        const items = [];
+        let loose = false;
+        let j = at;
+        while (j < lines.length) {
+          const cur = lines[j];
+          if (!cur.trim()) {
+            let k = j + 1;
+            while (k < lines.length && !lines[k].trim()) k++;
+            if (k >= lines.length) break;
+            const nxt = listMark(lines[k]);
+            if (nxt && nxt.kind === kind) {
+              loose = true;
+              j = k;
+              continue;
+            }
+            if (items.length && isListCont(lines[k])) {
+              loose = true;
+              items[items.length - 1].push("");
+              j = k;
+              continue;
+            }
+            break;
+          }
+          const mark = listMark(cur);
+          if (mark && mark.kind === kind) {
+            items.push([cur.slice(mark.end)]);
+            j++;
+            continue;
+          }
+          if (blockStart(cur) || !items.length) break;
+          items[items.length - 1].push(isListCont(cur) ? cur.trim() : cur);
+          j++;
+        }
+        let attrs = "";
+        if (kind === "ol" && first.start !== 1) attrs += ` start="${first.start}"`;
+        if (loose) attrs += ' class="loose"';
+        const inner = items.map((parts) => itemHtml(parts, loose)).join("");
+        return { html: `<${kind}${attrs}>${inner}</${kind}>`, next: j };
+      };
       let i = 0;
       while (i < lines.length) {
         const line = lines[i];
@@ -3185,26 +3259,17 @@
           blocks.push(`<blockquote>${quoted.map(inline).join("<br>")}</blockquote>`);
           continue;
         }
-        if (/^([-*+] |\d+\. )/.test(line)) {
-          const ordered = /^\d+\. /.test(line);
-          const items = [];
-          while (i < lines.length && /^([-*+] |\d+\. )/.test(lines[i])) {
-            items.push(`<li>${inline(lines[i].replace(/^([-*+] |\d+\. )/, ""))}</li>`);
-            i++;
-          }
-          blocks.push(ordered ? `<ol>${items.join("")}</ol>` : `<ul>${items.join("")}</ul>`);
+        if (listMark(line)) {
+          const rendered = renderList(i);
+          blocks.push(rendered.html);
+          i = rendered.next;
           continue;
         }
         const para = [line];
         i++;
         while (i < lines.length && lines[i].trim()) {
           const nxt = lines[i];
-          if (
-            /^@@FENCE\d+@@$/.test(nxt) ||
-            /^(#{1,4})\s+/.test(nxt) ||
-            nxt.startsWith("&gt;") ||
-            /^([-*+] |\d+\. )/.test(nxt)
-          ) break;
+          if (blockStart(nxt)) break;
           para.push(nxt);
           i++;
         }

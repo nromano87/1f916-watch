@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import html
 import re
-from typing import List, Optional
+from typing import List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
 
@@ -155,6 +155,105 @@ def _inline(text: str) -> str:
     return link_mentions(text)
 
 
+_LIST_MARK = re.compile(r"^(?:([-*+]) |(\d+)\. )")
+
+
+def _list_mark(line: str) -> Optional[Tuple[str, Optional[int], int]]:
+    """Return (tag, start number or None, index where item text begins)."""
+    m = _LIST_MARK.match(line)
+    if not m:
+        return None
+    if m.group(2) is not None:
+        return ("ol", int(m.group(2)), m.end())
+    return ("ul", None, m.end())
+
+
+def _is_list_cont(line: str) -> bool:
+    return line.startswith("  ") or line.startswith("\t")
+
+
+def _block_start(line: str) -> bool:
+    if line.startswith("@@FENCE") and line.endswith("@@"):
+        return True
+    if re.match(r"^#{1,4}\s+", line):
+        return True
+    if line.startswith("&gt;"):
+        return True
+    return _list_mark(line) is not None
+
+
+def _item_html(parts: Sequence[str], loose: bool) -> str:
+    paras: List[str] = []
+    buf: List[str] = []
+
+    def flush() -> None:
+        if buf:
+            paras.append("<br>".join(_inline(p) for p in buf))
+            buf.clear()
+
+    for part in parts:
+        if part == "":
+            flush()
+        else:
+            buf.append(part)
+    flush()
+    if not paras:
+        return "<li></li>"
+    if loose or len(paras) > 1:
+        return "<li>{}</li>".format("".join("<p>{}</p>".format(p) for p in paras))
+    return "<li>{}</li>".format(paras[0])
+
+
+def _render_list(lines: List[str], i: int) -> Tuple[str, int]:
+    """Render one list, keeping a blank line between items inside it.
+
+    A fresh ``<ol>`` per item makes the browser restart every marker at 1,
+    which is what blank-line-separated ``1.`` / ``2.`` posts were doing.
+    A following plain line (a hard wrap, not a new block) stays in the item.
+    """
+    marked = _list_mark(lines[i])
+    assert marked is not None
+    kind, start, _end = marked
+    items: List[List[str]] = []
+    loose = False
+    while i < len(lines):
+        line = lines[i]
+        if not line.strip():
+            j = i + 1
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            if j >= len(lines):
+                break
+            nxt = lines[j]
+            nxt_mark = _list_mark(nxt)
+            if nxt_mark and nxt_mark[0] == kind:
+                loose = True
+                i = j
+                continue
+            if items and _is_list_cont(nxt):
+                loose = True
+                items[-1].append("")
+                i = j
+                continue
+            break
+        mark = _list_mark(line)
+        if mark and mark[0] == kind:
+            items.append([line[mark[2] :]])
+            i += 1
+            continue
+        if _block_start(line) or not items:
+            break
+        items[-1].append(line.strip() if _is_list_cont(line) else line)
+        i += 1
+    attrs = ""
+    if kind == "ol" and start not in (None, 1):
+        attrs += ' start="{}"'.format(start)
+    if loose:
+        attrs += ' class="loose"'
+    inner = "".join(_item_html(parts, loose) for parts in items)
+    return "<{0}{1}>{2}</{0}>".format(kind, attrs, inner), i
+
+
 def to_html(text: str, *, highlight: Optional[str] = None) -> str:
     """Render a Markdown-ish body to sanitized HTML.
 
@@ -213,27 +312,16 @@ def to_html(text: str, *, highlight: Optional[str] = None) -> str:
             )
             continue
 
-        if re.match(r"^([-*+] |\d+\. )", line):
-            items: List[str] = []
-            ordered = bool(re.match(r"^\d+\. ", line))
-            while i < len(lines) and re.match(r"^([-*+] |\d+\. )", lines[i]):
-                item = re.sub(r"^([-*+] |\d+\. )", "", lines[i])
-                items.append("<li>{}</li>".format(_inline(item)))
-                i += 1
-            tag = "ol" if ordered else "ul"
-            blocks.append("<{0}>{1}</{0}>".format(tag, "".join(items)))
+        if _list_mark(line):
+            block, i = _render_list(lines, i)
+            blocks.append(block)
             continue
 
         para: List[str] = [line]
         i += 1
         while i < len(lines) and lines[i].strip():
             nxt = lines[i]
-            if (
-                nxt.startswith("@@FENCE")
-                or re.match(r"^(#{1,4})\s+", nxt)
-                or nxt.startswith("&gt;")
-                or re.match(r"^([-*+] |\d+\. )", nxt)
-            ):
+            if _block_start(nxt):
                 break
             para.append(nxt)
             i += 1

@@ -954,6 +954,8 @@
       } catch (e) {
         document.getElementById("error").hidden = false;
         document.getElementById("error").textContent = String(e.message || e);
+        const meta = document.getElementById("boardMeta");
+        if (meta && /^\s*(loading|searching)/i.test(meta.textContent || "")) meta.textContent = "Not loaded";
       }
     }
 
