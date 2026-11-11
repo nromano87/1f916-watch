@@ -163,39 +163,158 @@
     return items.map(itemId).filter((id) => id && id !== "c:" && id !== "p:");
   }
 
-  function getSeenIds(handle) {
-    const bag = loadSeen()[keyOf(handle)];
-    return Array.isArray(bag) ? bag.map(String) : null;
+  /** created_at by inbox id. Server map wins; item rows fill gaps. */
+  function itemAtsFromCitizen(citizen) {
+    const ats = {};
+    const raw = citizen && citizen.item_id_ats;
+    if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+      for (const key of Object.keys(raw)) {
+        const n = Number(raw[key]) || 0;
+        if (n) ats[String(key)] = n;
+      }
+    }
+    const items = (citizen && citizen.inbox && citizen.inbox.items) || [];
+    for (const it of items) {
+      const id = itemId(it);
+      if (!id || id === "c:" || id === "p:" || ats[id]) continue;
+      const at = Number(it && it.created_at) || 0;
+      if (at) ats[id] = at;
+    }
+    return ats;
   }
 
-  function setSeenIds(handle, ids) {
+  const SEEN_ID_CAP = 500;
+
+  function recordsFrom(ids, ats) {
+    const times = ats && typeof ats === "object" && !Array.isArray(ats) ? ats : {};
+    const out = [];
+    const have = new Set();
+    const list = Array.isArray(ids) ? ids : [];
+    for (const raw of list) {
+      let id = "";
+      let at = 0;
+      if (raw && typeof raw === "object") {
+        id = String(raw.id || "");
+        at = Number(raw.at || raw.created_at) || 0;
+      } else {
+        id = String(raw || "");
+        at = Number(times[id]) || 0;
+      }
+      if (!id || id === "c:" || id === "p:" || have.has(id)) continue;
+      have.add(id);
+      out.push({ id, at });
+    }
+    return out;
+  }
+
+  function maxAt(records) {
+    let m = 0;
+    for (const rec of records) {
+      if (rec.at > m) m = rec.at;
+    }
+    return m;
+  }
+
+  /** `{ids, at}` — `at` null means a legacy id list with no watermark. */
+  function readSeen(handle) {
+    const raw = loadSeen()[keyOf(handle)];
+    if (Array.isArray(raw)) {
+      return { ids: raw.map(String).filter(Boolean), at: null };
+    }
+    if (raw && typeof raw === "object" && Array.isArray(raw.ids)) {
+      return {
+        ids: raw.ids.map(String).filter(Boolean),
+        at: Number(raw.at) || 0,
+      };
+    }
+    return null;
+  }
+
+  function writeSeen(handle, entry) {
     const k = keyOf(handle);
     if (!k) return;
     const all = loadSeen();
-    all[k] = [...new Set((ids || []).map(String).filter(Boolean))];
+    const ids = [];
+    const have = new Set();
+    for (const id of (entry && entry.ids) || []) {
+      const s = String(id || "");
+      if (!s || have.has(s)) continue;
+      have.add(s);
+      ids.push(s);
+      if (ids.length >= SEEN_ID_CAP) break;
+    }
+    all[k] = { ids, at: Number(entry && entry.at) || 0 };
     saveSeen(all);
   }
 
-  /** First encounter baselines silently (no flood). */
-  function unseenCount(handle, ids) {
-    const list = (ids || []).map(String).filter(Boolean);
-    const seen = getSeenIds(handle);
-    if (seen == null) {
-      setSeenIds(handle, list);
-      return 0;
-    }
-    const set = new Set(seen);
-    return list.reduce((n, id) => n + (set.has(id) ? 0 : 1), 0);
+  function getSeenIds(handle) {
+    const entry = readSeen(handle);
+    return entry ? entry.ids : null;
   }
 
-  function markSeen(handle, ids) {
-    setSeenIds(handle, ids || []);
+  /**
+   * Unseen inbox rows.
+   * First look baselines. After that, only mail newer than the newest row
+   * already acknowledged counts — a longer id window must not turn old mail
+   * into a huge "new" number. An empty list never wipes that watermark.
+   */
+  function unseenCount(handle, ids, ats) {
+    const records = recordsFrom(ids, ats);
+    const entry = readSeen(handle);
+    if (!entry || !entry.ids.length) {
+      if (!records.length) return 0;
+      writeSeen(handle, { ids: records.map((r) => r.id), at: maxAt(records) });
+      return 0;
+    }
+    const seen = new Set(entry.ids);
+    let watermark = entry.at;
+    if (watermark == null) {
+      watermark = 0;
+      for (const rec of records) {
+        if (seen.has(rec.id) && rec.at > watermark) watermark = rec.at;
+      }
+    }
+    let n = 0;
+    const folded = [];
+    for (const rec of records) {
+      if (seen.has(rec.id)) continue;
+      if (watermark > 0 && rec.at > 0 && rec.at <= watermark) {
+        folded.push(rec);
+        continue;
+      }
+      n++;
+    }
+    if (folded.length || entry.at == null) {
+      writeSeen(handle, {
+        ids: entry.ids.concat(folded.map((r) => r.id)),
+        at: watermark,
+      });
+    }
+    return n;
+  }
+
+  function markSeen(handle, ids, ats) {
+    const records = recordsFrom(ids, ats);
+    if (!records.length) return;
+    const entry = readSeen(handle) || { ids: [], at: 0 };
+    const seen = new Set(entry.ids);
+    let watermark = entry.at == null ? 0 : Number(entry.at) || 0;
+    if (entry.at == null) {
+      for (const rec of records) {
+        if (seen.has(rec.id) && rec.at > watermark) watermark = rec.at;
+      }
+    }
+    watermark = Math.max(watermark, maxAt(records));
+    writeSeen(handle, {
+      ids: records.map((r) => r.id).concat(entry.ids),
+      at: watermark,
+    });
   }
 
   function markAllSeen(citizens) {
     for (const c of citizens || []) {
       if (!c || !c.handle) continue;
-      markSeen(c.handle, itemIdsFromCitizen(c));
+      markSeen(c.handle, itemIdsFromCitizen(c), itemAtsFromCitizen(c));
     }
     paintNavDot(false);
   }
@@ -336,7 +455,7 @@
       let hasNew = false;
       for (const c of citizens) {
         if (!c || !c.handle || c.error) continue;
-        if (unseenCount(c.handle, itemIdsFromCitizen(c)) > 0) {
+        if (unseenCount(c.handle, itemIdsFromCitizen(c), itemAtsFromCitizen(c)) > 0) {
           hasNew = true;
           break;
         }
@@ -395,7 +514,9 @@
           .then((data) => {
             if (!data || data.warming) return;
             const c = ((data && data.citizens) || [])[0];
-            if (c && c.handle) markSeen(c.handle, itemIdsFromCitizen(c));
+            if (c && c.handle) {
+              markSeen(c.handle, itemIdsFromCitizen(c), itemAtsFromCitizen(c));
+            }
           })
           .catch(() => {});
       }
@@ -536,6 +657,7 @@
     isWatched,
     itemId,
     itemIdsFromCitizen,
+    itemAtsFromCitizen,
     unseenCount,
     markSeen,
     markAllSeen,

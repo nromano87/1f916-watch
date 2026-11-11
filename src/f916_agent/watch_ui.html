@@ -3474,12 +3474,23 @@
       const ids = tabItemIds(snap, tab);
       const handle = tabSeenHandle(snap);
       const seen = getTabSeenIds(handle, tab);
-      if (seen == null) {
+      // A warming or empty paint must not stick as the baseline, or the next
+      // real inbox looks entirely new.
+      if (seen == null || seen.length === 0) {
+        if (!snap || snap.warming || !ids.length) return 0;
         setTabSeenIds(handle, tab, ids);
         return 0;
       }
       const seenSet = new Set(seen);
-      return ids.reduce((n, id) => n + (seenSet.has(id) ? 0 : 1), 0);
+      const unique = [];
+      const have = new Set();
+      for (const id of ids) {
+        const s = String(id || "");
+        if (!s || have.has(s)) continue;
+        have.add(s);
+        unique.push(s);
+      }
+      return unique.reduce((n, id) => n + (seenSet.has(id) ? 0 : 1), 0);
     }
 
     function markTabSeen(snap, tab) {
@@ -5844,9 +5855,13 @@ cross-witness
         try {
           const wl = window.f916Watchlist;
           const handle = (snap.identity || {}).handle || VIEW_HANDLE;
-          if (wl && handle && wl.isWatched(handle)) {
+          if (wl && handle && wl.isWatched(handle) && !snap.warming) {
             const fake = { handle, inbox: snap.inbox || {}, item_ids: null };
-            wl.markSeen(handle, wl.itemIdsFromCitizen(fake));
+            wl.markSeen(
+              handle,
+              wl.itemIdsFromCitizen(fake),
+              wl.itemAtsFromCitizen ? wl.itemAtsFromCitizen(fake) : null
+            );
             wl.pollStatus(true);
           }
         } catch (_) {}

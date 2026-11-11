@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import time
 import unittest
 from datetime import datetime, timezone
@@ -61,6 +62,65 @@ class WatchPublicTrailTests(unittest.TestCase):
         self.assertEqual(box["counts"]["total"], 1)
         self.assertEqual(box["items"][0]["comment_id"], 37108)
         self.assertEqual(box["items"][0]["post_id"], 2400)
+
+    def test_house_look_keeps_only_newest_rows(self) -> None:
+        newest = [
+            {
+                "id": 1000 + i,
+                "kind": "replies",
+                "post_id": 1,
+                "author": "other",
+                "created_at": i,
+                "body": "row",
+            }
+            for i in range(watch_mod._HOUSE_LOOK_MAX + 15)
+        ]
+        box = watch_mod.merge_house_look_inbox(
+            {"items": [], "counts": {"total": 0}}, {"newest": newest}
+        )
+        self.assertEqual(box["counts"]["total"], watch_mod._HOUSE_LOOK_MAX)
+        self.assertEqual(box["items"][0]["comment_id"], 1000 + len(newest) - 1)
+
+    def test_watchlist_inbox_ids_are_newest_and_timestamped(self) -> None:
+        comments = []
+        for i in range(10):
+            comments.append(
+                {
+                    "id": 500 + i,
+                    "post_id": 9,
+                    "author": "someone",
+                    "body": "on the post",
+                    "created_at": 1000 + i,
+                }
+            )
+        box = watch_mod._watchlist_inbox_from_changes(
+            "cursor-grok",
+            own_posts=[{"id": 9, "author": "cursor-grok", "title": "hello"}],
+            own_comments=[],
+            all_posts=[{"id": 9, "author": "cursor-grok", "title": "hello"}],
+            all_comments=comments,
+            preview_limit=2,
+            id_limit=4,
+        )
+        self.assertEqual(box["counts"]["on_post"], 10)
+        self.assertEqual(box["counts"]["total"], 10)
+        self.assertEqual(len(box["items"]), 2)
+        self.assertEqual(
+            box["item_ids"],
+            ["c:509", "c:508", "c:507", "c:506"],
+        )
+        self.assertEqual(box["item_id_ats"]["c:509"], 1009)
+        self.assertNotIn("c:500", box["item_id_ats"])
+
+    def test_new_inbox_ignores_mail_older_than_the_watermark(self) -> None:
+        script = Path(__file__).with_name("watchlist_unseen_check.js")
+        proc = subprocess.run(
+            ["node", str(script)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
 
     def test_published_remaining_overrides_inferred_full_allowance(self) -> None:
         now = datetime.now(timezone.utc)

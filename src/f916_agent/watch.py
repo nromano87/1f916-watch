@@ -2698,7 +2698,7 @@ a.pill:hover{{background:rgba(12,124,102,.18);border-color:rgba(12,124,102,.4)}}
       for (const h of handles) {{
         const c = byKey[h.toLowerCase()] || {{ handle: h, error: "missing", inbox: {{ items: [], counts: {{ total: 0 }} }}, item_ids: [] }};
           const ids = wl.itemIdsFromCitizen(c);
-          const unseen = warming ? 0 : wl.unseenCount(c.handle || h, ids);
+          const unseen = warming ? 0 : wl.unseenCount(c.handle || h, ids, c.item_id_ats);
         unseenByKey[h.toLowerCase()] = unseen;
         newTotal += unseen;
         const counts = (c.inbox && c.inbox.counts) || {{}};
@@ -5100,6 +5100,13 @@ def _find_citizen_on_census_page(
     return None
 
 
+# New-inbox compares this many newest ids. Older mail must not count as new
+# just because it is inside the window; the client watermarks on created_at.
+_WATCHLIST_UNSEEN_ID_LIMIT = 200
+# House /healthz "newest" is a wake sample. An unbounded list inflates Inbox.
+_HOUSE_LOOK_MAX = 40
+
+
 def _watchlist_inbox_item_id(item: Dict[str, Any]) -> str:
     """Stable id matching watch_ui / watchlist.js unseen tracking."""
     if not item:
@@ -5112,6 +5119,40 @@ def _watchlist_inbox_item_id(item: Dict[str, Any]) -> str:
             return "p:{}".format(item.get("post_id"))
         return "c:{}".format(item.get("comment_id") or item.get("id") or "")
     return "c:{}".format(item.get("comment_id") or item.get("id") or "")
+
+
+def _inbox_item_at(item: Dict[str, Any]) -> int:
+    try:
+        return int(item.get("created_at") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _cap_watchlist_item_ids(
+    ids: List[str],
+    ats: Dict[str, int],
+    limit: int = _WATCHLIST_UNSEEN_ID_LIMIT,
+) -> Tuple[List[str], Dict[str, int]]:
+    """Newest ids only, so a house-look dump cannot stretch the new count."""
+    limit = max(0, int(limit))
+    ranked: List[str] = []
+    seen: Set[str] = set()
+    for raw in ids or []:
+        iid = str(raw or "")
+        if not iid or iid in ("c:", "p:") or iid in seen:
+            continue
+        seen.add(iid)
+        ranked.append(iid)
+
+    def _at(iid: str) -> int:
+        try:
+            return int((ats or {}).get(iid) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    ranked.sort(key=_at, reverse=True)
+    kept = ranked[:limit]
+    return kept, {iid: _at(iid) for iid in kept}
 
 
 def _clip_preview(text: Any, limit: int = 160) -> str:
@@ -5393,9 +5434,9 @@ def merge_house_look_inbox(
         "mentions_of_you": "society_mention",
         "in_threads_you_joined": "joined_thread",
     }
-    for row in look.get("newest") or []:
-        if not isinstance(row, dict):
-            continue
+    newest = [r for r in (look.get("newest") or []) if isinstance(r, dict)]
+    newest.sort(key=lambda r: _inbox_item_at(r), reverse=True)
+    for row in newest[:_HOUSE_LOOK_MAX]:
         cid = row.get("id")
         if cid is None:
             continue
@@ -5676,7 +5717,7 @@ def _watchlist_inbox_from_changes(
     all_posts: List[Dict[str, Any]],
     all_comments: List[Dict[str, Any]],
     preview_limit: int = 8,
-    id_limit: int = 200,
+    id_limit: int = _WATCHLIST_UNSEEN_ID_LIMIT,
 ) -> Dict[str, Any]:
     """Replies + comment mentions from /api/changes — no per-thread fetches.
 
@@ -5772,15 +5813,20 @@ def _watchlist_inbox_from_changes(
     items.sort(key=lambda x: (x.get("created_at") or 0), reverse=True)
     counts["total"] = len(items)
     ids: List[str] = []
+    ats: Dict[str, int] = {}
     for it in items[:id_limit]:
         iid = _watchlist_inbox_item_id(it)
-        if iid and iid not in ("c:", "p:"):
-            ids.append(iid)
+        if not iid or iid in ("c:", "p:") or iid in ats:
+            continue
+        ids.append(iid)
+        ats[iid] = _inbox_item_at(it)
+    ids, ats = _cap_watchlist_item_ids(ids, ats, id_limit)
     return {
         "built_at": datetime.now(timezone.utc).isoformat(),
         "counts": counts,
         "items": [_preview_inbox_item(it) for it in items[:preview_limit]],
         "item_ids": ids,
+        "item_id_ats": ats,
     }
 
 
@@ -5919,13 +5965,24 @@ def _watchlist_entry_for_handle(
         )
         items = list(box.get("items") or [])
         ids = list(activity.get("item_ids") or [])
+        ats = {
+            str(k): _inbox_item_at({"created_at": v})
+            for k, v in (activity.get("item_id_ats") or {}).items()
+        }
         seen_ids = set(ids)
         for it in items:
             iid = _watchlist_inbox_item_id(it)
-            if iid and iid not in ("c:", "p:") and iid not in seen_ids:
+            if not iid or iid in ("c:", "p:"):
+                continue
+            at = _inbox_item_at(it)
+            if at and at > int(ats.get(iid) or 0):
+                ats[iid] = at
+            if iid not in seen_ids:
                 ids.append(iid)
                 seen_ids.add(iid)
+        ids, ats = _cap_watchlist_item_ids(ids, ats)
         entry["item_ids"] = ids
+        entry["item_id_ats"] = ats
         entry["inbox"] = {
             "built_at": activity.get("built_at"),
             "counts": box.get("counts")
